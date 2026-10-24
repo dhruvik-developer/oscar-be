@@ -1,0 +1,578 @@
+"""Serializers for the inventory module (api.md §7)."""
+from rest_framework import serializers
+
+from apps.core.serializers import (
+    BaseModelSerializer,
+    BaseSerializer,
+    QuantityField,
+    TenantPrimaryKeyRelatedField,
+)
+from apps.masters.models import Item, ItemPart, Location
+
+from .models import (
+    FaultyPart,
+    LotCostEntry,
+    QCInspection,
+    QCInspectionLine,
+    QCInspectionLineDefect,
+    QualityStandard,
+    Sample,
+    ServiceUsage,
+    StockAudit,
+    StockAuditLine,
+    StockMovement,
+    StockTransfer,
+    StockTransferLine,
+    Trip,
+    TripMaterialLine,
+    ZoneRequest,
+    ZoneRequestLine,
+)
+
+
+class StockMovementSerializer(BaseModelSerializer):
+    """The movement record of api.md §7.2, field for field."""
+
+    itemId = serializers.CharField(source="item_id", read_only=True)
+    itemSku = serializers.CharField(source="item.sku", read_only=True)
+    itemName = serializers.CharField(source="item.name", read_only=True)
+    locationId = serializers.CharField(source="location_id", read_only=True)
+    locationName = serializers.CharField(source="location.name", read_only=True)
+    referenceId = serializers.CharField(source="reference_id", read_only=True)
+    sourceDocumentId = serializers.CharField(source="source_document_id", read_only=True)
+    originalMovementId = serializers.CharField(source="original_movement_id", read_only=True)
+    reversalMovementId = serializers.CharField(source="reversal_movement_id", read_only=True)
+    date = serializers.DateField(source="movement_date", read_only=True)
+    serials = serializers.SerializerMethodField()
+
+    class Meta:
+        model = StockMovement
+        fields = [
+            "id", "itemId", "itemSku", "itemName", "locationId", "locationName",
+            "type", "quantity", "uom", "weighed_qty", "unit_cost",
+            "reference_type", "referenceId", "reference_number",
+            "source_document_type", "sourceDocumentId",
+            "originalMovementId", "reversalMovementId",
+            "batch_number", "serials", "date", "notes", "created_at",
+        ]
+
+    def get_serials(self, movement):
+        from apps.masters.models import ItemSerial
+
+        cached = getattr(movement, "_serials", None)
+        if cached is not None:
+            return cached
+        return list(
+            ItemSerial.objects.filter(
+                sold_movement_id=movement.id
+            ).values_list("serial_no", flat=True)
+        ) or list(
+            ItemSerial.objects.filter(
+                received_movement_id=movement.id
+            ).values_list("serial_no", flat=True)
+        )
+
+
+class StockAdjustmentSerializer(BaseSerializer):
+    """``POST /inventory/adjustments/`` -- replaces ``adjustItemStock``."""
+
+    itemId = TenantPrimaryKeyRelatedField(queryset=Item.objects.all())
+    locationId = TenantPrimaryKeyRelatedField(
+        queryset=Location.objects.all(), required=False, allow_null=True
+    )
+    quantity = QuantityField()
+    #: True means "set stock to this number"; False means "add this delta".
+    isAbsolute = serializers.BooleanField(required=False, default=False)
+    reason = serializers.CharField()
+    unitCost = serializers.DecimalField(
+        max_digits=18, decimal_places=4, coerce_to_string=False, required=False
+    )
+
+
+class StockPositionSerializer(BaseSerializer):
+    itemId = serializers.CharField()
+    sku = serializers.CharField()
+    name = serializers.CharField()
+    category = serializers.CharField(allow_null=True)
+    uom = serializers.CharField()
+    onHand = QuantityField()
+    reserved = QuantityField()
+    available = QuantityField()
+    damaged = QuantityField()
+    reorderLevel = QuantityField()
+    status = serializers.CharField()
+    unitCost = serializers.DecimalField(
+        max_digits=18, decimal_places=4, coerce_to_string=False
+    )
+    value = serializers.DecimalField(max_digits=18, decimal_places=2, coerce_to_string=False)
+
+
+class StockTransferLineSerializer(BaseModelSerializer):
+    itemId = TenantPrimaryKeyRelatedField(source="item", queryset=Item.objects.all())
+    sku = serializers.CharField(source="item.sku", read_only=True)
+    name = serializers.CharField(source="item.name", read_only=True)
+
+    #: ``[{"lotTakaId": uuid, "qty": "12.5"}]`` -- validated against the
+    #: source location when the transfer is created.
+    takas = serializers.ListField(child=serializers.DictField(), required=False, default=list)
+
+    class Meta:
+        model = StockTransferLine
+        fields = ["id", "itemId", "sku", "name", "qty", "received_qty", "takas"]
+
+
+class StockTransferSerializer(BaseModelSerializer):
+    """db.md §7.4 standardises on ``items[]`` and keeps the denormalised names
+    as read-only echoes, which is what the mock data's flat form used."""
+
+    items = StockTransferLineSerializer(many=True, required=False)
+    sourceLocationId = TenantPrimaryKeyRelatedField(
+        source="from_location", queryset=Location.objects.all()
+    )
+    destLocationId = TenantPrimaryKeyRelatedField(
+        source="to_location", queryset=Location.objects.all()
+    )
+    sourceLocation = serializers.CharField(source="from_location.name", read_only=True)
+    destLocation = serializers.CharField(source="to_location.name", read_only=True)
+    itemsCount = serializers.SerializerMethodField()
+    date = serializers.DateField(source="transfer_date")
+
+    class Meta:
+        model = StockTransfer
+        fields = [
+            "id", "transfer_number", "sourceLocationId", "destLocationId",
+            "sourceLocation", "destLocation", "date", "itemsCount", "status",
+            "shipped_by", "notes", "items", "created_at", "updated_at",
+        ]
+        # Status moves only through the dispatch / receive / cancel actions.
+        read_only_fields = ["transfer_number", "status", "created_at", "updated_at"]
+
+    def get_itemsCount(self, transfer):
+        return transfer.items.filter(deleted_at__isnull=True).count()
+
+    def validate(self, attrs):
+        source = attrs.get("from_location") or getattr(self.instance, "from_location", None)
+        destination = attrs.get("to_location") or getattr(self.instance, "to_location", None)
+        if source and destination and source.id == destination.id:
+            raise serializers.ValidationError(
+                {"destLocationId": ["Must differ from the source location."]}
+            )
+        return attrs
+
+
+class FaultyPartSerializer(BaseModelSerializer):
+    itemId = TenantPrimaryKeyRelatedField(source="item", queryset=Item.objects.all())
+    sku = serializers.CharField(source="item.sku", read_only=True)
+    itemName = serializers.CharField(source="item.name", read_only=True)
+    vendor = serializers.CharField(source="vendor.name", read_only=True)
+    date = serializers.DateField(source="reported_date")
+    qty = QuantityField(source="quantity")
+    timeline = serializers.SerializerMethodField()
+
+    class Meta:
+        model = FaultyPart
+        fields = [
+            "id", "rma_number", "date", "itemId", "sku", "itemName", "qty",
+            "vendor", "status", "notes", "fault_description", "timeline",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["rma_number", "created_at", "updated_at"]
+
+    def get_timeline(self, part):
+        """api.md §7.3 -- an ordered progress tracker derived from the status.
+
+        The frontend renders ``{ label, timestamp, status }`` directly, so the
+        server produces it rather than storing a parallel list.
+        """
+        steps = [
+            "Reported", "Pending Action", "Sent for Replacement",
+            "Replaced", "Credited", "Closed",
+        ]
+        try:
+            current = steps.index(part.status)
+        except ValueError:
+            current = 0
+        return [
+            {
+                "label": label,
+                "timestamp": part.created_at if index == 0 else None,
+                "status": (
+                    "completed" if index < current
+                    else "current" if index == current
+                    else "future"
+                ),
+            }
+            for index, label in enumerate(steps)
+        ]
+
+
+class ServiceUsageSerializer(BaseModelSerializer):
+    itemId = TenantPrimaryKeyRelatedField(source="item", queryset=Item.objects.all())
+    sku = serializers.CharField(source="item.sku", read_only=True)
+    qty = QuantityField(source="quantity")
+    date = serializers.DateField(source="used_on")
+
+    class Meta:
+        model = ServiceUsage
+        fields = [
+            "id", "ticket_number", "technician", "itemId", "sku", "qty", "date",
+            "notes", "job_reference", "chargeable", "created_at",
+        ]
+        read_only_fields = ["ticket_number", "created_at"]
+
+
+class ZoneRequestLineSerializer(BaseModelSerializer):
+    itemId = TenantPrimaryKeyRelatedField(source="item", queryset=Item.objects.all())
+    sku = serializers.CharField(source="item.sku", read_only=True)
+    product = serializers.CharField(source="item.name", read_only=True)
+    qty = QuantityField(source="requested_qty")
+    warehouseStock = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ZoneRequestLine
+        fields = ["id", "itemId", "sku", "product", "qty", "issued_qty", "warehouseStock"]
+
+    def get_warehouseStock(self, line):
+        """api.md §7.3 -- ``warehouseStock`` is the available quantity *at the
+        time the request is read*, so it is computed on read."""
+        from . import services as stock
+
+        client_id = self.context.get("client_id") or line.client_id
+        return stock.calculate_item_stock(client_id, line.item_id)["available"]
+
+
+class ZoneRequestSerializer(BaseModelSerializer):
+    lines = ZoneRequestLineSerializer(many=True, required=False)
+    zone = serializers.CharField(source="zone_location.name", read_only=True)
+    zoneLocationId = TenantPrimaryKeyRelatedField(
+        source="zone_location", queryset=Location.objects.all()
+    )
+    requestedBy = serializers.CharField(source="requested_by_name", required=False, allow_null=True)
+    date = serializers.DateField(source="request_date", required=False, allow_null=True)
+
+    class Meta:
+        model = ZoneRequest
+        fields = [
+            "id", "request_number", "requestedBy", "zone", "zoneLocationId",
+            "target_sector", "date", "requested_at", "status", "notes",
+            "manager_signoff_needed", "reject_reason", "lines",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["request_number", "requested_at", "created_at", "updated_at"]
+
+
+class StockAuditLineSerializer(BaseModelSerializer):
+    itemId = TenantPrimaryKeyRelatedField(source="item", queryset=Item.objects.all())
+    sku = serializers.CharField(source="item.sku", read_only=True)
+    name = serializers.CharField(source="item.name", read_only=True)
+    # GeneratedField (counted_qty - system_qty) -- DRF falls back to ModelField
+    # for it, which drf-spectacular cannot map (DecimalField() with no args).
+    # Declared explicitly so schema generation sees a real DecimalField.
+    variance = QuantityField(read_only=True)
+
+    class Meta:
+        model = StockAuditLine
+        fields = [
+            "id", "itemId", "sku", "name", "system_qty", "counted_qty",
+            "variance", "reason", "adjustment_movement",
+        ]
+        read_only_fields = ["variance", "adjustment_movement"]
+
+
+class StockAuditSerializer(BaseModelSerializer):
+    lines = StockAuditLineSerializer(many=True, required=False)
+
+    class Meta:
+        model = StockAudit
+        fields = [
+            "id", "audit_number", "location", "period_month", "status",
+            "conducted_by", "posted_at", "notes", "lines", "created_at", "updated_at",
+        ]
+        read_only_fields = ["audit_number", "posted_at", "created_at", "updated_at"]
+
+
+class QualityStandardSerializer(BaseModelSerializer):
+    category = serializers.CharField(source="category.name", read_only=True)
+    categoryId = TenantPrimaryKeyRelatedField(
+        source="category", model="masters.ItemCategory", required=False, allow_null=True
+    )
+    checks = serializers.JSONField(source="checklist", required=False)
+    active = serializers.BooleanField(source="is_active", required=False)
+
+    class Meta:
+        model = QualityStandard
+        fields = [
+            "id", "name", "category", "categoryId", "checks", "tolerance_pct",
+            "active", "created_at", "updated_at",
+        ]
+
+
+
+class ValuationRowSerializer(BaseSerializer):
+    itemId = serializers.CharField()
+    sku = serializers.CharField()
+    name = serializers.CharField()
+    category = serializers.CharField(allow_null=True)
+    location = serializers.CharField(allow_null=True)
+    quantity = QuantityField()
+    unitCost = serializers.DecimalField(
+        max_digits=18, decimal_places=4, coerce_to_string=False
+    )
+    value = serializers.DecimalField(max_digits=18, decimal_places=2, coerce_to_string=False)
+    ageingBucket = serializers.CharField(allow_null=True)
+
+
+class ItemPartSerializer(BaseModelSerializer):
+    """Machine BOM lines (``itemParts``)."""
+
+    parentItemId = TenantPrimaryKeyRelatedField(source="parent_item", model="masters.Item")
+    partItemId = TenantPrimaryKeyRelatedField(source="part_item", model="masters.Item")
+    partName = serializers.CharField(source="part_item.name", read_only=True)
+    partSku = serializers.CharField(source="part_item.sku", read_only=True)
+    requiredQty = QuantityField(source="required_qty", required=False)
+
+    class Meta:
+        model = ItemPart
+        fields = [
+            "id", "parentItemId", "partItemId", "partName", "partSku",
+            "requiredQty", "created_at",
+        ]
+        read_only_fields = ["created_at"]
+
+
+class QCInspectionLineDefectSerializer(BaseModelSerializer):
+    defectId = TenantPrimaryKeyRelatedField(source="defect", model="masters.DefectMaster")
+    defectCode = serializers.ReadOnlyField(source="defect.code")
+    defectName = serializers.ReadOnlyField(source="defect.name")
+    defectCategory = serializers.ReadOnlyField(source="defect.category")
+    defectSeverity = serializers.ReadOnlyField(source="defect.severity")
+
+    class Meta:
+        model = QCInspectionLineDefect
+        fields = [
+            "id", "defectId", "defectCode", "defectName", "defectCategory",
+            "defectSeverity", "defect_count", "points", "distance_meter", "remarks",
+        ]
+        read_only_fields = ["id", "defectCode", "defectName", "defectCategory", "defectSeverity"]
+
+
+class QCInspectionLineSerializer(BaseModelSerializer):
+    lotTakaId = TenantPrimaryKeyRelatedField(
+        source="lot_taka", model="inventory.LotTaka", required=False, allow_null=True
+    )
+    takaNo = serializers.CharField(source="taka_number", required=False)
+    lotNo = serializers.CharField(source="lot_number", required=False, allow_null=True, allow_blank=True)
+    originalMeter = QuantityField(source="original_meter", required=False)
+    actualMeter = QuantityField(source="actual_meter", required=False)
+    rollWeight = serializers.DecimalField(source="roll_weight", max_digits=12, decimal_places=4, required=False, allow_null=True)
+    penaltyPoints = serializers.IntegerField(source="penalty_points", required=False)
+    pointsPer100SqMeter = serializers.DecimalField(
+        source="points_per_100_sq_meter", max_digits=9, decimal_places=2, required=False
+    )
+    defects = QCInspectionLineDefectSerializer(many=True, required=False)
+
+    class Meta:
+        model = QCInspectionLine
+        fields = [
+            "id", "lotTakaId", "takaNo", "lotNo", "originalMeter", "actualMeter",
+            "rollWeight", "width", "gsm", "grade", "penaltyPoints", "pointsPer100SqMeter",
+            "disposition", "remarks", "defects",
+        ]
+        read_only_fields = ["id"]
+
+
+class QCInspectionSerializer(BaseModelSerializer):
+    inspectionNumber = serializers.CharField(source="inspection_number", required=False)
+    sourceDocumentType = serializers.CharField(source="source_document_type", required=False)
+    sourceDocumentId = serializers.UUIDField(source="source_document_id", required=False, allow_null=True)
+    sourceDocumentNumber = serializers.CharField(source="source_document_number", required=False, allow_null=True, allow_blank=True)
+    inspectionDate = serializers.DateField(source="inspection_date", required=False)
+    inspectorId = TenantPrimaryKeyRelatedField(source="inspector", model="accounts.User", required=False, allow_null=True)
+    inspectorName = serializers.SerializerMethodField()
+    inspectorEmployeeId = TenantPrimaryKeyRelatedField(source="inspector_employee", model="hrms.Employee", required=False, allow_null=True)
+    purchaseOrderId = TenantPrimaryKeyRelatedField(source="purchase_order", model="purchase.PurchaseOrder", required=False, allow_null=True)
+    productionInstructionId = TenantPrimaryKeyRelatedField(source="production_instruction", model="pms.ProductionInstruction", required=False, allow_null=True)
+    fabricItemId = TenantPrimaryKeyRelatedField(source="fabric_item", model="masters.Item", required=False, allow_null=True)
+    inspectionType = serializers.CharField(source="inspection_type", required=False)
+    inspectionMethod = serializers.CharField(source="inspection_method", required=False)
+    gsm = serializers.DecimalField(max_digits=9, decimal_places=2, required=False, allow_null=True)
+    width = serializers.DecimalField(max_digits=9, decimal_places=2, required=False, allow_null=True)
+    defectsFound = serializers.CharField(source="defects_found", required=False, allow_blank=True, allow_null=True)
+    qualityGrade = serializers.CharField(source="quality_grade", required=False, allow_blank=True, allow_null=True)
+    photos = serializers.ListField(child=serializers.CharField(), required=False)
+    lines = QCInspectionLineSerializer(many=True, required=False)
+
+    class Meta:
+        model = QCInspection
+        fields = [
+            "id", "inspectionNumber", "sourceDocumentType", "sourceDocumentId", "sourceDocumentNumber",
+            "purchaseOrderId", "productionInstructionId", "fabricItemId",
+            "inspectionType", "inspectionMethod", "gsm", "width", "defectsFound", "qualityGrade", "photos",
+            "inspectionDate", "inspectorId", "inspectorName", "inspectorEmployeeId", "shift", "status",
+            "total_received_qty", "total_inspected_qty", "passed_qty", "second_quality_qty",
+            "reprocess_qty", "rejected_qty", "hold_qty", "notes", "lines", "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "inspectionNumber", "created_at", "updated_at"]
+
+    def get_inspectorName(self, obj):
+        if obj.inspector:
+            return getattr(obj.inspector, "name", None) or getattr(obj.inspector, "email", None)
+        if obj.inspector_employee:
+            return getattr(obj.inspector_employee, "name", None)
+        return None
+
+
+class LotCostEntrySerializer(BaseModelSerializer):
+    lotTakaId = TenantPrimaryKeyRelatedField(
+        source="lot_taka", model="inventory.LotTaka", required=False, allow_null=True
+    )
+    costType = serializers.CharField(source="cost_type")
+    costPerMeter = serializers.DecimalField(source="cost_per_meter", max_digits=18, decimal_places=4, read_only=True)
+    sourceDocumentType = serializers.CharField(source="source_document_type", required=False)
+    sourceDocumentNumber = serializers.CharField(source="source_document_number", required=False, allow_null=True, allow_blank=True)
+    isApproved = serializers.BooleanField(source="is_approved", required=False, default=True)
+    approvalStatus = serializers.CharField(source="approval_status", required=False, default="Approved")
+
+    class Meta:
+        model = LotCostEntry
+        fields = [
+            "id", "lot_number", "lotTakaId", "costType", "amount", "quantity", "costPerMeter",
+            "sourceDocumentType", "source_document_id", "sourceDocumentNumber",
+            "date", "posted_by", "isApproved", "approvalStatus", "remarks",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["costPerMeter", "created_at", "updated_at"]
+
+
+class SampleSerializer(BaseModelSerializer):
+    sampleNumber = serializers.CharField(source="sample_number", required=False)
+    sampleDate = serializers.DateField(source="sample_date", required=False)
+    partyId = TenantPrimaryKeyRelatedField(
+        source="party", model="masters.Party", required=False, allow_null=True
+    )
+    partyName = serializers.CharField(source="party.name", read_only=True)
+    salespersonId = TenantPrimaryKeyRelatedField(
+        source="salesperson", model="hrms.Employee", required=False, allow_null=True
+    )
+    salespersonName = serializers.CharField(source="salesperson.name", read_only=True)
+    brokerId = TenantPrimaryKeyRelatedField(
+        source="broker", model="masters.Broker", required=False, allow_null=True
+    )
+    brokerName = serializers.CharField(source="broker.name", read_only=True)
+    sourceLotTakaId = TenantPrimaryKeyRelatedField(
+        source="source_lot_taka", model="inventory.LotTaka", required=False, allow_null=True
+    )
+    fabricQualityId = TenantPrimaryKeyRelatedField(
+        source="fabric_quality", model="masters.FabricQuality", required=False, allow_null=True
+    )
+    fabricQualityName = serializers.CharField(source="fabric_quality.name", read_only=True)
+    designId = TenantPrimaryKeyRelatedField(
+        source="design", model="masters.Design", required=False, allow_null=True
+    )
+    designName = serializers.CharField(source="design.name", read_only=True)
+    shadeId = TenantPrimaryKeyRelatedField(
+        source="shade", model="masters.Shade", required=False, allow_null=True
+    )
+    shadeName = serializers.CharField(source="shade.name", read_only=True)
+    sampleType = serializers.CharField(source="sample_type", required=False, default="CUT_PIECE")
+    isReturnable = serializers.BooleanField(source="is_returnable", required=False, default=True)
+    dueDate = serializers.DateField(source="due_date", required=False, allow_null=True)
+    returnedQuantity = serializers.DecimalField(source="returned_quantity", max_digits=18, decimal_places=4, read_only=True)
+    consumedQuantity = serializers.DecimalField(source="consumed_quantity", max_digits=18, decimal_places=4, read_only=True)
+    estimatedCost = serializers.DecimalField(source="estimated_cost", max_digits=18, decimal_places=4, read_only=True)
+
+    class Meta:
+        model = Sample
+        fields = [
+            "id", "sampleNumber", "sampleDate", "partyId", "partyName",
+            "salespersonId", "salespersonName", "brokerId", "brokerName",
+            "sourceLotTakaId", "fabricQualityId", "fabricQualityName",
+            "designId", "designName", "shadeId", "shadeName",
+            "sampleType", "quantity", "uom", "isReturnable", "dueDate", "status",
+            "returnedQuantity", "consumedQuantity", "estimatedCost",
+            "remarks", "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "sampleNumber", "returnedQuantity", "consumedQuantity", "estimatedCost", "created_at", "updated_at"]
+
+
+class TripMaterialLineSerializer(BaseModelSerializer):
+    lotTakaId = TenantPrimaryKeyRelatedField(
+        source="lot_taka", model="inventory.LotTaka", required=False, allow_null=True
+    )
+    lotNumber = serializers.CharField(source="lot_number", required=False, allow_null=True, allow_blank=True)
+    takaNumber = serializers.CharField(source="taka_number", required=False, allow_null=True, allow_blank=True)
+    itemId = TenantPrimaryKeyRelatedField(
+        source="item", model="masters.Item", required=False, allow_null=True
+    )
+    itemName = serializers.CharField(source="item.name", read_only=True)
+    rollWeight = serializers.DecimalField(source="roll_weight", max_digits=12, decimal_places=4, required=False, allow_null=True)
+    allocatedFreight = serializers.DecimalField(source="allocated_freight", max_digits=18, decimal_places=4, read_only=True)
+
+    class Meta:
+        model = TripMaterialLine
+        fields = [
+            "id", "lotTakaId", "lotNumber", "takaNumber", "itemId", "itemName",
+            "quantity", "rollWeight", "document_reference_type", "document_reference_id",
+            "document_reference_number", "allocatedFreight", "created_at",
+        ]
+        read_only_fields = ["allocatedFreight", "created_at"]
+
+
+class TripSerializer(BaseModelSerializer):
+    tripNumber = serializers.CharField(source="trip_number", required=False)
+    tripDate = serializers.DateField(source="trip_date", required=False)
+    fromLocation = serializers.CharField(source="from_location")
+    toLocation = serializers.CharField(source="to_location")
+    transporterId = TenantPrimaryKeyRelatedField(
+        source="transporter", model="masters.Transporter", required=False, allow_null=True
+    )
+    transporterName = serializers.CharField(source="transporter.name", read_only=True)
+    transporterPartyId = TenantPrimaryKeyRelatedField(
+        source="transporter_party", model="masters.Party", required=False, allow_null=True
+    )
+    vehicleId = TenantPrimaryKeyRelatedField(
+        source="vehicle", model="masters.Vehicle", required=False, allow_null=True
+    )
+    driverId = TenantPrimaryKeyRelatedField(
+        source="driver", model="masters.Driver", required=False, allow_null=True
+    )
+    vehicleNumber = serializers.CharField(source="vehicle_number", required=False, allow_blank=True)
+    driverName = serializers.CharField(source="driver_name", required=False, allow_null=True, allow_blank=True)
+    driverMobile = serializers.CharField(source="driver_mobile", required=False, allow_null=True, allow_blank=True)
+    proofFileId = TenantPrimaryKeyRelatedField(
+        source="proof_file", model="core.File", required=False, allow_null=True
+    )
+    proofFileUrl = serializers.SerializerMethodField()
+
+    def get_proofFileUrl(self, obj):
+        if obj.proof_file_id:
+            return f"/api/v1/files/{obj.proof_file_id}/download/"
+        return None
+    lrNumber = serializers.CharField(source="lr_number", required=False, allow_null=True, allow_blank=True)
+    lrDate = serializers.DateField(source="lr_date", required=False, allow_null=True)
+    tripType = serializers.CharField(source="trip_type", required=False, default="OUTWARD")
+    freightAmount = serializers.DecimalField(source="freight_amount", max_digits=18, decimal_places=2, required=False, default=0)
+    loadingCharges = serializers.DecimalField(source="loading_charges", max_digits=18, decimal_places=2, required=False, default=0)
+    unloadingCharges = serializers.DecimalField(source="unloading_charges", max_digits=18, decimal_places=2, required=False, default=0)
+    otherCharges = serializers.DecimalField(source="other_charges", max_digits=18, decimal_places=2, required=False, default=0)
+    totalCharges = serializers.DecimalField(source="total_charges", max_digits=18, decimal_places=2, read_only=True)
+    paidBy = serializers.CharField(source="paid_by", required=False, default="Company")
+    costAllocationTarget = serializers.CharField(source="cost_allocation_target", required=False, default="LOT")
+    isCostAllocated = serializers.BooleanField(source="is_cost_allocated", read_only=True)
+    materials = TripMaterialLineSerializer(many=True, required=False)
+    signatures = serializers.JSONField(read_only=True)
+
+    class Meta:
+        model = Trip
+        fields = [
+            "id", "tripNumber", "tripDate", "fromLocation", "toLocation",
+            "transporterId", "transporterName", "transporterPartyId",
+            "vehicleId", "driverId", "proofFileId", "proofFileUrl", "proof_file", "vehicleNumber", "driverName", "driverMobile", "lrNumber", "lrDate",
+            "tripType", "status", "freightAmount", "loadingCharges", "unloadingCharges",
+            "otherCharges", "totalCharges", "paidBy", "costAllocationTarget",
+            "isCostAllocated", "dispatch_time", "delivery_time", "remarks",
+            "materials", "signatures", "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "tripNumber", "totalCharges", "isCostAllocated", "created_at", "updated_at"]
+
+

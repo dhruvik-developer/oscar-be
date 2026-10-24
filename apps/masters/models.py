@@ -1,0 +1,1122 @@
+"""
+Shared masters (db.md §4, api.md §4).
+
+Parties, items, categories, units, locations, serials and the machine BOM.
+One ``parties`` table serves customers and vendors; the UI shows it three ways
+(``/parties``, ``/crm/customers``, vendor pickers) but there is one record.
+"""
+from django.db import models
+from django.utils import timezone
+
+from apps.core.models import LegacyIdMixin, TenantModel
+
+# api.md §4.2 -- Textile ERP item kinds.
+# `Service` items hold no stock and are excluded from movements and valuation.
+ITEM_KINDS = [
+    ("Fabric", "Fabric"),
+]
+
+#: Kinds that never hold stock (api.md §4.2).
+STOCKLESS_ITEM_KINDS = set()
+
+#: Permanent fabric catalogue. These are master rows stored in the database
+#: (``masters.Fabric``), never frontend mock data. Seeded by migration 0007
+#: and ``seed_fabrics`` for every tenant.
+DEFAULT_FABRICS = [
+    "Cotton",
+    "Linen",
+    "Silk",
+    "Wool",
+    "Polyester",
+    "Nylon",
+    "Spandex (Elastane)",
+    "Rayon (Viscose)",
+    "Denim",
+    "Velvet",
+    "Chiffon",
+    "Georgette",
+]
+
+DIMENSION_UNITS = [("mm", "mm"), ("cm", "cm"), ("m", "m"), ("in", "in")]
+
+
+# ---------------------------------------------------------------------------
+# db.md §4.1 -- Parties
+# ---------------------------------------------------------------------------
+class Party(TenantModel, LegacyIdMixin):
+    TYPES = [
+        ("Customer", "Customer"),
+        ("Vendor", "Vendor"),
+        ("Both", "Both"),
+        ("Processor", "Processor"),
+    ]
+    #: Supplier classification (db.md §4.1 addendum) -- only meaningful when
+    #: ``type == "Vendor"``; left null for every other role.
+    VENDOR_TYPES = [
+        ("Manufacturing", "Manufacturing"),
+        ("Dyeing - Other Process", "Dyeing - Other Process"),
+    ]
+    #: Fleet classification -- only meaningful when ``type == "Transporter"``.
+    VEHICLE_TYPES = [
+        ("Truck", "Truck"),
+        ("Mini Truck / LCV", "Mini Truck / LCV"),
+        ("Trailer", "Trailer"),
+        ("Container", "Container"),
+        ("Tanker", "Tanker"),
+        ("Tempo", "Tempo"),
+        ("Other", "Other"),
+    ]
+    CAPACITY_UNITS = [
+        ("Tons", "Tons"),
+        ("Kg", "Kg"),
+        ("Litres", "Litres"),
+        ("Taka", "Taka"),
+    ]
+    GST_TREATMENTS = [
+        ("Registered Business", "Registered Business"),
+        ("Unregistered Business", "Unregistered Business"),
+        ("Consumer", "Consumer"),
+        ("Overseas", "Overseas"),
+        ("SEZ", "SEZ"),
+        ("Deemed Export", "Deemed Export"),
+    ]
+    STATUSES = [("Active", "Active"), ("On Hold", "On Hold"), ("Inactive", "Inactive")]
+
+    code = models.TextField()
+    type = models.TextField(choices=TYPES, default="Customer")
+    vendor_type = models.TextField(choices=VENDOR_TYPES, null=True, blank=True)
+    is_processor = models.BooleanField(default=False)
+    #: Transporter fleet details (``type == "Transporter"`` only).
+    vehicle_number = models.TextField(null=True, blank=True)
+    vehicle_type = models.TextField(choices=VEHICLE_TYPES, null=True, blank=True)
+    vehicle_capacity = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True
+    )
+    vehicle_capacity_unit = models.TextField(
+        choices=CAPACITY_UNITS, null=True, blank=True
+    )
+    name = models.TextField()
+    phone = models.TextField(null=True, blank=True)
+    email = models.EmailField(null=True, blank=True)
+    gst_treatment = models.TextField(choices=GST_TREATMENTS, default="Unregistered Business")
+    gstin = models.TextField(null=True, blank=True)
+    gst_notes = models.TextField(null=True, blank=True)
+    #: Compared with company_profile.state to decide CGST+SGST vs IGST.
+    place_of_supply = models.TextField(null=True, blank=True)
+
+    tds_applicable = models.BooleanField(default=False)
+    tds_section = models.TextField(null=True, blank=True)
+    tds_rate = models.DecimalField(max_digits=7, decimal_places=4, null=True, blank=True)
+    tcs_applicable = models.BooleanField(default=False)
+    tcs_rate = models.DecimalField(max_digits=7, decimal_places=4, null=True, blank=True)
+
+    ledger_account = models.ForeignKey(
+        "accounting.Account", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    credit_limit = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    credit_days = models.IntegerField(default=30)
+    default_discount_pct = models.DecimalField(max_digits=7, decimal_places=4, default=0)
+    default_broker = models.ForeignKey(
+        "masters.Broker", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    default_salesperson = models.ForeignKey(
+        "hrms.Employee", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    payment_terms = models.TextField(null=True, blank=True)
+
+    bank_account_number = models.TextField(null=True, blank=True)
+    ifsc_code = models.TextField(null=True, blank=True)
+    bank_name = models.TextField(null=True, blank=True)
+    account_holder_name = models.TextField(null=True, blank=True)
+
+    opening_balance = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    #: DERIVED from journal_lines (db.md §12). Never accept it as a write --
+    #: it is recomputed on every posting that touches the party and stored
+    #: only for list-view performance.
+    balance = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+
+    billing_address = models.JSONField(default=dict, blank=True)
+    shipping_address = models.JSONField(default=dict, blank=True)
+    status = models.TextField(choices=STATUSES, default="Active")
+
+    class Meta:
+        db_table = "parties"
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "code"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_parties_code",
+            ),
+            models.UniqueConstraint(
+                fields=["client", "gstin"],
+                condition=models.Q(gstin__isnull=False, deleted_at__isnull=True),
+                name="uq_parties_gstin",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["client", "type"],
+                name="ix_parties_type",
+                condition=models.Q(deleted_at__isnull=True),
+            ),
+            models.Index(fields=["client", "name"], name="ix_parties_name"),
+        ]
+
+    def __str__(self):
+        return self.name
+
+    @property
+    def is_customer(self):
+        return self.type in ("Customer", "Both")
+
+    @property
+    def is_vendor(self):
+        return self.type in ("Vendor", "Both")
+
+
+class PartyContact(TenantModel):
+    party = models.ForeignKey(Party, on_delete=models.CASCADE, related_name="contacts")
+    name = models.TextField()
+    role = models.TextField(null=True, blank=True)
+    phone = models.TextField(null=True, blank=True)
+    email = models.EmailField(null=True, blank=True)
+    is_primary = models.BooleanField(default=False)
+
+    class Meta:
+        db_table = "party_contacts"
+        ordering = ["-is_primary", "name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["party"],
+                condition=models.Q(is_primary=True, deleted_at__isnull=True),
+                name="uq_party_primary_contact",
+            )
+        ]
+
+
+# ---------------------------------------------------------------------------
+# db.md §4.2 -- Items and inventory master
+# ---------------------------------------------------------------------------
+class ItemCategory(TenantModel, LegacyIdMixin):
+    KINDS = [("machine", "machine"), ("stock", "stock")]
+
+    name = models.TextField()
+    code = models.TextField()
+    kind = models.TextField(choices=KINDS, default="stock")
+    description = models.TextField(null=True, blank=True)
+    has_sub_parts = models.BooleanField(default=False)
+    lead_time_days = models.IntegerField(default=0)
+    #: api.md §4.2 -- the HSN default for this family, resolved on item create.
+    default_hsn_code = models.TextField(null=True, blank=True)
+
+    parent = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.SET_NULL, related_name="children"
+    )
+    is_active = models.BooleanField(default=True)
+    image_file = models.ForeignKey(
+        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    image_url = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "item_categories"
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "code"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_item_categories_code",
+            )
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class CategoryCustomField(TenantModel):
+    """Defines the keys allowed in ``items.custom_field_values`` (db.md §1.7)."""
+
+    TYPES = [
+        ("text", "text"),
+        ("number", "number"),
+        ("dropdown", "dropdown"),
+        ("boolean", "boolean"),
+    ]
+
+    category = models.ForeignKey(
+        ItemCategory, on_delete=models.CASCADE, related_name="custom_fields"
+    )
+    name = models.TextField()
+    type = models.TextField(choices=TYPES, default="text")
+    options = models.JSONField(null=True, blank=True)
+    required = models.BooleanField(default=False)
+    sort_order = models.IntegerField(default=0)
+
+    class Meta:
+        db_table = "category_custom_fields"
+        ordering = ["sort_order", "name"]
+        constraints = [
+            models.CheckConstraint(
+                condition=~models.Q(type="dropdown") | models.Q(options__isnull=False),
+                name="ck_ccf_options",
+            )
+        ]
+
+
+class Unit(TenantModel):
+    UOM_TYPES = [
+        ("Length", "Length"),
+        ("Weight", "Weight"),
+        ("Roll", "Roll"),
+        ("Piece", "Piece"),
+        ("Area", "Area"),
+        ("Volume", "Volume"),
+        ("Other", "Other"),
+    ]
+
+    code = models.TextField()
+    #: The UOM name ("Meter") -- kept as ``label`` because every unit
+    #: dropdown in the app already reads it.
+    label = models.TextField()
+    uom_type = models.TextField(choices=UOM_TYPES, default="Length")
+    is_base_unit = models.BooleanField(default=False)
+    decimal_places = models.PositiveSmallIntegerField(default=2)
+    #: How many base units one of this unit is worth (1 CM = 0.01 Meter).
+    conversion_factor = models.DecimalField(max_digits=18, decimal_places=6, default=1)
+    description = models.TextField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+    image_file = models.ForeignKey(
+        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    image_url = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "units"
+        ordering = ["code"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "code"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_units_code",
+            )
+        ]
+
+    def __str__(self):
+        return self.code
+
+
+class Location(TenantModel, LegacyIdMixin):
+    """Warehouses and zones. ``Transit`` exists because a transfer parks stock
+    between the ``TRANSFER_OUT`` and ``TRANSFER_IN`` movements (db.md §7.4)."""
+
+    TYPES = [
+        ("Warehouse", "Warehouse"),
+        ("Zone", "Zone"),
+        ("Godown", "Godown"),
+        ("Rack", "Rack"),
+        ("Bin", "Bin"),
+        ("Transit", "Transit"),
+        ("Scrap", "Scrap"),
+    ]
+
+    code = models.TextField()
+    name = models.TextField()
+    type = models.TextField(choices=TYPES, default="Warehouse")
+    parent = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.SET_NULL, related_name="children"
+    )
+    address = models.JSONField(null=True, blank=True)
+    description = models.TextField(null=True, blank=True)
+    capacity = models.DecimalField(max_digits=18, decimal_places=4, default=0, null=True, blank=True)
+    capacity_uom = models.TextField(default="Meter (m)", null=True, blank=True)
+    manager = models.TextField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "locations"
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "code"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_locations_code",
+            )
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class Fabric(TenantModel):
+    """Permanent fabric catalogue (Cotton, Silk, Denim, ...).
+
+    Backs the "Select fabric..." dropdown. Rows live in the database per
+    tenant -- the frontend must fetch ``GET /inventory/fabrics/``, never a
+    hardcoded mock list. ``Item.fabric_quality`` stores the selected fabric
+    name as free text for history; this table is the selectable master.
+    """
+
+    name = models.TextField()
+    code = models.TextField()
+    description = models.TextField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "fabrics"
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "name"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_fabrics_name",
+            ),
+            models.UniqueConstraint(
+                fields=["client", "code"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_fabrics_code",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["client", "name"], name="ix_fabrics_name"),
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+# ---------------------------------------------------------------------------
+# Textile masters (er-diagram.md -- FABRIC_QUALITY, DESIGN, SHADE)
+# ---------------------------------------------------------------------------
+class TextileMaster(TenantModel):
+    """A code + name master row. ``code`` is unique per tenant while live."""
+
+    code = models.TextField()
+    name = models.TextField()
+    description = models.TextField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        abstract = True
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "code"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_%(class)s_code",
+            )
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class FabricType(TextileMaster):
+    """Fabric type / classification (Grey, Finished, Knitted, Woven, ...)."""
+
+    PROCESS_STAGES = [
+        ("Grey", "Grey"),
+        ("Dyed", "Dyed"),
+        ("Printed", "Printed"),
+        ("Finished", "Finished"),
+    ]
+
+    #: The fabric condition this type describes -- drives the stage badge.
+    process_stage = models.TextField(choices=PROCESS_STAGES, default="Grey")
+    image_file = models.ForeignKey(
+        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    image_url = models.TextField(null=True, blank=True)
+
+    class Meta(TextileMaster.Meta):
+        db_table = "fabric_types"
+
+
+class FabricQuality(TextileMaster):
+    """A tradeable grey quality: the spec a lot is bought and sold against."""
+
+    fabric = models.ForeignKey(
+        Fabric, null=True, blank=True, on_delete=models.SET_NULL, related_name="qualities"
+    )
+    fabric_type = models.ForeignKey(
+        FabricType, null=True, blank=True, on_delete=models.SET_NULL, related_name="qualities"
+    )
+    composition = models.TextField(null=True, blank=True)
+    uom = models.ForeignKey(
+        "masters.Unit", null=True, blank=True, on_delete=models.SET_NULL, related_name="fabric_qualities"
+    )
+    #: Width in inches, the way grey fabric is traded.
+    width = models.DecimalField(max_digits=7, decimal_places=2, null=True, blank=True)
+    gsm = models.DecimalField(max_digits=7, decimal_places=2, null=True, blank=True)
+    reed = models.IntegerField(null=True, blank=True)
+    pick = models.IntegerField(null=True, blank=True)
+    warp_count = models.TextField(null=True, blank=True)
+    weft_count = models.TextField(null=True, blank=True)
+    image_file = models.ForeignKey(
+        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    image_url = models.TextField(null=True, blank=True)
+
+    class Meta(TextileMaster.Meta):
+        db_table = "fabric_qualities"
+
+
+class Design(TextileMaster):
+    PATTERN_TYPES = [
+        ("Printed", "Printed"),
+        ("Yarn Dyed", "Yarn Dyed"),
+        ("Jacquard", "Jacquard"),
+        ("Dobby", "Dobby"),
+        ("Solid", "Solid"),
+        ("Embroidered", "Embroidered"),
+        ("Other", "Other"),
+    ]
+
+    pattern_type = models.TextField(choices=PATTERN_TYPES, null=True, blank=True)
+    #: Season or collection the design belongs to (Summer 2025, Regular, ...).
+    season = models.TextField(null=True, blank=True)
+    #: Buyer / mill reference number for the design.
+    reference = models.TextField(null=True, blank=True)
+    image_file = models.ForeignKey(
+        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+
+    class Meta(TextileMaster.Meta):
+        db_table = "designs"
+
+
+class Shade(TextileMaster):
+    COLOUR_TYPES = [
+        ("Solid", "Solid"),
+        ("Melange", "Melange"),
+        ("Heather", "Heather"),
+        ("Printed", "Printed"),
+        ("Yarn Dyed", "Yarn Dyed"),
+        ("Other", "Other"),
+    ]
+
+    colour_type = models.TextField(choices=COLOUR_TYPES, default="Solid", null=True, blank=True)
+    pantone_reference = models.TextField(null=True, blank=True)
+    image_file = models.ForeignKey(
+        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    image_url = models.TextField(null=True, blank=True)
+    #: ``#RRGGBB`` swatch shown next to the shade name.
+    hex_color = models.TextField(null=True, blank=True)
+
+    class Meta(TextileMaster.Meta):
+        db_table = "shades"
+
+
+class FabricVariant(TextileMaster):
+    """A sellable fabric item: one quality in one design and one shade.
+
+    Design and shade are optional -- plain grey stock is a quality alone.
+    Width and GSM are read from the quality, never copied, so a corrected
+    quality spec reaches every variant.
+    """
+
+    quality = models.ForeignKey(FabricQuality, on_delete=models.PROTECT, related_name="variants")
+    design = models.ForeignKey(
+        Design, null=True, blank=True, on_delete=models.PROTECT, related_name="variants"
+    )
+    shade = models.ForeignKey(
+        Shade, null=True, blank=True, on_delete=models.PROTECT, related_name="variants"
+    )
+    uom = models.ForeignKey(
+        "masters.Unit", null=True, blank=True, on_delete=models.SET_NULL, related_name="fabric_variants"
+    )
+    hsn_code = models.TextField(null=True, blank=True)
+    fabric_type = models.TextField(null=True, blank=True)
+    fabric_type_ref = models.ForeignKey(
+        "masters.FabricType", null=True, blank=True, on_delete=models.SET_NULL, related_name="fabric_variants"
+    )
+    category = models.ForeignKey(
+        "masters.ItemCategory", null=True, blank=True, on_delete=models.SET_NULL, related_name="fabric_variants"
+    )
+    item = models.ForeignKey(
+        "masters.Item", null=True, blank=True, on_delete=models.SET_NULL, related_name="fabric_variants"
+    )
+    construction = models.TextField(null=True, blank=True)
+    image_url = models.TextField(null=True, blank=True)
+    #: Standard selling rate per UOM.
+    rate = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    image_file = models.ForeignKey(
+        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+
+    class Meta(TextileMaster.Meta):
+        db_table = "fabric_variants"
+        constraints = TextileMaster.Meta.constraints + [
+            models.UniqueConstraint(
+                fields=["client", "quality", "design", "shade"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_fabricvariant_combo",
+            ),
+        ]
+
+
+class Agency(TenantModel, LegacyIdMixin):
+    """External grey fabric production agency (PDF §04, §05)."""
+
+    name = models.TextField()
+    code = models.TextField()
+    contact_person = models.TextField(null=True, blank=True)
+    phone = models.TextField(null=True, blank=True)
+    email = models.EmailField(null=True, blank=True)
+    gstin = models.TextField(null=True, blank=True)
+    address = models.TextField(null=True, blank=True)
+    default_rate = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    rate_uom = models.TextField(default="Meter")
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "production_agencies"
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "code"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_agency_code",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.code} - {self.name}"
+
+
+class Broker(TenantModel, LegacyIdMixin):
+    """Broker master for commission and brokerage tracking (PDF §04, §14)."""
+
+    COMMISSION_TYPES = [
+        ("percent", "percent"),
+        ("per_meter", "per_meter"),
+        ("per_taka", "per_taka"),
+        ("fixed", "fixed"),
+    ]
+
+    name = models.TextField()
+    code = models.TextField()
+    contact_person = models.TextField(null=True, blank=True)
+    phone = models.TextField(null=True, blank=True)
+    email = models.EmailField(null=True, blank=True)
+    pan = models.TextField(null=True, blank=True)
+    gstin = models.TextField(null=True, blank=True)
+    commission_type = models.TextField(choices=COMMISSION_TYPES, default="percent")
+    default_value = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "brokers"
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "code"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_broker_code",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.code} - {self.name}"
+
+
+class ProcessMaster(TenantModel, LegacyIdMixin):
+    """Textile processing types (Dyeing, Printing, Washing, etc.) with standard loss & tolerance (PDF §04, §07)."""
+
+    code = models.TextField()
+    name = models.TextField()
+    category = models.TextField(null=True, blank=True)
+    expected_loss_pct = models.DecimalField(max_digits=7, decimal_places=4, default=0)
+    tolerance_pct = models.DecimalField(max_digits=7, decimal_places=4, default=0)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "process_masters"
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "code"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_process_master_code",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.code} - {self.name}"
+
+
+class JobWorkRateMaster(TenantModel, LegacyIdMixin):
+    """Standard rate contract: processor × process × fabric quality (PDF §04, §07)."""
+
+    processor = models.ForeignKey(
+        Party, on_delete=models.CASCADE, related_name="jobwork_rates"
+    )
+    process = models.ForeignKey(
+        ProcessMaster, on_delete=models.CASCADE, related_name="rates"
+    )
+    fabric_quality = models.ForeignKey(
+        FabricQuality, null=True, blank=True, on_delete=models.CASCADE, related_name="jobwork_rates"
+    )
+    rate = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    rate_uom = models.TextField(default="Meter")
+    effective_from = models.DateField()
+    effective_to = models.DateField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "jobwork_rate_masters"
+        ordering = ["-effective_from", "processor"]
+
+    def __str__(self):
+        return f"{self.processor.name} - {self.process.name}: {self.rate}/{self.rate_uom}"
+
+
+class RateMaster(TenantModel, LegacyIdMixin):
+    """Sales and purchase price list / rate master (PDF §01, §06, §11)."""
+
+    RATE_TYPES = [
+        ("Sales", "Sales"),
+        ("Purchase", "Purchase"),
+    ]
+
+    rate_type = models.CharField(max_length=16, choices=RATE_TYPES, default="Sales")
+    party = models.ForeignKey(
+        Party, null=True, blank=True, on_delete=models.CASCADE, related_name="rate_masters"
+    )
+    item = models.ForeignKey(
+        "masters.Item", null=True, blank=True, on_delete=models.CASCADE, related_name="rate_masters"
+    )
+    fabric_quality = models.ForeignKey(
+        FabricQuality, null=True, blank=True, on_delete=models.CASCADE, related_name="rate_masters"
+    )
+    design = models.ForeignKey(
+        Design, null=True, blank=True, on_delete=models.CASCADE, related_name="rate_masters"
+    )
+    shade = models.ForeignKey(
+        Shade, null=True, blank=True, on_delete=models.CASCADE, related_name="rate_masters"
+    )
+    rate = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    min_selling_rate = models.DecimalField(
+        max_digits=18, decimal_places=4, default=0, null=True, blank=True
+    )
+    uom = models.TextField(default="Meter")
+    valid_from = models.DateField(default=timezone.localdate)
+    valid_to = models.DateField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+    notes = models.TextField(blank=True, default="")
+
+    class Meta:
+        db_table = "rate_masters"
+        ordering = ["-valid_from", "-created_at"]
+        indexes = [
+            models.Index(fields=["client", "rate_type", "is_active"], name="ix_rate_mstr_lookup"),
+            models.Index(fields=["client", "party", "rate_type"], name="ix_rate_mstr_party"),
+        ]
+
+    def __str__(self):
+        party_str = f" ({self.party.name})" if self.party else ""
+        return f"[{self.rate_type}] {self.rate}/{self.uom}{party_str}"
+
+
+PriceList = RateMaster
+
+
+class DefectMaster(TenantModel, LegacyIdMixin):
+    """Configurable defect catalogue for QC inspections (PDF §04, §08)."""
+
+    CATEGORIES = [
+        ("shade", "shade"),
+        ("stain", "stain"),
+        ("hole", "hole"),
+        ("printing defect", "printing defect"),
+        ("finish", "finish"),
+        ("weaving defect", "weaving defect"),
+        ("other", "other"),
+    ]
+    SEVERITIES = [
+        ("Minor", "Minor"),
+        ("Major", "Major"),
+        ("Critical", "Critical"),
+    ]
+
+    code = models.TextField()
+    name = models.TextField()
+    category = models.TextField(choices=CATEGORIES, default="other")
+    severity = models.TextField(choices=SEVERITIES, default="Minor")
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "defect_masters"
+        ordering = ["category", "name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "code"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_defect_master_code",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.code} - {self.name} ({self.severity})"
+
+
+class LossReasonMaster(TenantModel, LegacyIdMixin):
+    """Loss/wastage reason master (PDF §07, §11)."""
+
+    code = models.TextField()
+    name = models.TextField()
+    description = models.TextField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "loss_reason_masters"
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "code"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_loss_reason_code",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.code} - {self.name}"
+
+
+class ReturnReasonMaster(TenantModel, LegacyIdMixin):
+    """Reason for customer/supplier return or job work return (PDF §07, §09)."""
+
+    code = models.TextField()
+    name = models.TextField()
+    description = models.TextField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "return_reason_masters"
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "code"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_return_reason_code",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.code} - {self.name}"
+
+
+class Transporter(TenantModel, LegacyIdMixin):
+    """Dedicated transporter master with fleet and driver management (PDF §13)."""
+
+    name = models.TextField()
+    code = models.TextField()
+    contact_person = models.TextField(null=True, blank=True)
+    phone = models.TextField(null=True, blank=True)
+    email = models.EmailField(null=True, blank=True)
+    gstin = models.TextField(null=True, blank=True)
+    pan = models.TextField(null=True, blank=True)
+    address = models.JSONField(default=dict, blank=True)
+    # List of vehicle objects: [{ "vehicleNumber": "...", "vehicleType": "...", "capacity": "...", "defaultDriver": "...", "driverPhone": "..." }]
+    vehicles = models.JSONField(default=list, blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "transporters"
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "code"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_transporter_code",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.code} - {self.name}"
+
+
+class Item(TenantModel, LegacyIdMixin):
+    """db.md §4.2.
+
+    ``availableQty``, ``reservedQty`` and ``status`` are deliberately **not**
+    columns. The mock object carries them because the frontend recomputes them
+    on every render; here they are derived from movements and open orders
+    (db.md §7.3) and joined on at read, so the JSON contract is unchanged.
+    """
+
+    TRACKING_MODES = [("Quantity", "Quantity"), ("Serial", "Serial")]
+    LIFECYCLE = [("Active", "Active"), ("Draft", "Draft"), ("Archived", "Archived")]
+
+    sku = models.TextField()
+    name = models.TextField()
+    description = models.TextField(null=True, blank=True)
+    category = models.ForeignKey(
+        ItemCategory, null=True, blank=True, on_delete=models.SET_NULL, related_name="items"
+    )
+    item_kind = models.TextField(choices=ITEM_KINDS, default="Fabric")
+    hsn_code = models.TextField(null=True, blank=True)
+
+    uom = models.TextField(default="Nos")
+    purchase_unit = models.TextField(null=True, blank=True)
+    sales_unit = models.TextField(null=True, blank=True)
+    unit_conversion_factor = models.DecimalField(
+        max_digits=18, decimal_places=6, default=1
+    )
+
+    # Weight-based receiving -- the core fabrication rule (api.md §6.3).
+    is_weight_item = models.BooleanField(default=False)
+    theoretical_weight = models.DecimalField(
+        max_digits=18, decimal_places=4, null=True, blank=True
+    )
+    weight_unit = models.TextField(default="kg")
+    tolerance_pct = models.DecimalField(max_digits=7, decimal_places=4, default=2)
+
+    tracking_mode = models.TextField(choices=TRACKING_MODES, default="Quantity")
+    tracking_type = models.TextField(
+        choices=[("NONE", "NONE"), ("LOT", "LOT"), ("TAKA", "TAKA"), ("SERIAL", "SERIAL")],
+        default="NONE",
+    )
+    reorder_level = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    cost_price = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    selling_price = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    default_location = models.ForeignKey(
+        Location, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    vendor = models.ForeignKey(
+        Party, null=True, blank=True, on_delete=models.SET_NULL, related_name="supplied_items"
+    )
+    tax_pct = models.DecimalField(max_digits=7, decimal_places=4, null=True, blank=True)
+    lifecycle_status = models.TextField(choices=LIFECYCLE, default="Active")
+    custom_field_values = models.JSONField(default=dict, blank=True)
+
+    # Sheet spec
+    has_sheet_spec = models.BooleanField(default=False)
+    sheet_height = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
+    sheet_height_unit = models.TextField(choices=DIMENSION_UNITS, null=True, blank=True)
+    sheet_width = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
+    sheet_width_unit = models.TextField(choices=DIMENSION_UNITS, null=True, blank=True)
+    sheet_length = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
+    sheet_length_unit = models.TextField(choices=DIMENSION_UNITS, null=True, blank=True)
+    sheet_weight_kg = models.DecimalField(
+        max_digits=18, decimal_places=4, null=True, blank=True
+    )
+    dimension_unit = models.TextField(null=True, blank=True)  # legacy single-axis unit
+
+    # Fabric spec (``item_kind == "Fabric"``) — the textile catalogue fields:
+    # quality (Cotton/Polyester/…), weave design, colour, width and GSM.
+    fabric_quality = models.TextField(null=True, blank=True)
+    fabric_design = models.TextField(null=True, blank=True)
+    fabric_color = models.TextField(null=True, blank=True)
+    #: Width in inches (58", 60", …) — the way greige fabric is traded.
+    fabric_width = models.DecimalField(max_digits=7, decimal_places=2, null=True, blank=True)
+    fabric_gsm = models.DecimalField(max_digits=7, decimal_places=2, null=True, blank=True)
+
+    class Meta:
+        db_table = "items"
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "sku"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_items_sku",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["client", "category"],
+                name="ix_items_category",
+                condition=models.Q(deleted_at__isnull=True),
+            ),
+            models.Index(fields=["client", "sku"], name="ix_items_sku"),
+            models.Index(fields=["client", "item_kind"], name="ix_items_kind"),
+        ]
+
+    def __str__(self):
+        return f"{self.sku} {self.name}"
+
+    @property
+    def holds_stock(self):
+        return self.item_kind not in STOCKLESS_ITEM_KINDS
+
+
+class CategoryPart(TenantModel):
+    """Category default parts (``categoryParts`` in the frontend)."""
+
+    category = models.ForeignKey(
+        ItemCategory, on_delete=models.CASCADE, related_name="default_parts"
+    )
+    item = models.ForeignKey(Item, on_delete=models.CASCADE, related_name="+")
+    default_qty = models.DecimalField(max_digits=18, decimal_places=4, default=1)
+
+    class Meta:
+        db_table = "category_parts"
+        constraints = [
+            models.UniqueConstraint(fields=["category", "item"], name="uq_category_parts")
+        ]
+
+
+class ItemPart(TenantModel):
+    """Machine BOM (``itemParts``).
+
+    A machine's parts may themselves be machines; cycles are rejected on insert
+    with a recursive check in the service layer, because the self-reference
+    constraint only catches the trivial case (db.md §4.2).
+    """
+
+    parent_item = models.ForeignKey(Item, on_delete=models.CASCADE, related_name="bom_lines")
+    part_item = models.ForeignKey(Item, on_delete=models.PROTECT, related_name="used_in_boms")
+    required_qty = models.DecimalField(max_digits=18, decimal_places=4, default=1)
+
+    class Meta:
+        db_table = "item_parts"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["parent_item", "part_item"], name="uq_item_parts"
+            ),
+            models.CheckConstraint(
+                condition=~models.Q(parent_item=models.F("part_item")),
+                name="ck_item_parts_no_self",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(required_qty__gt=0), name="ck_item_parts_qty"
+            ),
+        ]
+
+
+# ---------------------------------------------------------------------------
+# db.md §4.3 -- Serial numbers
+# ---------------------------------------------------------------------------
+class ItemSerial(TenantModel):
+    """Replaces ``items.serialNumbers[]``.
+
+    An array cannot carry per-serial status, location, warranty link or
+    movement history -- api.md §4.2 requires filtering by status and §5.9
+    requires knowing which serials were already returned.
+    """
+
+    STATUSES = [
+        ("available", "available"),
+        ("reserved", "reserved"),
+        ("sold", "sold"),
+        ("returned", "returned"),
+        ("faulty", "faulty"),
+        ("scrapped", "scrapped"),
+        ("in_transit", "in_transit"),
+    ]
+
+    item = models.ForeignKey(Item, on_delete=models.CASCADE, related_name="serials")
+    serial_no = models.TextField()
+    location = models.ForeignKey(
+        Location, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    status = models.TextField(choices=STATUSES, default="available")
+    batch_number = models.TextField(null=True, blank=True)
+    received_movement = models.ForeignKey(
+        "inventory.StockMovement",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    sold_movement = models.ForeignKey(
+        "inventory.StockMovement",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    warranty_card = models.ForeignKey(
+        "sales.WarrantyCard",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+
+    class Meta:
+        db_table = "item_serials"
+        ordering = ["serial_no"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "item", "serial_no"], name="uq_item_serials"
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["client", "item", "status"], name="ix_item_serials_status"
+            )
+        ]
+
+    def __str__(self):
+        return self.serial_no
+
+
+class DocumentLineSerial(TenantModel):
+    """Serial selection per document line (db.md §3.2).
+
+    A ``line_table`` discriminator avoids nine near-empty tables; the cost is
+    no FK on ``line_id``, acceptable for a child only ever written alongside
+    its parent.
+    """
+
+    line_table = models.TextField()
+    line_id = models.UUIDField()
+    serial = models.ForeignKey(ItemSerial, on_delete=models.PROTECT, related_name="line_links")
+
+    class Meta:
+        db_table = "document_line_serials"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["line_table", "line_id", "serial"], name="uq_document_line_serials"
+            )
+        ]
+        indexes = [models.Index(fields=["serial"], name="ix_dls_serial")]
+
+
+class Vehicle(TenantModel, LegacyIdMixin):
+    """Vehicle master for logistics & fleet management (PDF §13)."""
+
+    vehicle_number = models.TextField(db_index=True)
+    vehicle_type = models.TextField(default="Truck")
+    capacity = models.TextField(null=True, blank=True)
+    transporter = models.ForeignKey(
+        Transporter, null=True, blank=True, on_delete=models.SET_NULL, related_name="vehicles_list"
+    )
+    is_active = models.BooleanField(default=True)
+    remarks = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "logistics_vehicles"
+        ordering = ["vehicle_number"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "vehicle_number"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_logistics_vehicle_number",
+            )
+        ]
+
+    def __str__(self):
+        return self.vehicle_number
+
+
+class Driver(TenantModel, LegacyIdMixin):
+    """Driver master for transport & fleet operations (PDF §13)."""
+
+    name = models.TextField()
+    mobile = models.TextField(null=True, blank=True)
+    licence = models.TextField(null=True, blank=True)
+    transporter = models.ForeignKey(
+        Transporter, null=True, blank=True, on_delete=models.SET_NULL, related_name="drivers_list"
+    )
+    is_active = models.BooleanField(default=True)
+    remarks = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "logistics_drivers"
+        ordering = ["name"]
+
+    def __str__(self):
+        return f"{self.name} ({self.mobile or self.licence or 'Driver'})"
