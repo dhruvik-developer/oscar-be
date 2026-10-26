@@ -689,15 +689,15 @@ DEFAULT_STAGES = [
     ("Future", 9, "#64748b", "CalendarClock", "#f8fafc", "#475569", False, False, False),
 ]
 
-#: api.md §9.3 -- the deal catalogue is separate and independent.
+#: api.md §9.3 -- the deal catalogue is separate and independent. This is
+#: the whole pipeline: Revised and Declined were dropped from the board
+#: (Deal.STAGES still accepts them so older deals keep their value).
 DEFAULT_DEAL_STAGES = [
     ("Draft", 1, False, False),
     ("Sent", 2, False, False),
     ("Open", 3, False, False),
-    ("Revised", 4, False, False),
-    ("Declined", 5, False, True),
-    ("Won", 6, True, False),
-    ("Lost", 7, False, True),
+    ("Won", 4, True, False),
+    ("Lost", 5, False, True),
 ]
 
 
@@ -719,6 +719,22 @@ def ensure_lead_sources(client):
     if Source._base_manager.filter(client=client).exists():
         return []
     return [Source.objects.create(client=client, name=name) for name in DEFAULT_LEAD_SOURCES]
+
+
+def ensure_deal_stages(client):
+    """Make sure the pipeline stages (DEFAULT_DEAL_STAGES) exist as live rows.
+
+    The board draws its columns from these rows and falls back to defaults
+    only when there are none, so one stray stage (added on the former Deal
+    Stages screen) replaced the whole Draft → Sent → Open flow.
+    """
+    from .models import DealStage
+
+    for name, sequence, is_won, is_lost in DEFAULT_DEAL_STAGES:
+        if not DealStage.objects.filter(client=client, name=name, deleted_at__isnull=True).exists():
+            DealStage.objects.create(
+                client=client, name=name, sequence=sequence, is_won=is_won, is_lost=is_lost
+            )
 
 
 def ensure_crm_configuration(client):

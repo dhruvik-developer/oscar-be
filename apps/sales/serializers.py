@@ -1,6 +1,7 @@
 """Sales serializers (api.md §5)."""
 from rest_framework import serializers
 
+from apps.core.exceptions import ValidationFailed
 from apps.core.document_serializers import (
     HEADER_FIELDS,
     READ_ONLY_HEADER_FIELDS,
@@ -100,6 +101,25 @@ class QuotationSerializer(DocumentSerializer):
     crmLead = TenantPrimaryKeyRelatedField(
         source="crm_lead", model="crm.Lead", required=False, allow_null=True
     )
+    #: Writable here only: a quotation may be addressed by hand to anyone
+    #: (no customer or lead row). Contact details go in ``billing_address``.
+    #: With a party or lead the snapshot overwrites it, as for any document.
+    partyName = serializers.CharField(
+        source="party_name", required=False, allow_blank=True, allow_null=True
+    )
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        instance = self.instance
+        party = attrs.get("party", getattr(instance, "party", None))
+        lead = attrs.get("crm_lead", getattr(instance, "crm_lead", None))
+        name = attrs.get("party_name", getattr(instance, "party_name", None))
+        if party is None and lead is None and not (name or "").strip():
+            raise ValidationFailed(
+                "Choose a customer or lead, or enter the name for a manual quotation.",
+                field_errors={"partyName": ["Required when no customer or lead is chosen."]},
+            )
+        return attrs
 
     class Meta:
         model = Quotation

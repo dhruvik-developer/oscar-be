@@ -892,6 +892,18 @@ class DealStageViewSet(TenantModelViewSet):
     ordering = ["sequence"]
     permission_map = {"read": ["view_lead"], "write": ["manage_pipeline"]}
 
+    def get_queryset(self):
+        # The pipeline is fixed (services.DEFAULT_DEAL_STAGES): rows left from
+        # the removed Deal Stages screen, and the retired Revised / Declined,
+        # are not board columns.
+        return super().get_queryset().filter(
+            name__in=[name for name, *_ in services.DEFAULT_DEAL_STAGES]
+        )
+
+    def list(self, request, *args, **kwargs):
+        services.ensure_deal_stages(request.user.client)
+        return super().list(request, *args, **kwargs)
+
 
 class MasterTaskViewSet(TenantModelViewSet):
     queryset = MasterTask.objects.prefetch_related("stages")

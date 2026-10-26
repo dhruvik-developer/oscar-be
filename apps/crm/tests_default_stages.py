@@ -8,7 +8,7 @@ from rest_framework.test import APIClient
 
 from apps.accounts.authentication import build_tokens
 from apps.accounts.models import Client, User
-from apps.crm.models import Lead, Source, Stage
+from apps.crm.models import DealStage, Lead, Source, Stage
 from apps.crm.services import DEFAULT_STAGES
 
 
@@ -72,3 +72,14 @@ class DefaultLeadSourceTests(WorkspaceTestCase):
         Source.objects.create(client=self.tenant, name="Exhibition")
         names = [row["name"] for row in self.api.get("/api/v1/crm/sources/").data["results"]]
         self.assertEqual(names, ["Exhibition"])
+
+
+class DealStageCatalogueTests(WorkspaceTestCase):
+    def test_board_gets_the_pipeline_stages_and_not_stray_ones(self):
+        DealStage.objects.create(client=self.tenant, name="frieght", sequence=0)
+        resp = self.api.get("/api/v1/crm/deal-stages/")
+        self.assertEqual(resp.status_code, 200)
+        names = [row["name"] for row in resp.data["results"]]
+        self.assertEqual(names, ["Draft", "Sent", "Open", "Won", "Lost"])
+        self.api.get("/api/v1/crm/deal-stages/")
+        self.assertEqual(DealStage.objects.filter(client=self.tenant, name="Draft").count(), 1)

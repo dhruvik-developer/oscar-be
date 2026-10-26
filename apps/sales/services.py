@@ -1332,5 +1332,50 @@ def get_picking_list(order):
         "date": order.doc_date.isoformat() if order.doc_date else None,
         "deliveryDate": order.delivery_date.isoformat() if getattr(order, "delivery_date", None) else None,
         "lines": picking_items,
-    }
-
+    }
+
+
+#: Keys of a manual quotation's ``billing_address`` that are contact details,
+#: not address lines.
+MANUAL_CONTACT_KEYS = ("contactPerson", "phone", "email")
+
+
+def party_from_manual_quotation(quotation, *, user=None):
+    """The customer for an approved quotation addressed by hand.
+
+    A manual quotation has no lead and no party, only the name and details
+    typed on it. On approval it needs a customer like any other (the sales
+    order is raised on one): an active customer with the same name is reused,
+    otherwise one is created from what the quotation carries.
+    """
+    from apps.masters.models import Party
+
+    name = (quotation.party_name or "").strip()
+    if not name:
+        return None
+    existing = Party.objects.filter(
+        client_id=quotation.client_id,
+        name__iexact=name,
+        type__in=("Customer", "Both"),
+        deleted_at__isnull=True,
+    ).first()
+    if existing is not None:
+        return existing
+
+    details = dict(quotation.billing_address or {})
+    address = {k: v for k, v in details.items() if k not in MANUAL_CONTACT_KEYS and v}
+    gstin = (quotation.party_gstin or "").strip() or None
+    return Party.objects.create(
+        client_id=quotation.client_id,
+        code=allocate_number(quotation.client, "CUST"),
+        type="Customer",
+        name=name,
+        phone=details.get("phone") or None,
+        email=details.get("email") or None,
+        gstin=gstin,
+        gst_treatment="Registered Business" if gstin else "Unregistered Business",
+        place_of_supply=quotation.place_of_supply,
+        billing_address=address,
+        shipping_address=dict(address),
+        created_by=user if getattr(user, "is_authenticated", False) else None,
+    )
