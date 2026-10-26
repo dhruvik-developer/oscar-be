@@ -40,6 +40,9 @@ class MeUserSerializer(BaseModelSerializer):
     def to_representation(self, instance):
         data = super().to_representation(instance)
         data["roleCode"] = instance.role.code if instance.role_id else None
+        data["mustChangePassword"] = bool(instance.must_change_password)
+        data["twoFactorEnabled"] = bool(instance.two_factor_enabled)
+        data["twoFactorRequired"] = instance.requires_two_factor
         data["isSuperuser"] = bool(instance.is_superuser)
         data["is_superuser"] = bool(instance.is_superuser)
         return data
@@ -85,8 +88,21 @@ class ForgotPasswordSerializer(BaseSerializer):
     email = serializers.EmailField()
 
 
+class LoginOtpSerializer(BaseSerializer):
+    challengeId = serializers.UUIDField()
+    otp = serializers.RegexField(r"^\s*\d{6}\s*$", error_messages={"invalid": "Enter the 6-digit code."})
+
+
+class VerifyResetOtpSerializer(BaseSerializer):
+    email = serializers.EmailField()
+    otp = serializers.RegexField(r"^\s*\d{6}\s*$", error_messages={"invalid": "Enter the 6-digit code."})
+
+
 class ResetPasswordSerializer(BaseSerializer):
     token = serializers.CharField()
+    #: Required when the token came from the reset email: the link alone
+    #: cannot change a password, the emailed code has to go with it.
+    otp = serializers.CharField(required=False, allow_blank=True, trim_whitespace=True)
     newPassword = serializers.CharField(write_only=True, trim_whitespace=False)
 
     def validate_newPassword(self, value):
@@ -98,13 +114,15 @@ class ResetPasswordSerializer(BaseSerializer):
 
 
 class UpdateMeSerializer(BaseModelSerializer):
-    """``PATCH /auth/me/`` -- own profile only: name, phone, avatar."""
+    """``PATCH /auth/me/`` -- own profile only: name, phone, avatar, and opting
+    in to two-step sign-in. A role that requires it cannot be opted out of."""
 
     avatar = serializers.CharField(source="avatar_url", required=False, allow_null=True)
+    twoFactorEnabled = serializers.BooleanField(source="two_factor_enabled", required=False)
 
     class Meta:
         model = User
-        fields = ["name", "phone", "avatar"]
+        fields = ["name", "phone", "avatar", "twoFactorEnabled"]
 
 
 class UserSessionSerializer(BaseModelSerializer):
@@ -156,6 +174,7 @@ class UserSerializer(BaseModelSerializer):
     lastLogin = serializers.DateTimeField(source="last_login_at", read_only=True)
     permissions = serializers.SerializerMethodField()
     password = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    twoFactorEnabled = serializers.BooleanField(source="two_factor_enabled", required=False)
 
     class Meta:
         model = User
@@ -164,6 +183,7 @@ class UserSerializer(BaseModelSerializer):
             "joinedDate", "lastLogin", "employeeId", "isFromHrms", "designation",
             "employeeStatus", "location", "reportingManager",
             "reportingManagerId", "avatar", "permissions", "crm_roles", "password",
+            "twoFactorEnabled",
             "created_at", "updated_at",
         ]
         read_only_fields = ["created_at", "updated_at"]
@@ -234,7 +254,9 @@ class UserSerializer(BaseModelSerializer):
                     validated_data["role"] = matched_role
         user = User(**validated_data)
         if password:
+            # An administrator chose it, so the user replaces it at first sign-in.
             user.set_password(password)
+            user.must_change_password = True
         else:
             # api.md §3.1 -- create "triggers the invite email"; until the
             # invite is accepted the account cannot be logged into.
@@ -256,8 +278,11 @@ class UserSerializer(BaseModelSerializer):
                     validated_data["role"] = matched_role
         user = super().update(instance, validated_data)
         if password:
+            request = self.context.get("request")
+            set_by_self = bool(request and getattr(request.user, "pk", None) == user.pk)
             user.set_password(password)
-            user.save(update_fields=["password"])
+            user.must_change_password = not set_by_self
+            user.save(update_fields=["password", "must_change_password"])
         return user
 
 
@@ -293,12 +318,14 @@ class RoleSerializer(BaseModelSerializer):
         child=serializers.CharField(), required=False, write_only=True
     )
     permissions = serializers.SerializerMethodField()
+    requiresTwoFactor = serializers.BooleanField(source="requires_two_factor", required=False)
 
     class Meta:
         model = Role
         fields = [
             "id", "code", "name", "description", "is_system", "userCount",
-            "permissions", "selectedPermissions", "created_at", "updated_at",
+            "permissions", "selectedPermissions", "requiresTwoFactor",
+            "created_at", "updated_at",
         ]
         read_only_fields = ["is_system", "created_at", "updated_at"]
 

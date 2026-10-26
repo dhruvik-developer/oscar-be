@@ -16,11 +16,15 @@ from rest_framework_simplejwt.exceptions import (
 )
 from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 
-from apps.core.exceptions import NotAuthenticated
+from apps.core.exceptions import NotAuthenticated, PermissionDenied
 from apps.core.tenancy import set_current_client_id
 
 CLIENT_CLAIM = "client_id"
 PERMISSIONS_CLAIM = "perms"
+
+#: What a user holding an administrator-chosen password may still call:
+#: enough to load who they are, replace the password, or leave.
+PASSWORD_CHANGE_ALLOWED = ("/auth/me/", "/auth/change-password/", "/auth/logout/")
 
 
 class TenantJWTAuthentication(JWTAuthentication):
@@ -48,6 +52,27 @@ class TenantJWTAuthentication(JWTAuthentication):
             raise NotAuthenticated(
                 "Your session is no longer valid. Please sign in again.",
                 code="TOKEN_INVALID",
+            )
+
+        # Signing out, a password change or reset, deactivation or "sign out
+        # other devices" revoke the session row. Checking it here makes that
+        # take effect now rather than when the access token expires.
+        session_id = token.get("sid")
+        if session_id:
+            from .models import UserSession
+
+            session = UserSession.objects.filter(pk=session_id).only(
+                "revoked_at", "expires_at"
+            ).first()
+            if session is None or not session.is_active:
+                raise NotAuthenticated(
+                    "Your session has been signed out.", code="TOKEN_REVOKED"
+                )
+
+        if user.must_change_password and not request.path.endswith(PASSWORD_CHANGE_ALLOWED):
+            raise PermissionDenied(
+                "Set your own password before continuing.",
+                code="PASSWORD_CHANGE_REQUIRED",
             )
 
         request.client_id = user.client_id

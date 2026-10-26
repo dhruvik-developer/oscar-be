@@ -35,6 +35,15 @@ def env_list(key, default=""):
 
 SECRET_KEY = env("DJANGO_SECRET_KEY", "dev-insecure-key-do-not-use-in-production")
 DEBUG = env_bool("DJANGO_DEBUG", True)
+# JWTs and password-reset codes are signed with this key; a short or default
+# one makes them forgeable. Development may run with it, production may not.
+if not DEBUG and (len(SECRET_KEY) < 32 or "insecure" in SECRET_KEY or "change-me" in SECRET_KEY):
+    from django.core.exceptions import ImproperlyConfigured
+
+    raise ImproperlyConfigured(
+        "DJANGO_SECRET_KEY must be a random string of at least 32 characters "
+        "when DJANGO_DEBUG=False."
+    )
 ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1,0.0.0.0,testserver")
 
 INSTALLED_APPS = [
@@ -223,6 +232,7 @@ REST_FRAMEWORK = {
         "public": "60/min",
         "public_write": "10/min",
         "login": "20/min",
+        "password_change": "5/min",
     },
 }
 
@@ -253,6 +263,17 @@ CORS_ALLOWED_ORIGINS = env_list(
     "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000",
 )
 CORS_ALLOW_CREDENTIALS = False
+
+#: Where the React app is served; password-reset emails link to
+#: ``{FRONTEND_URL}/reset-password``. Defaults to the first CORS origin.
+FRONTEND_URL = env("FRONTEND_URL", "") or (CORS_ALLOWED_ORIGINS[0] if CORS_ALLOWED_ORIGINS else "")
+
+#: Shown by the sign-in page's "IT Helpdesk" box (GET /auth/support/). Before
+#: sign-in the tenant is unknown, so this is per deployment, not per tenant.
+#: Empty values are hidden rather than replaced with placeholders.
+SUPPORT_EMAIL = env("SUPPORT_EMAIL", "")
+SUPPORT_PHONE = env("SUPPORT_PHONE", "")
+SUPPORT_HOURS = env("SUPPORT_HOURS", "")
 CORS_ALLOW_HEADERS = (
     "accept",
     "authorization",
