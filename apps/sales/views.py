@@ -513,6 +513,9 @@ class QuotationViewSet(SalesDocumentViewSet):
             quotation.crm_lead = conversion["lead"]
 
         party = conversion["party"]
+        if party is None and quotation.party_id is None and quotation.crm_lead_id is None:
+            # Manual quotation (typed name, no lead): its customer is made now.
+            party = services.party_from_manual_quotation(quotation, user=request.user)
         # The approved quotation stays linked to the customer: point it at the
         # converted (or matched) party so the follow-up Sales Order is raised
         # on the right customer. The frozen address snapshot is only filled

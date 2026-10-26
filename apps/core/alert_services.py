@@ -203,6 +203,32 @@ def get_thresholds(client_id, alert_key):
     return int(days or 0), pct, amount
 
 
+def alert_recipients(client_id):
+    """Active users of the tenant who can see alerts.
+
+    The same rule as ``User.effective_permissions``: superusers, or
+    ``view_alerts`` from the role or a user grant, unless a user override
+    denies it. (``is_staff`` is the Django-admin flag; tenant users do not
+    carry it, so filtering on it reached nobody.)
+    """
+    from django.db.models import Exists, OuterRef
+
+    from apps.accounts.models import RolePermission, User, UserPermission
+
+    perm = "view_alerts"
+    role_grant = RolePermission.objects.filter(role_id=OuterRef("role_id"), permission_id=perm)
+    overrides = UserPermission.objects.filter(user_id=OuterRef("pk"), permission_id=perm)
+    return User.objects.filter(
+        client_id=client_id, status="Active", deleted_at__isnull=True
+    ).filter(
+        Q(is_superuser=True)
+        | (
+            (Exists(role_grant) | Exists(overrides.filter(effect="grant")))
+            & ~Exists(overrides.exclude(effect="grant"))
+        )
+    )
+
+
 def trigger_incident(
     client_id,
     alert_key,
@@ -251,9 +277,7 @@ def trigger_incident(
 
     # In-app notification fanout
     try:
-        from apps.accounts.models import User
-        recipients = User.objects.filter(client_id=client_id, status="Active", is_staff=True)[:10]
-        for user in recipients:
+        for user in alert_recipients(client_id):
             Notification.objects.create(
                 client_id=client_id,
                 recipient=user,

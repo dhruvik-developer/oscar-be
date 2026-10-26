@@ -231,6 +231,36 @@ def team_roster(client_id):
     return roster
 
 
+def assignment_options(client_id):
+    """``GET /crm/assignment-options/`` -- the role and department masters.
+
+    Master and stage tasks pick their assignee role from Administration →
+    Roles and their department from HRMS → Departments, so the values stored
+    on a task are the same ones ``resolve_assignee`` matches users against.
+    """
+    from apps.accounts.models import Role
+    from apps.hrms.models import Department
+
+    roles = Role.objects.filter(client_id=client_id, deleted_at__isnull=True).order_by("name")
+    departments = Department.objects.filter(
+        client_id=client_id, deleted_at__isnull=True, status="Active"
+    ).order_by("name")
+    return {
+        "roles": [{"id": str(r.id), "code": r.code, "name": r.name} for r in roles],
+        "departments": [{"id": str(d.id), "name": d.name} for d in departments],
+    }
+
+
+def _role_filter(role):
+    """A user holds ``role`` through their system role (name or code) or, for
+    tasks saved before roles came from the master, through ``crm_roles``."""
+    return (
+        Q(role__name__iexact=role, role__deleted_at__isnull=True)
+        | Q(role__code__iexact=role, role__deleted_at__isnull=True)
+        | Q(crm_roles__contains=[role])
+    )
+
+
 def resolve_assignee(client_id, role=None, department=None):
     """Role + department, round-robin on open-task count (db.md §9.3).
 
@@ -239,26 +269,26 @@ def resolve_assignee(client_id, role=None, department=None):
     """
     from apps.accounts.models import User
 
-    queryset = User.objects.filter(
+    base = User.objects.filter(
         client_id=client_id, deleted_at__isnull=True, status="Active"
     )
     if role:
-        queryset = queryset.filter(crm_roles__contains=[role])
-    if department:
-        queryset = queryset.filter(department__iexact=department)
+        base = base.filter(_role_filter(role))
+    # An HR-sourced account carries its department on the employee row.
+    queryset = (
+        base.filter(
+            Q(department__iexact=department)
+            | Q(employee__department__name__iexact=department)
+        )
+        if department
+        else base
+    )
 
-    candidates = list(queryset.only("id"))
+    candidates = list(queryset.only("id").distinct())
     if not candidates and department:
         # Fall back to role alone before giving up -- a mis-typed department
         # should not silently leave the task unassigned.
-        candidates = list(
-            User.objects.filter(
-                client_id=client_id,
-                deleted_at__isnull=True,
-                status="Active",
-                crm_roles__contains=[role] if role else [],
-            ).only("id")
-        )
+        candidates = list(base.only("id").distinct())
     if not candidates:
         return None
 
@@ -659,16 +689,65 @@ DEFAULT_STAGES = [
     ("Future", 9, "#64748b", "CalendarClock", "#f8fafc", "#475569", False, False, False),
 ]
 
-#: api.md §9.3 -- the deal catalogue is separate and independent.
+#: api.md §9.3 -- the deal catalogue is separate and independent. This is
+#: the whole pipeline: Revised and Declined were dropped from the board
+#: (Deal.STAGES still accepts them so older deals keep their value).
 DEFAULT_DEAL_STAGES = [
     ("Draft", 1, False, False),
     ("Sent", 2, False, False),
     ("Open", 3, False, False),
-    ("Revised", 4, False, False),
-    ("Declined", 5, False, True),
-    ("Won", 6, True, False),
-    ("Lost", 7, False, True),
+    ("Won", 4, True, False),
+    ("Lost", 5, False, True),
 ]
+
+
+#: Lead sources a new workspace starts with: textile leads come through a
+#: broker or a company salesperson (PDF §11-12). More are added under
+#: CRM Setup → Lead Sources.
+DEFAULT_LEAD_SOURCES = ("Broker", "Sales Person")
+
+
+def ensure_lead_sources(client):
+    """Seed DEFAULT_LEAD_SOURCES for a workspace that has never had a source.
+
+    The lead form used to add these two in the browser only, so they showed
+    in the dropdown but not on the Lead Sources page, and a lead saved with
+    one lost its source (the server only takes a real source id).
+    """
+    from .models import Source
+
+    if Source._base_manager.filter(client=client).exists():
+        return []
+    return [Source.objects.create(client=client, name=name) for name in DEFAULT_LEAD_SOURCES]
+
+
+def ensure_deal_stages(client):
+    """Make sure the pipeline stages (DEFAULT_DEAL_STAGES) exist as live rows.
+
+    The board draws its columns from these rows and falls back to defaults
+    only when there are none, so one stray stage (added on the former Deal
+    Stages screen) replaced the whole Draft → Sent → Open flow.
+    """
+    from .models import DealStage
+
+    for name, sequence, is_won, is_lost in DEFAULT_DEAL_STAGES:
+        if not DealStage.objects.filter(client=client, name=name, deleted_at__isnull=True).exists():
+            DealStage.objects.create(
+                client=client, name=name, sequence=sequence, is_won=is_won, is_lost=is_lost
+            )
+
+
+def ensure_crm_configuration(client):
+    """Seed the shipped stages for a workspace that has never had any.
+
+    Workspaces are provisioned outside the API, so nothing seeded them and a
+    new one had no lead stages: every lead create failed, and the app kept
+    leads only in the browser. Soft-deleted rows count as "had stages", so
+    a workspace that deliberately removed them is left alone.
+    """
+    if Stage._base_manager.filter(client=client).exists():
+        return []
+    return seed_crm_configuration(client)
 
 
 def seed_crm_configuration(client):
@@ -701,7 +780,7 @@ def seed_crm_configuration(client):
             defaults={"sequence": sequence, "is_won": is_won, "is_lost": is_lost},
         )
 
-    for name in ("Website", "Referral", "Exhibition", "Walk-in", "Campaign"):
+    for name in (*DEFAULT_LEAD_SOURCES, "Website", "Referral", "Exhibition", "Walk-in", "Campaign"):
         Source.objects.get_or_create(client=client, name=name)
 
     return created

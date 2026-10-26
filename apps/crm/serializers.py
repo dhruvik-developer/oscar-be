@@ -106,7 +106,8 @@ class LeadSerializer(BaseModelSerializer):
     #: JSON ``status`` maps to the stage *name* -- stages are configurable.
     status = serializers.CharField(source="stage.name", read_only=True)
     isLost = serializers.BooleanField(source="stage.is_lost", read_only=True)
-    stageId = TenantPrimaryKeyRelatedField(source="stage", model="crm.Stage")
+    #: Optional on create: the workspace's first active stage is used.
+    stageId = TenantPrimaryKeyRelatedField(source="stage", model="crm.Stage", required=False)
     source = serializers.CharField(source="source.name", read_only=True)
     sourceId = TenantPrimaryKeyRelatedField(
         source="source", model="crm.Source", required=False, allow_null=True
@@ -475,12 +476,27 @@ class DealSerializer(BaseModelSerializer):
     expectedCloseDate = serializers.DateField(
         source="expected_close_date", required=False, allow_null=True
     )
+    source = serializers.SerializerMethodField()
+    phone = serializers.SerializerMethodField()
+    leadNumber = serializers.CharField(source="lead.lead_number", read_only=True, default="")
+
+    def get_source(self, obj):
+        if obj.lead and obj.lead.source:
+            return obj.lead.source.name
+        return ""
+
+    def get_phone(self, obj):
+        if obj.lead and obj.lead.phone:
+            return obj.lead.phone
+        if obj.party and getattr(obj.party, "phone", None):
+            return obj.party.phone
+        return ""
 
     class Meta:
         model = Deal
         fields = [
-            "id", "deal_number", "title", "leadId", "customerId", "customerName",
-            "ownerId", "ownerName", "stage", "value", "probability",
+            "id", "deal_number", "title", "leadId", "leadNumber", "customerId", "customerName",
+            "ownerId", "ownerName", "stage", "value", "probability", "source", "phone",
             "expected_close_date", "expectedCloseDate", "closed_at", "lost_reason", "quotation",
             "crm_project", "created_at", "updated_at",
         ]

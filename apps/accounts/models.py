@@ -89,6 +89,9 @@ class Role(TenantModel):
     name = models.TextField()
     description = models.TextField(null=True, blank=True)
     is_system = models.BooleanField(default=False)
+    #: Everyone in this role confirms sign-in with an emailed code
+    #: (PDF §16: owner, accounts and other sensitive roles).
+    requires_two_factor = models.BooleanField(default=False)
     permissions = models.ManyToManyField(
         Permission, through="RolePermission", related_name="roles"
     )
@@ -205,6 +208,12 @@ class User(AbstractBaseUser, PermissionsMixin, AuditedModel):
     last_login_at = models.DateTimeField(null=True, blank=True)
     failed_login_count = models.IntegerField(default=0)
     locked_until = models.DateTimeField(null=True, blank=True)
+    #: Set when an administrator chooses the password; the user must replace
+    #: it before using the app. Cleared by change-password and reset-password.
+    must_change_password = models.BooleanField(default=False)
+    #: This user confirms sign-in with an emailed code even when the role
+    #: does not ask for it.
+    two_factor_enabled = models.BooleanField(default=False)
 
     #: CRM stage automation resolves assignees by role + department against a
     #: team roster (api.md §9.3). The frontend hardcodes this in
@@ -242,6 +251,10 @@ class User(AbstractBaseUser, PermissionsMixin, AuditedModel):
         super().save(*args, **kwargs)
 
     # -- permissions -------------------------------------------------------
+    @property
+    def requires_two_factor(self):
+        return bool(self.two_factor_enabled or (self.role_id and self.role.requires_two_factor))
+
     def effective_permissions(self):
         if self.is_superuser:
             all_perms = set(Permission.objects.values_list("id", flat=True))
@@ -335,6 +348,14 @@ class PasswordResetToken(models.Model):
     expires_at = models.DateTimeField()
     used_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    #: The emailed 6-digit code, an alternative to the link. Keyed hash of
+    #: (row id, code); it expires sooner than the link and dies after
+    #: OTP_MAX_ATTEMPTS wrong guesses.
+    otp_hash = models.TextField(null=True, blank=True)
+    otp_expires_at = models.DateTimeField(null=True, blank=True)
+    otp_attempts = models.IntegerField(default=0)
+
+    OTP_MAX_ATTEMPTS = 5
 
     class Meta:
         db_table = "password_reset_tokens"
@@ -342,3 +363,43 @@ class PasswordResetToken(models.Model):
     @property
     def is_usable(self):
         return self.used_at is None and self.expires_at > timezone.now()
+
+    @property
+    def otp_usable(self):
+        return (
+            self.is_usable
+            and bool(self.otp_hash)
+            and self.otp_expires_at is not None
+            and self.otp_expires_at > timezone.now()
+            and self.otp_attempts < self.OTP_MAX_ATTEMPTS
+        )
+
+
+class LoginChallenge(models.Model):
+    """The second step of a two-factor sign-in.
+
+    Created after a correct password; holds the emailed code (keyed hash) until
+    it is entered. The id goes to the client, the code only to the inbox.
+    """
+
+    MAX_ATTEMPTS = 5
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="login_challenges")
+    otp_hash = models.TextField()
+    expires_at = models.DateTimeField()
+    attempts = models.IntegerField(default=0)
+    used_at = models.DateTimeField(null=True, blank=True)
+    ip = models.GenericIPAddressField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "login_challenges"
+
+    @property
+    def is_usable(self):
+        return (
+            self.used_at is None
+            and self.expires_at > timezone.now()
+            and self.attempts < self.MAX_ATTEMPTS
+        )
