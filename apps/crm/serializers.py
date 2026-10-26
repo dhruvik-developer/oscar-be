@@ -106,7 +106,8 @@ class LeadSerializer(BaseModelSerializer):
     #: JSON ``status`` maps to the stage *name* -- stages are configurable.
     status = serializers.CharField(source="stage.name", read_only=True)
     isLost = serializers.BooleanField(source="stage.is_lost", read_only=True)
-    stageId = TenantPrimaryKeyRelatedField(source="stage", model="crm.Stage")
+    #: Optional on create: the workspace's first active stage is used.
+    stageId = TenantPrimaryKeyRelatedField(source="stage", model="crm.Stage", required=False)
     source = serializers.CharField(source="source.name", read_only=True)
     sourceId = TenantPrimaryKeyRelatedField(
         source="source", model="crm.Source", required=False, allow_null=True

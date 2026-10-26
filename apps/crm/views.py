@@ -165,6 +165,7 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
             self.request.user.client, "LEAD"
         )
         if not serializer.validated_data.get("stage"):
+            services.ensure_crm_configuration(self.request.user.client)
             first = Stage.objects.filter(
                 client_id=self.get_client_id(), is_active=True, deleted_at__isnull=True
             ).order_by("sequence").first()
@@ -852,6 +853,12 @@ class StageViewSet(TenantModelViewSet):
             lead_count=Count("leads", filter=Q(leads__deleted_at__isnull=True))
         )
 
+    def list(self, request, *args, **kwargs):
+        # A workspace that never had stages gets the defaults on first read,
+        # so the Leads screen has somewhere to put a new lead.
+        services.ensure_crm_configuration(request.user.client)
+        return super().list(request, *args, **kwargs)
+
     @action(detail=False, methods=["post"])
     @transaction.atomic
     def reorder(self, request):
@@ -1103,6 +1110,16 @@ class TeamRosterView(APIView):
 
     def get(self, request):
         return Response({"roster": services.team_roster(request.client_id)})
+
+
+class AssignmentOptionsView(APIView):
+    """``GET /crm/assignment-options/`` -- roles and departments for task templates."""
+
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_task"]
+
+    def get(self, request):
+        return Response(services.assignment_options(request.client_id))
 
 
 # ---------------------------------------------------------------------------
@@ -1542,6 +1559,12 @@ class SourceViewSet(TenantModelViewSet):
     audit_label_field = "name"
     status_field = None
     ordering = ["name"]
+
+    def list(self, request, *args, **kwargs):
+        # A workspace that never had sources gets Broker / Sales Person, so
+        # the Lead Source dropdown and this list show the same real rows.
+        services.ensure_lead_sources(request.user.client)
+        return super().list(request, *args, **kwargs)
 
 
 class IndustryViewSet(TenantModelViewSet):

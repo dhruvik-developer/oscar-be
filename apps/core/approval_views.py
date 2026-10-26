@@ -335,6 +335,15 @@ class AlertSettingViewSet(viewsets.ModelViewSet):
         client_id = getattr(self.request, "client_id", None) or getattr(self.request.user, "client_id", None)
         return AlertSetting.objects.filter(client_id=client_id).order_by("alert_key")
 
+    def list(self, request, *args, **kwargs):
+        # The defaults used to appear only after the first alert run, so the
+        # Thresholds tab was empty on a new workspace. get_or_create: cheap
+        # and never overwrites a threshold someone changed.
+        from .alert_services import ensure_alert_settings
+
+        ensure_alert_settings(request.user.client)
+        return super().list(request, *args, **kwargs)
+
     def _reevaluate(self, instance, client_id):
         if instance.alert_key != "combined_grey_stock_low":
             return

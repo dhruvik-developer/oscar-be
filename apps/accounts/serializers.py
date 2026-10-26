@@ -1,9 +1,12 @@
 """Serializers for auth and administration (api.md §2 and §3)."""
+import re
+
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework import serializers
 
 from apps.core.exceptions import ValidationFailed
+from apps.core.phone import clean_mobile
 from apps.core.serializers import BaseModelSerializer, BaseSerializer
 
 from .models import Client, Permission, Role, RolePermission, User, UserPermission, UserSession
@@ -124,6 +127,9 @@ class UpdateMeSerializer(BaseModelSerializer):
         model = User
         fields = ["name", "phone", "avatar", "twoFactorEnabled"]
 
+    def validate_phone(self, value):
+        return clean_mobile(value)
+
 
 class UserSessionSerializer(BaseModelSerializer):
     isCurrent = serializers.SerializerMethodField()
@@ -230,6 +236,9 @@ class UserSerializer(BaseModelSerializer):
         """Role-derived plus overrides (api.md §3.1: "permissions[]" on detail)."""
         return sorted(user.effective_permissions())
 
+    def validate_phone(self, value):
+        return clean_mobile(value)
+
     def validate_email(self, value):
         value = value.lower()
         client_id = self.context.get("client_id")
@@ -327,6 +336,8 @@ class RoleSerializer(BaseModelSerializer):
             "permissions", "selectedPermissions", "requiresTwoFactor",
             "created_at", "updated_at",
         ]
+        # Derived from the name when omitted (see create).
+        extra_kwargs = {"code": {"required": False, "allow_blank": True}}
         read_only_fields = ["is_system", "created_at", "updated_at"]
 
     def get_userCount(self, role):
@@ -340,7 +351,30 @@ class RoleSerializer(BaseModelSerializer):
             RolePermission.objects.filter(role=role).values_list("permission_id", flat=True)
         )
 
+    def to_internal_value(self, data):
+        # The admin screen sends the permission list as `permissions` (the
+        # name it reads back); `permissions` is read-only here, so without
+        # this alias every permission change was silently dropped.
+        if hasattr(data, "get") and "selectedPermissions" not in data and isinstance(data.get("permissions"), list):
+            data = {**data, "selectedPermissions": data["permissions"]}
+        return super().to_internal_value(data)
+
+    def _unique_code(self, name):
+        """``Sales Executive`` → ``SALES_EXECUTIVE`` (``_2``, ``_3`` … if taken)."""
+        base = re.sub(r"[^A-Z0-9]+", "_", (name or "").upper()).strip("_")[:40] or "ROLE"
+        client_id = self.context.get("client_id")
+        taken = set(
+            Role.objects.filter(client_id=client_id, code__startswith=base, deleted_at__isnull=True)
+            .values_list("code", flat=True)
+        )
+        code, n = base, 2
+        while code in taken:
+            code, n = f"{base}_{n}", n + 1
+        return code
+
     def validate_code(self, value):
+        if not value:
+            return value
         client_id = self.context.get("client_id")
         existing = Role.objects.filter(client_id=client_id, code=value, deleted_at__isnull=True)
         if self.instance is not None:
@@ -366,12 +400,16 @@ class RoleSerializer(BaseModelSerializer):
 
     def create(self, validated_data):
         permission_ids = validated_data.pop("selectedPermissions", [])
+        if not validated_data.get("code"):
+            validated_data["code"] = self._unique_code(validated_data.get("name"))
         role = super().create(validated_data)
         self._apply_permissions(role, permission_ids)
         return role
 
     def update(self, instance, validated_data):
         permission_ids = validated_data.pop("selectedPermissions", None)
+        if not validated_data.get("code", instance.code):
+            validated_data.pop("code", None)  # never blank out an existing code
         role = super().update(instance, validated_data)
         if permission_ids is not None:
             self._apply_permissions(role, permission_ids)
