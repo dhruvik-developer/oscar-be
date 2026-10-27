@@ -3340,6 +3340,28 @@ class ExpenseViewSet(TenantModelViewSet):
 
 
 
+    @transaction.atomic
+
+    def perform_destroy(self, instance):
+
+        """A deleted expense takes its ledger entry with it (by reversal, never
+
+        by editing the posted entry) -- otherwise the books keep the cost."""
+
+        from apps.accounting import services as ledger
+
+
+
+        if instance.journal_entry_id:
+
+            ledger.reverse_entry(instance.journal_entry, user=self.request.user)
+
+        super().perform_destroy(instance)
+
+
+
+
+
 class VendorBillViewSet(TenantModelViewSet):
 
     """Manual vendor-bill entry, matched later to a real ``PurchaseBill``.

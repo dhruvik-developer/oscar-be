@@ -340,71 +340,6 @@ def validate_outward_stock(order, takas_data=None, qty=None):
     }
 
 
-
-
-def validate_outward_stock(order, takas_data=None, qty=None):
-    """Pre-flight validation for Stage 12 Job Work Outward dispatch."""
-    from apps.inventory.models import LotTaka
-
-    if order.status in JobWorkOrder.LOCKED_STATUSES:
-        raise ValidationFailed(f"Job Work Order {order.jwo_no} is locked ({order.status}).")
-
-    total_qty = D(str(qty or 0))
-    dispatched_so_far = _sum([o for o in live(order.outwards) if o.status in ("Sent", "Confirmed")])
-    remaining_planned = max(D(order.planned_qty or 0) - dispatched_so_far, ZERO)
-
-    taka_errors = []
-    validated_takas = []
-    calculated_qty = ZERO
-
-    if takas_data:
-        for item in takas_data:
-            taka_id = item.get("lot_taka_id") or item.get("lotTakaId") or item.get("lot_taka")
-            if isinstance(taka_id, LotTaka):
-                lot_taka = taka_id
-            else:
-                lot_taka = LotTaka.objects.filter(client_id=order.client_id, id=taka_id).first()
-
-            if not lot_taka:
-                taka_errors.append(f"Taka {taka_id} not found.")
-                continue
-
-            if lot_taka.status == "External WIP":
-                taka_errors.append(f"Roll {lot_taka.taka_number or lot_taka.taka_id} is already at external processor WIP.")
-            elif lot_taka.status in ("Dispatched", "QC Hold", "Scrapped", "Consumed"):
-                taka_errors.append(f"Roll {lot_taka.taka_number or lot_taka.taka_id} has status '{lot_taka.status}' and cannot be dispatched.")
-
-            taka_meters = D(str(item.get("meters") or lot_taka.available_quantity or 0))
-            if taka_meters <= ZERO:
-                taka_errors.append(f"Roll {lot_taka.taka_number or lot_taka.taka_id} has 0 available metres.")
-            elif taka_meters > D(str(lot_taka.available_quantity or 0)):
-                taka_errors.append(f"Roll {lot_taka.taka_number or lot_taka.taka_id}: requested {taka_meters}M exceeds available {lot_taka.available_quantity}M.")
-
-            calculated_qty += taka_meters
-            validated_takas.append({
-                "id": str(lot_taka.id),
-                "takaNumber": lot_taka.taka_number,
-                "lotNumber": lot_taka.lot_number,
-                "meters": float(taka_meters),
-                "availableQuantity": float(lot_taka.available_quantity or 0),
-            })
-
-    if total_qty <= ZERO and calculated_qty > ZERO:
-        total_qty = calculated_qty
-
-    if taka_errors:
-        raise ValidationFailed("; ".join(taka_errors), field_errors={"takas": taka_errors})
-
-    return {
-        "valid": True,
-        "totalQty": float(total_qty),
-        "remainingPlanned": float(remaining_planned),
-        "dispatchedSoFar": float(dispatched_so_far),
-        "validatedTakasCount": len(validated_takas),
-        "validatedTakas": validated_takas,
-    }
-
-
 def save_order_row(request, order, kind, serializer, instance=None):
     """Create (instance=None) or update one child row of a JWO."""
     model, _ser, series, label = ORDER_ROW_KINDS[kind]
@@ -417,6 +352,19 @@ def save_order_row(request, order, kind, serializer, instance=None):
     takas_data = None
     if kind in ("outwards", "inwards"):
         takas_data = data.pop("takas", None)
+    if kind == "outwards" and takas_data:
+        # Rolls already on this challan were checked when they were added
+        # (and may now sit at the processor); check only the new ones.
+        on_row = set()
+        if instance is not None:
+            on_row = {str(i) for i in instance.takas.values_list("lot_taka_id", flat=True)}
+        new_rolls = [
+            t for t in takas_data
+            if str(getattr(t.get("lot_taka"), "id", None) or t.get("lot_taka_id") or t.get("lotTakaId") or "")
+            not in on_row
+        ]
+        if new_rolls:
+            validate_outward_stock(order, new_rolls)
 
     if instance is None:
         if series:
@@ -481,33 +429,40 @@ def save_order_row(request, order, kind, serializer, instance=None):
             vendor_party = order.vendor
             wip_loc = stock_services.wip_location_for_party(order.client_id, vendor_party or order.vendor_name)
 
-            already_moved = StockMovement.objects.filter(
-                client_id=order.client_id,
-                reference_type="JobWorkOrder",
-                reference_id=order.id,
-                reference_number=row.no or order.jwo_no,
-                type="JOBWORK_OUTWARD",
-            ).exists()
-
-            if not already_moved:
-                for ot in row.takas.select_related("lot_taka").all():
-                    lot_taka = ot.lot_taka
-                    if lot_taka and lot_taka.status != "External WIP":
-                        meters = ot.meters or lot_taka.available_quantity or 0
-                        stock_services.relocate_lot(
-                            client_id=order.client_id,
-                            lot=lot_taka,
-                            quantity=meters,
-                            to_location_id=wip_loc.id,
-                            out_type="JOBWORK_OUTWARD",
-                            in_type="JOBWORK_OUTWARD",
-                            reference_type="JobWorkOrder",
-                            reference_id=order.id,
-                            reference_number=row.no or order.jwo_no,
-                            user=user,
-                        )
-                        lot_taka.status = "External WIP"
-                        lot_taka.save(update_fields=["status", "updated_at"])
+            for ot in row.takas.select_related("lot_taka").all():
+                lot_taka = ot.lot_taka
+                if not lot_taka or lot_taka.status == "External WIP":
+                    continue
+                # Guard per roll, so a roll added after confirmation still
+                # moves and a re-save never moves the same roll twice.
+                already_moved = StockMovement.objects.filter(
+                    client_id=order.client_id,
+                    reference_type="JobWorkOrder",
+                    reference_id=order.id,
+                    reference_number=row.no or order.jwo_no,
+                    type="JOBWORK_OUTWARD",
+                    lot_taka=lot_taka,
+                    quantity__lt=0,
+                ).exists()
+                if already_moved:
+                    continue
+                meters = ot.meters or lot_taka.available_quantity or 0
+                holder, _ = stock_services.relocate_lot(
+                    client_id=order.client_id,
+                    lot=lot_taka,
+                    quantity=meters,
+                    to_location_id=wip_loc.id,
+                    out_type="JOBWORK_OUTWARD",
+                    in_type="JOBWORK_OUTWARD",
+                    reference_type="JobWorkOrder",
+                    reference_id=order.id,
+                    reference_number=row.no or order.jwo_no,
+                    user=user,
+                )
+                # A partial send splits the roll: only the part at the
+                # processor is External WIP, the rest stays as it was.
+                holder.status = "External WIP"
+                holder.save(update_fields=["status", "updated_at"])
 
             if order.status in ("Draft", "Sent"):
                 order.status = "In-Process"
@@ -548,8 +503,12 @@ def save_order_row(request, order, kind, serializer, instance=None):
             rec_lot_num = t_entry.get("lot_number") or (
                 f"{source_taka.lot_number}-P" if source_taka else f"JWO-{order.jwo_no}"
             )
-            taka_num = str(t_entry.get("taka_number") or (idx + 1))
-            taka_id = t_entry.get("taka_id") or f"TAK-{rec_lot_num}-{taka_num}"
+            taka_num = stock_services._unique_taka_number(
+                order.client_id, rec_lot_num, str(t_entry.get("taka_number") or (idx + 1))
+            )
+            # The TAK series, like every other roll (was TAK-{lot}-P-{n}, which
+            # collided on a second inward of the same lot).
+            taka_id = t_entry.get("taka_id") or allocate_number(order.client_id, "TAK")
 
             rec_taka = None
             if target_item:
@@ -560,6 +519,7 @@ def save_order_row(request, order, kind, serializer, instance=None):
                     lot_number=rec_lot_num,
                     taka_number=taka_num,
                     taka_id=taka_id,
+                    barcode=taka_id,
                     received_quantity=meters,
                     available_quantity=ZERO,
                     roll_weight=weight_kg,

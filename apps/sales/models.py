@@ -192,6 +192,16 @@ class QuotationActivity(models.Model):
 # ---------------------------------------------------------------------------
 # Sales orders (api.md §5.4)
 # ---------------------------------------------------------------------------
+def order_lead(order):
+    """The CRM lead behind a sales order: its own link, else its quotation's."""
+    if order is None:
+        return None
+    if getattr(order, "crm_lead_id", None):
+        return order.crm_lead
+    quotation = getattr(order, "quotation", None)
+    return quotation.crm_lead if quotation is not None else None
+
+
 class SalesOrder(DocumentHeader):
     order_number = models.TextField(null=True, blank=True)
     stage = models.TextField(choices=choices(ORDER_STAGES), default="Draft")
@@ -200,6 +210,11 @@ class SalesOrder(DocumentHeader):
     delivery_date = models.DateField(null=True, blank=True)
     quotation = models.ForeignKey(
         Quotation, null=True, blank=True, on_delete=models.SET_NULL, related_name="orders"
+    )
+    #: The CRM lead the order came from. Set directly now that orders need no
+    #: quotation; the lead's agreed broker / salesperson terms are read from it.
+    crm_lead = models.ForeignKey(
+        "crm.Lead", null=True, blank=True, on_delete=models.SET_NULL, related_name="sales_orders"
     )
     pms_project = models.ForeignKey(
         "pms.Project", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"

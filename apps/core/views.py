@@ -551,8 +551,9 @@ class GlobalSearchView(APIView):
             ("salesOrder", "apps.sales.models", "SalesOrder", "order_number", "/sales/orders/"),
             ("invoice", "apps.sales.models", "SalesInvoice", "invoice_number", "/sales/invoices/"),
             ("challan", "apps.sales.models", "DeliveryChallan", "challan_number", "/sales/challans/"),
-            ("proforma", "apps.sales.models", "ProformaInvoice", "proforma_number",
-             "/sales/proforma-invoices/"),
+            # [Quotation & Proforma Invoice modules are commented out]
+            # ("proforma", "apps.sales.models", "ProformaInvoice", "proforma_number",
+             # "/sales/proforma-invoices/"),
             ("purchaseOrder", "apps.purchase.models", "PurchaseOrder", "po_number",
              "/purchase/orders/"),
         ]

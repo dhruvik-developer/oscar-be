@@ -161,8 +161,71 @@ def annual_commercial_leakage(client_id, date_from=None, date_to=None):
     }
 
 
+def _ledger_cogs(client_id, source_type, source_ids):
+    """Net COGS the ledger posted per source document (Dr - Cr on the COGS
+    account, live entries only) -- the figure the P&L carries."""
+    from apps.accounting.models import JournalLine
+
+    out = {}
+    lines = JournalLine.objects.filter(
+        client_id=client_id,
+        account__system_key="cogs",
+        journal_entry__source_document_type=source_type,
+        journal_entry__source_document_id__in=list(source_ids),
+        journal_entry__reversal_of__isnull=True,
+        journal_entry__deleted_at__isnull=True,
+    ).exclude(journal_entry__status="Reversed").values_list(
+        "journal_entry__source_document_id", "debit", "credit"
+    )
+    for source_id, dr, cr in lines:
+        out[source_id] = out.get(source_id, ZERO) + D(dr) - D(cr)
+    return out
+
+
+def _invoice_cost_basis(invoice):
+    """How well the invoice's cost is known.
+
+    ``actual``    every stock line went out on a costed SALE movement (the
+                  batch / taka landed rate, else the WAC frozen at dispatch);
+    ``estimated`` some stock line had no costed movement, so posting fell back
+                  to the current WAC / item cost;
+    ``missing``   stock lines but no COGS at all.
+    """
+    from apps.accounting.services import _movement_unit_cost
+
+    stock_lines = [
+        line for line in invoice.line_items.filter(deleted_at__isnull=True).select_related("item")
+        if line.item_id and line.item.holds_stock
+    ]
+    if not stock_lines:
+        return "no-stock"
+    references = [("SalesInvoice", invoice.id)]
+    if invoice.delivery_challan_id:
+        references.append(("DeliveryChallan", invoice.delivery_challan_id))
+    from apps.sales.models import DeliveryChallanLine
+
+    for line in stock_lines:
+        if line.sales_order_line_id:
+            references.extend(
+                ("DeliveryChallan", cid) for cid in DeliveryChallanLine.objects.filter(
+                    sales_order_line_id=line.sales_order_line_id, deleted_at__isnull=True,
+                ).values_list("delivery_challan_id", flat=True)
+            )
+    for line in stock_lines:
+        if _movement_unit_cost(invoice.client_id, line.item_id, references) is None:
+            return "estimated"
+    return "actual"
+
+
 def party_profitability_report(client_id, date_from=None, date_to=None):
-    """Party-wise profitability breakdown with COGS and contribution margin (PDF §15)."""
+    """Party-wise sales, actual COGS, gross profit and contribution (PDF §15).
+
+    COGS is what the ledger posted for each invoice (less what returns
+    reversed): the stock that actually left, at its batch / taka landed rate
+    or the WAC frozen at dispatch -- never a fixed ratio. Sales are net of GST
+    (taxable value) and already net of discounts, so discount is shown, not
+    deducted again. Parties whose cost is not fully known are flagged.
+    """
     today = timezone.localdate()
     date_from = date_from or (today - timedelta(days=90))
     date_to = date_to or today
@@ -170,99 +233,104 @@ def party_profitability_report(client_id, date_from=None, date_to=None):
     if isinstance(date_from, str): date_from = date.fromisoformat(date_from[:10])
     if isinstance(date_to, str): date_to = date.fromisoformat(date_to[:10])
 
-    invoices = SalesInvoice.objects.filter(
+    invoices = list(SalesInvoice.objects.filter(
         client_id=client_id,
         doc_date__gte=date_from,
         doc_date__lte=date_to,
         deleted_at__isnull=True,
-    ).exclude(status__in=["Draft", "Cancelled"]).select_related("party")
+    ).exclude(status__in=["Draft", "Cancelled"]).select_related("party"))
+    invoice_cogs = _ledger_cogs(client_id, "SalesInvoice", [inv.id for inv in invoices])
 
     party_data = {}
+
+    def group_for(pid, pname):
+        return party_data.setdefault(pid, {
+            "partyId": pid, "partyName": pname, "invoiceCount": 0,
+            "sales": ZERO, "salesInclTax": ZERO, "cogs": ZERO, "discount": ZERO,
+            "brokerage": ZERO, "returns": ZERO, "returnsCogs": ZERO, "transport": ZERO,
+            "costStatus": "actual", "invoicesWithoutActualCost": [],
+        })
+
     for inv in invoices:
         pid = str(inv.party_id)
-        pname = inv.party.name if inv.party else (inv.party_name or "Direct")
-        group = party_data.setdefault(pid, {
-            "partyId": pid,
-            "partyName": pname,
-            "invoiceCount": 0,
-            "sales": ZERO,
-            "cogs": ZERO,
-            "discount": ZERO,
-            "brokerage": ZERO,
-            "incentive": ZERO,
-            "returns": ZERO,
-        })
+        group = group_for(pid, inv.party.name if inv.party else (inv.party_name or "Direct"))
         group["invoiceCount"] += 1
-        group["sales"] += D(inv.total or 0)
+        taxable = D(inv.taxable_value or 0) or (D(inv.total or 0) - D(inv.total_tax or 0))
+        group["sales"] += taxable
+        group["salesInclTax"] += D(inv.total or 0)
         group["discount"] += D(inv.total_discount or 0)
+        posted = invoice_cogs.get(inv.id)
+        basis = _invoice_cost_basis(inv)
+        if basis == "no-stock":
+            continue
+        if posted is None or posted <= ZERO:
+            basis = "missing"
+        else:
+            group["cogs"] += posted
+        if basis != "actual":
+            group["invoicesWithoutActualCost"].append(inv.invoice_number or str(inv.id))
+            if basis == "missing" or group["costStatus"] == "actual":
+                group["costStatus"] = "incomplete" if basis == "missing" else "estimated"
 
-    # Brokerage per party
     commissions = BrokerCommission.objects.filter(
-        client_id=client_id,
-        invoice_date__gte=date_from,
-        invoice_date__lte=date_to,
-        deleted_at__isnull=True,
+        client_id=client_id, invoice_date__gte=date_from, invoice_date__lte=date_to, deleted_at__isnull=True,
     ).exclude(status="Cancelled")
     for bc in commissions:
         pid = str(bc.party_id)
         if pid in party_data:
             party_data[pid]["brokerage"] += D(bc.commission_amount or 0)
 
-    # Returns per party
-    returns = SalesReturn.objects.filter(
-        client_id=client_id,
-        doc_date__gte=date_from,
-        doc_date__lte=date_to,
-        deleted_at__isnull=True,
-    ).exclude(status="Cancelled")
+    returns = list(SalesReturn.objects.filter(
+        client_id=client_id, doc_date__gte=date_from, doc_date__lte=date_to, deleted_at__isnull=True,
+    ).exclude(status="Cancelled"))
+    return_cogs = _ledger_cogs(client_id, "SalesReturn", [r.id for r in returns])
     for sr in returns:
         pid = str(sr.party_id)
         if pid in party_data:
-            party_data[pid]["returns"] += D(sr.total or 0)
+            party_data[pid]["returns"] += D(getattr(sr, "taxable_value", None) or 0) or (D(sr.total or 0) - D(getattr(sr, "total_tax", 0) or 0))
+            # A return's ledger entry credits COGS: negative here.
+            party_data[pid]["returnsCogs"] += -return_cogs.get(sr.id, ZERO)
 
-    # Transport support / allocated freight per party from Sales Orders
     from apps.sales.models import SalesOrder
-    so_freight = SalesOrder.objects.filter(
-        client_id=client_id,
-        doc_date__gte=date_from,
-        doc_date__lte=date_to,
-        deleted_at__isnull=True,
-    ).exclude(stage="Cancelled")
-    for so in so_freight:
+    for so in SalesOrder.objects.filter(
+        client_id=client_id, doc_date__gte=date_from, doc_date__lte=date_to, deleted_at__isnull=True,
+    ).exclude(stage="Cancelled"):
         pid = str(so.party_id)
         if pid in party_data and getattr(so, "allocated_freight_cost", None):
-            party_data[pid]["transport"] = party_data[pid].get("transport", ZERO) + D(so.allocated_freight_cost)
+            party_data[pid]["transport"] += D(so.allocated_freight_cost)
 
     rows = []
     for p in party_data.values():
-        sales = p["sales"]
-        disc = p["discount"]
-        brok = p["brokerage"]
-        ret = p["returns"]
-        # Estimate / allocate COGS at 75% or from lines if available
-        cogs = round2(sales * Decimal("0.72"))
-        transport = p.get("transport", ZERO)
-        net = round2(sales - cogs - disc - brok - ret - transport)
-        margin = float(round2(net / sales * Decimal("100"))) if sales > ZERO else 0.0
-
+        net_sales = p["sales"] - p["returns"]
+        cogs = round2(p["cogs"] - p["returnsCogs"])
+        gross = round2(net_sales - cogs)
+        net = round2(gross - p["brokerage"] - p["transport"])
         rows.append({
             "partyId": p["partyId"],
             "partyName": p["partyName"],
             "invoiceCount": p["invoiceCount"],
-            "sales": float(round2(sales)),
+            "sales": float(round2(p["sales"])),
+            "salesInclTax": float(round2(p["salesInclTax"])),
+            "returns": float(round2(p["returns"])),
+            "netSales": float(round2(net_sales)),
             "cogs": float(cogs),
-            "discount": float(round2(disc)),
-            "brokerage": float(round2(brok)),
-            "returns": float(round2(ret)),
-            "transport": float(round2(transport)),
+            "grossProfit": float(gross),
+            "grossMarginPct": float(round2(gross / net_sales * Decimal("100"))) if net_sales > ZERO else 0.0,
+            "discount": float(round2(p["discount"])),
+            "brokerage": float(round2(p["brokerage"])),
+            "transport": float(round2(p["transport"])),
             "netContribution": float(net),
-            "marginPct": margin,
+            "marginPct": float(round2(net / net_sales * Decimal("100"))) if net_sales > ZERO else 0.0,
+            "costStatus": p["costStatus"],
+            "invoicesWithoutActualCost": p["invoicesWithoutActualCost"],
         })
 
     rows.sort(key=lambda x: x["sales"], reverse=True)
     return {
         "periodFrom": date_from.isoformat(),
         "periodTo": date_to.isoformat(),
+        "costMethod": "Ledger COGS per invoice (batch / taka landed rate or WAC frozen at dispatch), "
+                      "less COGS reversed by returns. Sales are net of GST and discounts.",
         "rows": rows,
         "results": rows,
     }

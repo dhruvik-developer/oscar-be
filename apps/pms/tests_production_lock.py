@@ -124,13 +124,22 @@ class FinalPoTests(DailyEntryLockTests):
         self._make_vendor_and_item()
         self._verify()
         instruction = services.generate_final_job_work_po(self.instruction, user=self.user)
-        self.assertEqual(instruction.status, "PO Created")
+        # A final PO awaiting approval keeps the instruction at PO Pending;
+        # it moves to PO Created only once the final PO is approved.
+        self.assertEqual(instruction.status, "PO Pending")
         po = instruction.final_po
         self.assertEqual(po.status, "Pending Approval")
         line = po.line_items.get()
         self.assertEqual(line.qty, Decimal("40"))
         self.assertEqual(line.rate, Decimal("12.50"))
         self.assertEqual(po.subtotal, Decimal("500.00"))
+
+        instruction = services.generate_final_job_work_po(
+            instruction, user=self.user, custom_data={"action": "approve_complete"}
+        )
+        self.assertEqual(instruction.status, "PO Created")
+        self.assertEqual(instruction.final_po_id, po.id)
+        self.assertEqual(instruction.final_po.status, "Approved")
 
     def test_generate_po_without_vendor_party_fails(self):
         self._verify()

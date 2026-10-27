@@ -5,11 +5,13 @@ from rest_framework.routers import DefaultRouter
 from . import views
 
 router = DefaultRouter(trailing_slash=True)
-router.register("quotations", views.QuotationViewSet, basename="sales-quotations")
+# [Quotation & Proforma Invoice modules are commented out]
+# router.register("quotations", views.QuotationViewSet, basename="sales-quotations")
 router.register("orders", views.SalesOrderViewSet, basename="sales-orders")
-router.register(
-    "proforma-invoices", views.ProformaInvoiceViewSet, basename="sales-proformas"
-)
+# [Quotation & Proforma Invoice modules are commented out]
+# router.register(
+    # "proforma-invoices", views.ProformaInvoiceViewSet, basename="sales-proformas"
+# )
 router.register("challans", views.DeliveryChallanViewSet, basename="sales-challans")
 router.register("delivery-challans", views.DeliveryChallanViewSet, basename="sales-delivery-challans")
 router.register("invoices", views.SalesInvoiceViewSet, basename="sales-invoices")

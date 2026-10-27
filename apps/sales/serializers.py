@@ -155,12 +155,15 @@ class SalesOrderSerializer(DocumentSerializer):
 
     vehicleNo = serializers.CharField(source="vehicle_number", required=False, allow_blank=True, allow_null=True)
     dispatchDate = serializers.DateField(source="dispatch_date", required=False, allow_null=True)
+    crmLead = TenantPrimaryKeyRelatedField(
+        source="crm_lead", model="crm.Lead", required=False, allow_null=True
+    )
 
     class Meta:
         model = SalesOrder
         fields = HEADER_FIELDS + [
             "order_number", "stage", "payment_status", "delivery_date",
-            "quotation", "pms_project", "reference_number",
+            "quotation", "pms_project", "reference_number", "crm_lead", "crmLead",
             "dispatch_date", "dispatchDate", "vehicle_number", "vehicleNo", "transporter",
         ]
         read_only_fields = READ_ONLY_HEADER_FIELDS + ["order_number", "payment_status"]

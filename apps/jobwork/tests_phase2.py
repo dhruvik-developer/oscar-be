@@ -231,3 +231,136 @@ class Phase2JobWorkTests(TestCase):
         self.assertEqual(ledger_data["totalReceived"], 960.0)
         self.assertEqual(ledger_data["totalLoss"], 40.0)
         self.assertEqual(ledger_data["closingBalance"], 0.0)
+
+    def test_inward_qc_moves_rolls_out_of_qc_hold_and_keeps_the_batch(self):
+        jwo_id = self.api.post("/api/v1/jobwork/orders/", {
+            "vendorId": str(self.processor.id), "processMasterId": str(self.process.id),
+            "process": "Dyeing", "vendor": self.processor.name, "orderDate": "2026-04-15",
+            "materials": [{"fabricItem": self.item.name, "qty": 1000.0, "rate": 15.5}],
+        }, format="json").json()["id"]
+        self.assertEqual(self.api.post(f"/api/v1/jobwork/orders/{jwo_id}/outwards/", {
+            "date": "2026-04-16", "qty": 1000.0,
+            "takas": [{"lotTakaId": str(self.grey_taka.id), "meters": 1000.0}],
+        }, format="json").status_code, 201)
+        inward = self.api.post(f"/api/v1/jobwork/orders/{jwo_id}/inwards/", {
+            "date": "2026-04-20", "qty": 960.0, "accepted": 960.0, "rejected": 0.0,
+            "takas": [{"sourceTakaId": str(self.grey_taka.id), "taka_number": "1", "meters": 960.0}],
+        }, format="json")
+        self.assertEqual(inward.status_code, 201, inward.content)
+        inward_id = JWOInward.objects.get(job_work_order_id=jwo_id).id
+
+        qc = self.api.post("/api/v1/inventory/qc/disposition/", {
+            "receiptId": str(inward_id), "goodQty": 900, "rejectedQty": 60,
+            "locationId": str(self.godown.id),
+        }, format="json")
+        self.assertEqual(qc.status_code, 200, qc.content)
+        self.assertTrue(qc.json()["stockPosted"])
+
+        self.grey_taka.refresh_from_db()
+        rolls = LotTaka.objects.filter(client=self.client_obj, batch=self.grey_taka.batch, available_quantity__gt=0)
+        by_location = {r.location.code: r.available_quantity for r in rolls}
+        self.assertEqual(by_location.get("WH-GODOWN-1"), Decimal("900.0000"))
+        self.assertEqual(by_location.get("SYS-REJECT"), Decimal("60.0000"))
+        self.assertNotIn("SYS-QC-HOLD", by_location)
+
+        again = self.api.post("/api/v1/inventory/qc/disposition/", {
+            "receiptId": str(inward_id), "goodQty": 960, "locationId": str(self.godown.id),
+        }, format="json")
+        self.assertEqual(again.status_code, 409, again.content)
+
+    def _order(self, process):
+        return self.api.post("/api/v1/jobwork/orders/", {
+            "vendorId": str(self.processor.id), "process": process, "vendor": self.processor.name,
+            "orderDate": "2026-04-15",
+            "materials": [{"fabricItem": self.item.name, "qty": 1000.0, "rate": 10}],
+        }, format="json").json()["id"]
+
+    def _send(self, jwo_id, taka, meters):
+        return self.api.post(f"/api/v1/jobwork/orders/{jwo_id}/outwards/", {
+            "date": "2026-04-16", "qty": meters,
+            "takas": [{"lotTakaId": str(taka.id), "meters": meters}],
+        }, format="json")
+
+    def _receive(self, jwo_id, taka, meters):
+        res = self.api.post(f"/api/v1/jobwork/orders/{jwo_id}/inwards/", {
+            "date": "2026-04-20", "qty": meters, "accepted": meters, "rejected": 0,
+            "takas": [{"sourceTakaId": str(taka.id), "taka_number": "1", "meters": meters}],
+        }, format="json")
+        self.assertEqual(res.status_code, 201, res.content)
+        inward = JWOInward.objects.filter(job_work_order_id=jwo_id).order_by("-created_at").first()
+        qc = self.api.post("/api/v1/inventory/qc/disposition/", {
+            "receiptId": str(inward.id), "goodQty": meters, "locationId": str(self.godown.id),
+        }, format="json")
+        self.assertEqual(qc.status_code, 200, qc.content)
+        return LotTaka.objects.get(
+            client=self.client_obj, location=self.godown, available_quantity=meters,
+            source_document_number__isnull=False, batch=taka.batch,
+            lot_number__endswith="-P" if taka.lot_number.count("-P") == 0 else "-P-P",
+        )
+
+    def test_sequential_processes_keep_one_batch_and_full_history(self):
+        from apps.inventory.batch_services import serialize_batch
+
+        batch = self.grey_taka.batch
+        dyeing = self._order("Dyeing")
+        self.assertEqual(self._send(dyeing, self.grey_taka, 1000).status_code, 201)
+        dyed = self._receive(dyeing, self.grey_taka, 980)
+
+        finishing = self._order("Finishing")
+        self.assertEqual(self._send(finishing, dyed, 980).status_code, 201)
+        finished = self._receive(finishing, dyed, 970)
+
+        self.assertEqual(dyed.batch_id, batch.id)
+        self.assertEqual(finished.batch_id, batch.id)
+        titles = [e["title"] for e in serialize_batch(batch, detail=True)["timeline"]]
+        self.assertIn("Sent for Dyeing", titles)
+        self.assertIn("Sent for Finishing", titles)
+        self.assertIn("Received back from Finishing", titles)
+
+    def test_partial_send_leaves_the_rest_available_and_qc_hold_rolls_are_refused(self):
+        jwo = self._order("Dyeing")
+        self.assertEqual(self._send(jwo, self.grey_taka, 400).status_code, 201)
+        self.grey_taka.refresh_from_db()
+        self.assertEqual(self.grey_taka.available_quantity, Decimal("600.0000"))
+        self.assertEqual(self.grey_taka.status, "Available")
+        at_processor = LotTaka.objects.get(parent_taka=self.grey_taka, location__code__startswith="SYS-WIP-")
+        self.assertEqual(at_processor.status, "External WIP")
+
+        self.grey_taka.status = "QC Hold"
+        self.grey_taka.save(update_fields=["status"])
+        refused = self._send(self._order("Dyeing"), self.grey_taka, 100)
+        self.assertEqual(refused.status_code, 400, refused.content)
+
+    def test_two_inwards_from_one_lot_get_distinct_rolls(self):
+        jwo = self._order("Dyeing")
+        self._send(jwo, self.grey_taka, 1000)
+        for meters in (400, 500):
+            res = self.api.post(f"/api/v1/jobwork/orders/{jwo}/inwards/", {
+                "date": "2026-04-20", "qty": meters, "accepted": meters, "rejected": 0,
+                "takas": [{"sourceTakaId": str(self.grey_taka.id), "taka_number": "1", "meters": meters}],
+            }, format="json")
+            self.assertEqual(res.status_code, 201, res.content)
+        rolls = LotTaka.objects.filter(client=self.client_obj, source_document_type="JobWorkInward")
+        self.assertEqual(rolls.count(), 2)
+        self.assertEqual(len({r.taka_id for r in rolls}), 2)
+        self.assertEqual(len({r.taka_number for r in rolls}), 2)
+
+    def test_processing_customer_material_is_a_service_cost_not_stock(self):
+        from apps.accounting.models import JournalLine
+        from apps.inventory.batch_services import set_ownership
+
+        customer = Party.objects.create(client=self.client_obj, name="Cust", code="C-1", type="Customer")
+        set_ownership(self.grey_taka.batch, ownership="CUSTOMER", owner_party_id=customer.id)
+        jwo = self._order("Dyeing")
+        JobWorkOrder.objects.filter(pk=jwo).update(rate=Decimal("10"))
+        self.assertEqual(self._send(jwo, self.grey_taka, 1000).status_code, 201)
+        res = self.api.post(f"/api/v1/jobwork/orders/{jwo}/inwards/", {
+            "date": "2026-04-20", "qty": 980, "accepted": 980, "rejected": 0,
+            "takas": [{"sourceTakaId": str(self.grey_taka.id), "taka_number": "1", "meters": 980}],
+        }, format="json")
+        self.assertEqual(res.status_code, 201, res.content)
+        keys = set(JournalLine.objects.filter(journal_entry__client=self.client_obj, debit__gt=0)
+                   .values_list("account__system_key", flat=True))
+        self.assertIn("cogs", keys)
+        self.assertNotIn("stock", keys)
+

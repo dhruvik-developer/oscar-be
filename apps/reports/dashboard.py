@@ -6,6 +6,7 @@ database, so the browser only renders. Nothing is estimated: a figure with no
 source rows is zero (or ``None`` where a value cannot be determined, e.g. a
 WIP value when the job-work materials carry no rate).
 """
+from collections import defaultdict
 from datetime import date, timedelta
 from decimal import Decimal
 
@@ -179,6 +180,12 @@ def stock_valuation(client_id):
             if key:
                 stage_by_quality[str(key).strip().lower()] = stage
 
+    from apps.inventory.batch_services import customer_owned_qty_by_item_location
+
+    held_for_others = defaultdict(lambda: ZERO)
+    for (item_id, _location_id), qty in customer_owned_qty_by_item_location(client_id).items():
+        held_for_others[item_id] += qty
+
     per_item = {}
     for row in (
         StockBalance.objects.filter(client_id=client_id, item__deleted_at__isnull=True)
@@ -190,7 +197,8 @@ def stock_valuation(client_id):
             inward_value=_money("inward_value"),
         )
     ):
-        on_hand = D(row["total_on_hand"])
+        # Customer material in our godowns is not OSCAR's asset.
+        on_hand = D(row["total_on_hand"]) - held_for_others.get(row["item_id"], ZERO)
         if on_hand <= ZERO:
             continue
         if D(row["inward_qty"]) > ZERO:

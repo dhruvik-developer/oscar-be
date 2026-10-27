@@ -239,7 +239,8 @@ class Phase2InventoryQCTests(TestCase):
         qc_taka.refresh_from_db()
         self.assertEqual(qc_taka.location.code, "WH-MAIN")
         self.assertEqual(qc_taka.status, "Available")
-        self.assertEqual(qc_taka.qc_status, "Pass")
+        # LOT_QC_STATUSES spelling (sales accept "Passed").
+        self.assertEqual(qc_taka.qc_status, "Passed")
 
         # Verify StockMovement records created
         movs = StockMovement.objects.filter(

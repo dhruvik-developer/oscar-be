@@ -216,6 +216,10 @@ def post_movement(
         if lot_taka_obj.available_quantity <= ZERO and type == "SALE":
             lot_taka_obj.status = LotTaka.STATUS_DISPATCHED
             update_fields.append("status")
+        elif type == "SALE" and lot_taka_obj.status == LotTaka.STATUS_RESERVED:
+            # The reservation was drawn on; what is left is free stock again.
+            lot_taka_obj.status = LotTaka.STATUS_AVAILABLE
+            update_fields.append("status")
         lot_taka_obj.save(update_fields=update_fields)
 
     if original_movement is not None:

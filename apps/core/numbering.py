@@ -45,6 +45,8 @@ SERIES_DEFAULTS = {
     "SMPL": ("SMPL", "fy", 4, "-"),
     "SMPR": ("SMPR", "fy", 4, "-"),
     "LOT": ("LOT", "fy", 5, "-"),
+    # Permanent fabric batch ID, kept through every process: OSCAR-GRY-2026-0001
+    "BAT": ("OSCAR-GRY", "yearly", 4, "-"),
     # QC reprocess orders (JWOReprocess)
     "RP": ("RP", "fy", 4, "-"),
     # Accounts
@@ -64,6 +66,11 @@ SERIES_DEFAULTS = {
     "ASSET": ("AST", "never", 4, "-"),
     # Grey-fabric production wiring (HRMS_ERP_CHANGES.md)
     "PROD": ("PROD", "fy", 4, "-"),
+    # In-house production runs (yarn -> grey fabric)
+    "PRUN": ("PRUN", "fy", 4, "-"),
+    # Customer material receipts / deliveries back to the customer
+    "CMR": ("CMR", "fy", 4, "-"),
+    "CMD": ("CMD", "fy", 4, "-"),
     "INC": ("INC", "fy", 4, "-"),
     # Job work
     "PP": ("PP", "fy", 3, "-"),

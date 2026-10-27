@@ -45,8 +45,10 @@ def calculate_broker_commission(invoice, *, user=None, rate_override=None, commi
     # Determine agreed terms from deal / lead if available
     agreed_type = None
     agreed_rate = None
-    if so and so.quotation and so.quotation.crm_lead:
-        lead = so.quotation.crm_lead
+    from .models import order_lead
+
+    if order_lead(so) is not None:
+        lead = order_lead(so)
         cvals = lead.custom_values or {}
         agreed_type = cvals.get("commission_basis") or cvals.get("commission_type")
         if cvals.get("commission_rate") is not None:

@@ -6,6 +6,7 @@
 """
 
 from django.test import TestCase, override_settings
+from django.utils import timezone
 from rest_framework.test import APIRequestFactory, force_authenticate
 
 from apps.accounts.models import Client, User
@@ -52,9 +53,11 @@ class LeadDealLifecycleTests(TestCase):
         quotation = Quotation.objects.create(
             client=self.tenant,
             quotation_number="QT-TEST-001",
+            doc_date=timezone.localdate(),
             crm_lead=lead,
             crm_deal=deal,
             status="Draft",
+            subtotal=50000,
             total=50000,
         )
 

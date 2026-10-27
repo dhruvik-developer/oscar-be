@@ -18,6 +18,10 @@ from apps.inventory.models import LotTaka
 from apps.masters.models import Item, Location, Party
 from apps.sales.models import Quotation, SalesOrder
 
+from unittest import skip
+
+QUOTATION_COMMENTED_OUT = "The Quotation module is commented out (its /sales/quotations/ routes are off)."
+
 
 def uid(prefix):
     return f"{prefix}-{uuid.uuid4().hex[:8]}"
@@ -164,6 +168,7 @@ class DiscountApprovalTests(TestCase):
         self.assertEqual(body["lines"][0]["approverRoleCode"], "SALES_MGR")
 
     # -- quotations ---------------------------------------------------------------
+    @skip(QUOTATION_COMMENTED_OUT)
     def test_quotation_send_is_held_until_approved(self):
         resp = self.api(self.salesperson).post("/api/v1/sales/quotations/", {
             "partyId": str(self.customer.id),
@@ -190,6 +195,7 @@ class DiscountApprovalTests(TestCase):
         )
         self.assertEqual(sent.status_code, 200, sent.content[:400])
 
+    @skip(QUOTATION_COMMENTED_OUT)
     def test_request_approval_at_save_keeps_the_salespersons_reason(self):
         resp = self.api(self.salesperson).post("/api/v1/sales/quotations/", {
             "partyId": str(self.customer.id),

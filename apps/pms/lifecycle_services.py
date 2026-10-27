@@ -276,7 +276,9 @@ def production_lifecycle(po):
             and any(q.status in QC_PASSED_STATUSES for q in qc_final)
             and qc_inspected >= produced
         )
-        or any(q.status in ("Approved", "Passed") for q in qc_final)
+        # Without a produced quantity to compare against, an approved inspection completes QC;
+        # otherwise the passed inspections must cover the produced quantity (above).
+        or (produced <= ZERO and any(q.status in ("Approved", "Passed") for q in qc_final))
         or verified
         or bool(final_po)
     )

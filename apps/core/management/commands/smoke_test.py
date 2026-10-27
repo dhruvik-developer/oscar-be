@@ -5,7 +5,8 @@ Exercises the checklist that document names, over the real URL routing and
 serializers rather than by calling services directly:
 
   1. log in, land on the dashboard
-  2. quotation -> order -> challan -> invoice -> payment, checking stock,
+  2. order -> challan -> invoice -> payment, checking stock (the quotation
+     step is skipped while the Quotation module is commented out),
      party balance and the ledger after each step
   3. force a 401 and confirm the error shape
   4. confirm the list envelope and the error contract
@@ -192,10 +193,11 @@ class Command(BaseCommand):
 
         before = self.call("GET", f"/inventory/items/{item['id']}/stock/", expect=200).json()
 
-        # 1. Quotation
-        quotation = self.call(
+        # 1-2. Sales order, created directly. [Quotation & Proforma Invoice modules are commented out]
+        # (It used to be POST /sales/quotations/ then .../convert-to-order/.)
+        order = self.call(
             "POST",
-            "/sales/quotations/",
+            "/sales/orders/",
             {
                 "partyId": customer["id"],
                 "date": str(timezone.localdate()),
@@ -205,17 +207,11 @@ class Command(BaseCommand):
             },
             expect=201,
         ).json()
-        self.expect(quotation["quotationNumber"], "quotation has no number")
-        self.expect(
-            Decimal(str(quotation["total"])) == Decimal("4720.00"),
-            f"quotation total wrong: {quotation['total']}",
-        )
-
-        # 2. Convert to order
-        order = self.call(
-            "POST", f"/sales/quotations/{quotation['id']}/convert-to-order/", {}, expect=201
-        ).json()
         self.expect(order["orderNumber"], "order has no number")
+        self.expect(
+            Decimal(str(order["total"])) == Decimal("4720.00"),
+            f"order total wrong: {order['total']}",
+        )
 
         # Confirming reserves stock (api.md §5.4).
         self.call("PATCH", f"/sales/orders/{order['id']}/", {"stage": "Confirmed"}, expect=200)
@@ -298,7 +294,7 @@ class Command(BaseCommand):
         self._smoke_invoice_id = invoice["id"]
         self._smoke_item_id = item["id"]
         return (
-            f"{quotation['quotationNumber']} -> {order['orderNumber']} "
+            f"{order['orderNumber']} "
             f"-> {finalized['invoiceNumber']}, outstanding {outstanding['outstanding']}"
         )
 

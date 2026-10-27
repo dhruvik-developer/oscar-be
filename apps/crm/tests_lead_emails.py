@@ -67,7 +67,7 @@ class LeadEmailSendingTests(TestCase):
         # Check timeline endpoint includes sent email
         timeline_response = self.request("get", f"/leads/{self.lead.id}/timeline/", "timeline", pk=self.lead.id)
         self.assertEqual(timeline_response.status_code, 200)
-        items = timeline_response.data.get("data") if isinstance(timeline_response.data, dict) else timeline_response.data
+        items = timeline_response.data.get("results") if isinstance(timeline_response.data, dict) else timeline_response.data
         email_events = [event for event in items if event.get("type") == "email"]
         self.assertTrue(len(email_events) >= 1)
         self.assertEqual(email_events[0]["title"], "Follow-up on Proposal")

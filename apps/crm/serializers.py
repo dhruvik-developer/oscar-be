@@ -154,6 +154,43 @@ class LeadSerializer(BaseModelSerializer):
         ]
         read_only_fields = ["created_at", "updated_at"]
 
+    def validate_customValues(self, value):
+        """A salesperson attribution (source "Sales Person") must name an HRMS
+        employee of this workspace; the stored name follows the employee. An
+        agreed rate, when given, must be a non-negative number on a known basis."""
+        if not isinstance(value, dict):
+            return value
+        rate = value.get("salesperson_commission_rate")
+        if rate not in (None, ""):
+            try:
+                rate_value = float(rate)
+            except (TypeError, ValueError):
+                rate_value = -1
+            if rate_value < 0 or rate_value != rate_value:
+                raise serializers.ValidationError("The salesperson's agreed rate must be a number of 0 or more.")
+        basis = value.get("salesperson_commission_basis")
+        if basis not in (None, "", "percent", "per_meter", "per_taka"):
+            raise serializers.ValidationError("Unknown salesperson commission basis.")
+        if not value.get("salesperson_id"):
+            return value
+        from django.core.exceptions import ValidationError as DjangoValidationError
+
+        from apps.hrms.models import Employee
+
+        request = self.context.get("request")
+        client_id = getattr(request, "client_id", None) or getattr(
+            getattr(request, "user", None), "client_id", None
+        )
+        try:
+            employee = Employee.objects.filter(
+                client_id=client_id, pk=value["salesperson_id"], deleted_at__isnull=True
+            ).first()
+        except (TypeError, ValueError, DjangoValidationError):
+            employee = None
+        if employee is None:
+            raise serializers.ValidationError("The selected salesperson is not an employee of this workspace.")
+        return {**value, "salesperson_id": str(employee.id), "salesperson_name": employee.name}
+
     def _counter(self, lead, attribute):
         return getattr(lead, attribute, 0)
 

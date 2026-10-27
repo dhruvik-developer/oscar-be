@@ -1124,6 +1124,16 @@ class TeamRosterView(APIView):
         return Response({"roster": services.team_roster(request.client_id)})
 
 
+class IncentiveSchemesView(APIView):
+    """``GET /crm/incentive-schemes/`` -- active salesperson incentive terms."""
+
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_lead"]
+
+    def get(self, request):
+        return Response({"schemes": services.incentive_schemes(request.client_id)})
+
+
 class AssignmentOptionsView(APIView):
     """``GET /crm/assignment-options/`` -- roles and departments for task templates."""
 

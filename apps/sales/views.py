@@ -692,7 +692,8 @@ class SalesOrderViewSet(SalesDocumentViewSet):
         )
         serializer.validated_data.setdefault("stage", "Confirmed")
         order = super().perform_create(serializer)
-        self._gate_discount(order, previous_stage=None)
+        if not self._gate_discount(order, previous_stage=None) and order.stage == "Confirmed":
+            services.reserve_order_takas(order)
         return order
 
     def perform_update(self, serializer):

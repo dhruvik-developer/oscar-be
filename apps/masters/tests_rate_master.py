@@ -22,6 +22,10 @@ from apps.masters.models import (
 from apps.purchase.models import PurchaseOrder
 from apps.sales.models import Quotation, SalesOrder
 
+from unittest import skip
+
+QUOTATION_COMMENTED_OUT = "The Quotation module is commented out (its /sales/quotations/ routes are off)."
+
 
 def uid(prefix):
     return f"{prefix}-{uuid.uuid4().hex[:8]}"
@@ -182,6 +186,7 @@ class SalesDocumentRateMasterTests(RateMasterBaseTestCase):
         self.assertEqual(line.rate, Decimal("150.00"))
         self.assertEqual(order.subtotal, Decimal("7500.00"))  # 50 * 150
 
+    @skip(QUOTATION_COMMENTED_OUT)
     def test_quotation_line_defaults_from_rate_master(self):
         client = self.api(self.clerk)
         resp = client.post("/api/v1/sales/quotations/", {

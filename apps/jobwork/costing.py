@@ -37,6 +37,17 @@ def _accrued(order, source_type, source_id):
     return round2(D(totals["c"] or ZERO) - D(totals["d"] or ZERO))
 
 
+def order_is_customer_material(order):
+    """True when every roll sent on the order belongs to a customer / third party."""
+    from apps.jobwork.models import JWOOutwardTaka
+
+    ownerships = set(
+        JWOOutwardTaka.objects.filter(outward__job_work_order=order, lot_taka__isnull=False)
+        .values_list("lot_taka__batch__ownership", flat=True)
+    )
+    return bool(ownerships) and "OSCAR" not in ownerships and None not in ownerships
+
+
 def sync_jobwork_accrual(order, *, source_type, source_id, amount, narration, user=None):
     """Bring the accrual for one job-work row to ``amount``.
 
@@ -47,7 +58,11 @@ def sync_jobwork_accrual(order, *, source_type, source_id, amount, narration, us
     delta = round2(target - _accrued(order, source_type, source_id))
     if delta == ZERO:
         return None
-    stock = ledger.system_account(order.client_id, "stock")
+    # Processing a customer's own material adds nothing to OSCAR's stock: the
+    # charge is the cost of the service OSCAR bills the customer for.
+    stock = ledger.system_account(
+        order.client_id, "cogs" if order_is_customer_material(order) else "stock"
+    )
     payable = ledger.system_account(order.client_id, ACCRUAL_ACCOUNT)
     value = abs(delta)
     party = order.vendor

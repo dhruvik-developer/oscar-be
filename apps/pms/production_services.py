@@ -681,7 +681,7 @@ def generate_final_job_work_po(instruction, *, user=None, custom_data=None):
     if rate <= ZERO:
         rate = D("28.50")
 
-    # The agency must exist as a vendor party (same name or ID); never fail unexpectedly.
+    # The agency must exist as a vendor party (matched by ID or name).
     vendor = None
     vendor_id = custom_data.get("vendorId")
     if vendor_id:
@@ -703,17 +703,10 @@ def generate_final_job_work_po(instruction, *, user=None, custom_data=None):
                 ).order_by("created_at").first()
             )
     if vendor is None:
-        vendor = (
-            Party.objects.filter(
-                client_id=instruction.client_id, deleted_at__isnull=True,
-                type__in=["Vendor", "Both"],
-            ).order_by("created_at").first()
-        )
-    if vendor is None:
-        vendor = Party.objects.create(
-            client=instruction.client,
-            name=agency_name or "Job Work Vendor",
-            type="Vendor",
+        # Never bill an arbitrary or auto-created vendor: the agency must be a real party.
+        raise ValidationFailed(
+            f"Agency '{agency_name or '-'}' is not set up as a vendor party; create the vendor before generating the Final Job Work PO.",
+            field_errors={"vendorId": ["No vendor party matches this agency."]},
         )
 
     fabric_text = (custom_data.get("fabric") or instruction.fabric or "").strip()
@@ -1176,10 +1169,13 @@ def submit_daily_entry(entry, user=None):
 # Incentive (kept apart from payroll on purpose) (PDF §12)
 # ---------------------------------------------------------------------------
 def sales_totals_for_period(
-    client_id, start, end, employee=None, exclude_gst=False, basis="INVOICE"
+    client_id, start, end, employee=None, exclude_gst=False, basis="INVOICE",
+    exclude_invoice_ids=None,
 ):
     """Net sales = posted invoices minus posted returns/credit notes.
     Optionally filters by salesperson/employee and calculates collection / gross profit.
+    ``exclude_invoice_ids`` leaves out invoices (and returns against them)
+    whose salesperson is paid on agreed lead terms instead of the scheme.
     """
     from decimal import Decimal
     from django.db.models import DecimalField, Value
@@ -1218,6 +1214,10 @@ def sales_totals_for_period(
         elif invoices.filter(Q(salesperson_fk__isnull=False) | (Q(salesperson__isnull=False) & ~Q(salesperson=""))).exists():
             invoices = emp_invoices
             returns = emp_returns
+
+    if exclude_invoice_ids:
+        invoices = invoices.exclude(id__in=exclude_invoice_ids)
+        returns = returns.exclude(sales_invoice_id__in=exclude_invoice_ids)
 
     invoice_ids = list(invoices.values_list("id", flat=True))
     invoice_numbers = list(
@@ -1285,6 +1285,82 @@ def sales_totals_for_period(
     }
 
 
+AGREED_COMMISSION_TYPES = ("percent", "per_meter", "per_taka")
+
+
+def _agreed_salesperson_terms(invoice, employee):
+    """``(basis, rate)`` agreed on the CRM lead behind an invoice for this
+    salesperson, or None when the scheme applies.
+
+    Set on the Create Lead form (source "Sales Person"). Only counts when
+    the lead names this same employee, so a reassigned invoice is not paid
+    at someone else's rate.
+    """
+    from apps.sales.models import order_lead
+
+    lead = order_lead(invoice.sales_order)
+    if lead is None:
+        return None
+    values = lead.custom_values or {}
+    if str(values.get("salesperson_id") or "") != str(employee.id):
+        return None
+    raw_rate = values.get("salesperson_commission_rate")
+    if raw_rate in (None, ""):
+        return None
+    try:
+        rate = D(str(raw_rate))
+    except Exception:
+        return None
+    if not rate.is_finite() or rate < ZERO:
+        return None
+    basis = values.get("salesperson_commission_basis") or "percent"
+    if basis not in AGREED_COMMISSION_TYPES:
+        basis = "percent"
+    return basis, rate
+
+
+def agreed_salesperson_commission(client_id, invoice_ids, employee):
+    """Commission on invoices whose lead carries agreed salesperson terms.
+
+    Uses the brokerage formula (percent of taxable value, per meter, per
+    taka) and shrinks each invoice's share by what was returned against it.
+    Returns ``(total, rows)`` where ``rows`` describe each invoice.
+    """
+    from apps.sales.broker_services import commission_amount
+    from apps.sales.models import SalesInvoice, SalesReturn
+
+    invoices = (
+        SalesInvoice.objects.filter(client_id=client_id, pk__in=invoice_ids)
+        .select_related("sales_order__crm_lead", "sales_order__quotation__crm_lead")
+    )
+    total = ZERO
+    rows = []
+    for invoice in invoices:
+        terms = _agreed_salesperson_terms(invoice, employee)
+        if terms is None:
+            continue
+        basis, rate = terms
+        amount = commission_amount(invoice, basis, rate)
+        taxable = D(invoice.taxable_value or invoice.total or 0)
+        returned = sum(
+            (D(r.taxable_value or r.total or 0) for r in SalesReturn.objects.filter(
+                client_id=client_id, sales_invoice=invoice, status="Posted", deleted_at__isnull=True,
+            )),
+            ZERO,
+        )
+        if returned > ZERO and taxable > ZERO:
+            amount = round2(amount * max(ZERO, D(1) - returned / taxable))
+        total += amount
+        rows.append({
+            "invoiceId": str(invoice.id),
+            "invoiceNumber": invoice.invoice_number,
+            "basis": basis,
+            "rate": str(rate),
+            "amount": str(amount),
+        })
+    return round2(total), rows
+
+
 def compute_scheme_incentive(scheme, base_amount):
     """Calculate incentive on base_amount according to scheme slab_type and slabs."""
     base_val = round2(D(base_amount or 0))
@@ -1347,14 +1423,27 @@ def calculate_incentive(
         employee=employee, exclude_gst=exclude_gst, basis=basis
     )
 
-    if basis == "COLLECTION":
-        base_amount = totals["collection"]
-    elif basis == "GROSS_PROFIT":
-        base_amount = totals["gross_profit"]
-    else:  # INVOICE
-        base_amount = totals["net_sales"]
+    # Invoices from leads with an agreed salesperson rate are paid at that
+    # rate and left out of the scheme base, so no sale is paid twice.
+    agreed_total, agreed_rows = agreed_salesperson_commission(
+        client_id, totals["invoice_ids"], employee
+    )
+    scheme_totals = totals
+    if agreed_rows:
+        scheme_totals = sales_totals_for_period(
+            client_id, period_start, period_end,
+            employee=employee, exclude_gst=exclude_gst, basis=basis,
+            exclude_invoice_ids=[row["invoiceId"] for row in agreed_rows],
+        )
 
-    total_incentive = compute_scheme_incentive(scheme, base_amount)
+    if basis == "COLLECTION":
+        base_amount = scheme_totals["collection"]
+    elif basis == "GROSS_PROFIT":
+        base_amount = scheme_totals["gross_profit"]
+    else:  # INVOICE
+        base_amount = scheme_totals["net_sales"]
+
+    total_incentive = round2(compute_scheme_incentive(scheme, base_amount) + agreed_total)
 
     hold_amount = ZERO
     if hold_unpaid and totals["total_invoiced"] > ZERO:
@@ -1394,6 +1483,9 @@ def calculate_incentive(
             "totalPaid": str(totals["total_paid"]),
             "holdAmount": str(hold_amount),
             "payableAmount": str(payable_now),
+            "agreedAmount": str(agreed_total),
+            "agreedInvoices": agreed_rows,
+            "schemeInvoiceIds": [str(pk) for pk in scheme_totals["invoice_ids"]],
         },
         created_by=user if getattr(user, "is_authenticated", False) else None,
     )
@@ -1778,13 +1870,15 @@ def release_incentive_hold(calc, *, user=None):
     return calc
 
 
-def _calc_invoice_payments(calc):
-    """Invoiced / paid / collected on the invoices this calc was built from."""
+def _calc_invoice_payments(calc, invoice_ids=None):
+    """Invoiced / paid / collected on the invoices this calc was built from
+    (or on ``invoice_ids``, a subset of them)."""
     from django.db.models.functions import Coalesce
     from django.db.models import DecimalField, Value
     from apps.sales.models import PaymentAllocation, SalesInvoice
 
-    invoice_ids = (calc.detail or {}).get("invoiceIds") or []
+    if invoice_ids is None:
+        invoice_ids = (calc.detail or {}).get("invoiceIds") or []
     invoices = SalesInvoice.objects.filter(
         client_id=calc.client_id, pk__in=invoice_ids, deleted_at__isnull=True
     ).exclude(status="Cancelled")
@@ -1831,7 +1925,14 @@ def sync_incentive_with_payments(calc, *, user=None):
     money = _calc_invoice_payments(calc)
     incentive = D(calc.incentive_amount)
     if basis == "COLLECTION":
-        incentive = compute_scheme_incentive(scheme, money["collection"])
+        # Agreed-rate invoices are not priced by collection; keep their share.
+        calc_detail = calc.detail or {}
+        scheme_collection = money["collection"]
+        if "schemeInvoiceIds" in calc_detail:
+            scheme_collection = _calc_invoice_payments(calc, calc_detail["schemeInvoiceIds"])["collection"]
+        incentive = round2(
+            compute_scheme_incentive(scheme, scheme_collection) + D(calc_detail.get("agreedAmount") or 0)
+        )
     hold = ZERO
     if scheme.hold_unpaid_invoices and money["total_invoiced"] > ZERO:
         unpaid = max(ZERO, money["total_invoiced"] - money["total_paid"])
@@ -1857,7 +1958,7 @@ def sync_incentive_with_payments(calc, *, user=None):
         "payableAmount": str(new_payable),
     })
     if basis == "COLLECTION":
-        detail["baseAmount"] = str(money["collection"])
+        detail["baseAmount"] = str(scheme_collection)
     calc.incentive_amount = incentive
     calc.hold_amount = hold
     calc.detail = detail

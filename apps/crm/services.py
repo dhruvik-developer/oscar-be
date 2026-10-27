@@ -251,6 +251,34 @@ def assignment_options(client_id):
     }
 
 
+def incentive_schemes(client_id):
+    """``GET /crm/incentive-schemes/`` -- the active salesperson incentive
+    schemes (PDF §12), so the lead form can show how an attributed
+    salesperson is paid. Read-only; schemes are managed under HRMS."""
+    from apps.pms.models import IncentiveScheme
+
+    today = timezone.localdate()
+    schemes = IncentiveScheme.objects.filter(
+        client_id=client_id, deleted_at__isnull=True, is_active=True
+    ).filter(
+        Q(applies_from__isnull=True) | Q(applies_from__lte=today),
+        Q(applies_to__isnull=True) | Q(applies_to__gte=today),
+    ).order_by("name")
+    return [
+        {
+            "id": str(s.id),
+            "name": s.name,
+            "periodType": s.period_type,
+            "basis": s.basis,
+            "slabType": s.slab_type,
+            "ratePct": str(s.rate_pct),
+            "slabs": s.slabs or [],
+            "payoutAfterDays": s.payout_after_days,
+        }
+        for s in schemes
+    ]
+
+
 def _role_filter(role):
     """A user holds ``role`` through their system role (name or code) or, for
     tasks saved before roles came from the master, through ``crm_roles``."""
@@ -644,15 +672,16 @@ def annotate_lead_counters(client_id, leads):
     sources = counts(LeadSource)
     files = counts(LeadFile)
     open_tasks = counts(Task, extra={"status__in": ["Open", "In Progress", "Waiting"]})
-    invoices = dict(
-        SalesInvoice.objects.filter(
-            client_id=client_id,
-            deleted_at__isnull=True,
-            sales_order__quotation__crm_lead_id__in=lead_ids,
-        )
-        .values_list("sales_order__quotation__crm_lead_id")
-        .annotate(count=Count("id"))
-    )
+    # An order reaches its lead directly (``crm_lead``) or, for older
+    # orders, through its quotation.
+    invoices = {}
+    for direct_lead, quote_lead in SalesInvoice.objects.filter(
+        Q(sales_order__crm_lead_id__in=lead_ids) | Q(sales_order__quotation__crm_lead_id__in=lead_ids),
+        client_id=client_id,
+        deleted_at__isnull=True,
+    ).values_list("sales_order__crm_lead_id", "sales_order__quotation__crm_lead_id"):
+        key = direct_lead or quote_lead
+        invoices[key] = invoices.get(key, 0) + 1
     challans = dict(
         DeliveryChallan.objects.filter(
             client_id=client_id,

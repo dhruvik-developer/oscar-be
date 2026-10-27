@@ -1059,9 +1059,16 @@ class ValuationView(APIView):
             balances = balances.filter(location_id=location_filter)
 
         lots_by_key = {}
+        # Customer-owned rolls are held, not owned: they are taken out of the
+        # quantity valued and reported separately (never in OSCAR's value).
+        customer_qty = {}
         for lot in LotTaka.objects.filter(
             client_id=client_id, deleted_at__isnull=True, available_quantity__gt=0
-        ).order_by("received_date"):
+        ).select_related("batch").order_by("received_date"):
+            if lot.batch_id and lot.batch.ownership != "OSCAR":
+                key = (lot.item_id, lot.location_id)
+                customer_qty[key] = customer_qty.get(key, ZERO) + D(lot.available_quantity)
+                continue
             lots_by_key.setdefault((lot.item_id, lot.location_id), []).append(lot)
 
         rows = []
@@ -1101,7 +1108,7 @@ class ValuationView(APIView):
             })
 
         for balance in balances:
-            on_hand = D(balance.on_hand)
+            on_hand = D(balance.on_hand) - customer_qty.get((balance.item_id, balance.location_id), ZERO)
             if on_hand <= ZERO:
                 continue
             unit_cost = balance.weighted_average_cost or D(balance.item.cost_price)
@@ -1144,6 +1151,7 @@ class ValuationView(APIView):
                 aggregates={
                     "method": "WAC",
                     "totalValuation": round2(total_value),
+                    "customerOwnedQtyExcluded": round4(sum(customer_qty.values(), ZERO)),
                     "buckets": [
                         {
                             "bucket": label,
@@ -3773,8 +3781,9 @@ class QCDispositionView(APIView):
                     "stockPosted": result["stockPosted"], "message": message,
                 })
 
-            # Job work inward: the job-work module owns its stock; this records
-            # the QC verdict and, for reprocess, the reprocess order.
+            # Job work inward: the processed rolls wait at QC Hold; approval
+            # routes them like a purchase receipt (good -> godown, the rest to
+            # their stock locations) and records the verdict on the inward.
             total = sum(quantities.values(), ZERO)
             if not is_draft and total <= ZERO:
                 raise ValidationFailed(
@@ -3789,6 +3798,19 @@ class QCDispositionView(APIView):
             verdict = qc_service.verdict_for(
                 {k: quantities[k] for k in ("good", "second", "reprocess", "reject")},
                 quantities["hold"],
+            )
+            waiting, _ = qc_service.jobwork_inward_pool(inward)
+            if not waiting and inward.status not in ("Received", "Pending", "QC Pending", "On Hold"):
+                raise Conflict(
+                    f"QC for {inward.no} is already done ({inward.status}).",
+                    code="QC_ALREADY_DONE",
+                )
+            good_location_id = request.data.get("locationId") or Location.objects.filter(
+                client_id=client_id, is_active=True, deleted_at__isnull=True, type__in=["Warehouse", "Godown"],
+            ).exclude(code__startswith="SYS-").order_by("created_at").values_list("id", flat=True).first()
+            moved = qc_service.dispose_jobwork_inward(
+                inward, quantities=quantities, good_location_id=good_location_id,
+                user=request.user, remarks=remarks or None,
             )
             inward.accepted = quantities["good"] + quantities["second"]
             inward.rejected = quantities["reject"]
@@ -3814,10 +3836,37 @@ class QCDispositionView(APIView):
                     )
             return Response({
                 "success": True, "isDraft": False, "status": verdict,
-                "stockPosted": False,
+                "stockPosted": moved > 0,
                 "message": f"Job work QC recorded ({verdict})."
+                + (f" {moved} stock movement(s) posted." if moved else "")
                 + (f" Reprocess order {rp_no} created." if rp_no else ""),
             })
+
+
+class QCPurchaseReturnView(APIView):
+    """
+    POST /inventory/qc/purchase-return/
+         { rolls: [{lotTakaId, qty}], reason, date?, lossId? }
+    Return QC-rejected purchased rolls to the supplier as a debit note
+    (apps.purchase.qc_returns). Partial quantities allowed.
+    """
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_inventory"]
+
+    def post(self, request):
+        from apps.core.permissions import require_permission
+        from apps.purchase.qc_returns import return_rejected_rolls
+
+        require_permission(request.user, "cancel_purchase_document",
+                           "Raising a purchase return needs purchase return rights.")
+        returns = return_rejected_rolls(
+            client=request.user.client, rolls=request.data.get("rolls"), reason=request.data.get("reason"),
+            user=request.user, return_date=request.data.get("date") or None, loss_id=request.data.get("lossId"),
+        )
+        return Response({"returns": [{
+            "id": str(r.id), "returnNumber": r.return_number, "supplier": r.party_name,
+            "billNumber": r.purchase_bill.bill_number, "total": str(r.total),
+        } for r in returns]}, status=status.HTTP_201_CREATED)
 
 
 class QCReportsView(APIView):
@@ -5901,6 +5950,429 @@ class LotTraceabilityView(APIView):
         return Response(lineage)
 
 
+def _can_see_batch_cost(user):
+    """Cost and profit on a batch are financial data: ``view_ledger`` only."""
+    if getattr(user, "is_superuser", False):
+        return True
+    granted = getattr(user, "permission_ids", None)
+    if granted is None:
+        granted = user.effective_permissions()
+    return "*" in granted or "view_ledger" in granted
+
+
+class BatchListView(APIView):
+    """
+    GET /inventory/batches/?q=&origin=&ownership=&supplierId=&from=&to=&status=&page=&page_size=
+    The batch registry: one row per permanent batch ID with derived quantities.
+    """
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_inventory"]
+
+    def get(self, request):
+        from .batch_services import serialize_batch
+        from .models import Batch
+
+        params = request.query_params
+        qs = Batch.objects.filter(client_id=request.client_id, deleted_at__isnull=True).select_related(
+            "item", "supplier", "owner_party"
+        )
+        q = (params.get("q") or "").strip()
+        if q:
+            qs = qs.filter(
+                Q(batch_code__icontains=q)
+                | Q(source_document_number__icontains=q)
+                | Q(item__name__icontains=q)
+                | Q(supplier__name__icontains=q)
+                | Q(takas__lot_number__icontains=q)
+                | Q(takas__taka_id__icontains=q)
+            ).distinct()
+        for param, field in (("origin", "origin"), ("ownership", "ownership"),
+                             ("supplierId", "supplier_id"), ("itemId", "item_id")):
+            if params.get(param):
+                qs = qs.filter(**{field: params[param]})
+        if params.get("from"):
+            qs = qs.filter(created_on__gte=params["from"])
+        if params.get("to"):
+            qs = qs.filter(created_on__lte=params["to"])
+        qs = qs.order_by("-created_on", "-created_at")
+
+        try:
+            page = max(1, int(params.get("page") or 1))
+            page_size = min(200, max(1, int(params.get("page_size") or 25)))
+        except ValueError:
+            page, page_size = 1, 25
+        # ?withCost=1 adds cost / revenue / profit per batch (the batch
+        # profitability report) for users who may see the ledger.
+        with_cost = params.get("withCost") in ("1", "true") and _can_see_batch_cost(request.user)
+        wanted_status = params.get("status")
+        if wanted_status:
+            rows = [r for r in (serialize_batch(b, include_cost=with_cost) for b in qs) if r["status"] == wanted_status]
+            total = len(rows)
+            rows = rows[(page - 1) * page_size: page * page_size]
+        else:
+            total = qs.count()
+            rows = [serialize_batch(b, include_cost=with_cost) for b in qs[(page - 1) * page_size: page * page_size]]
+        body = envelope(rows, count=total, page=page, page_size=page_size)
+        body["canSeeCost"] = _can_see_batch_cost(request.user)
+        return Response(body)
+
+
+class BatchEligibleStockView(APIView):
+    """
+    GET /inventory/batches/eligible/?itemId=&locationId=&batch=&orderId=
+    Sellable stock of an item grouped by batch, for the sales batch picker
+    (manual pick or QR scan of a batch tag).
+    """
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_inventory"]
+
+    def get(self, request):
+        from .batch_services import eligible_sale_stock
+
+        item_id = request.query_params.get("itemId")
+        if not item_id:
+            raise ValidationFailed("itemId is required.", field_errors={"itemId": ["Required."]})
+        rows = eligible_sale_stock(
+            request.client_id,
+            item_id,
+            location_id=request.query_params.get("locationId") or None,
+            batch_code=request.query_params.get("batch") or None,
+            order_id=request.query_params.get("orderId") or None,
+        )
+        return Response({"results": rows})
+
+
+class BatchChargeView(APIView):
+    """
+    POST /inventory/batches/allocate-charge/
+    { batches: [code], amount, costType, basis: METER|TAKA|MANUAL,
+      manual?: {code: amount}, reference?, remarks? }
+    Split one freight / processing / other charge over batches the way the
+    user chooses. Posting cost needs the same access as seeing it.
+    """
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_inventory"]
+
+    def post(self, request):
+        from apps.core.permissions import require_permission
+
+        from .batch_services import allocate_charge
+
+        require_permission(request.user, "view_ledger", "Posting batch costs needs ledger access.")
+        data = request.data
+        rows = allocate_charge(
+            client_id=request.client_id,
+            batch_codes=data.get("batches") or [],
+            amount=data.get("amount"),
+            cost_type=data.get("costType"),
+            basis=data.get("basis"),
+            manual=data.get("manual") or {},
+            reference=(data.get("reference") or "").strip() or None,
+            remarks=data.get("remarks"),
+            user=request.user,
+        )
+        return Response({"allocations": rows}, status=status.HTTP_201_CREATED)
+
+
+class BatchLossView(APIView):
+    """
+    POST  /inventory/batches/<code>/losses/  classify rejected metres
+          { quantity, cause, responsiblePartyId?, process?, outcome?, reference?, notes?, date? }
+    PATCH /inventory/batch-losses/<id>/      move a claim along
+          { outcome?, claimStatus?, recoveredAmount?, reference?, notes? }
+    Classifying needs QC approval rights; claim money needs ledger access.
+    """
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_inventory"]
+
+    def post(self, request, code):
+        from apps.core.permissions import require_permission
+
+        from .batch_services import find_batch, record_loss, serialize_batch
+
+        require_permission(request.user, "approve_qc", "Classifying rejections needs QC approval rights.")
+        batch = find_batch(request.client_id, code)
+        if batch is None:
+            return Response({"message": f"No batch found for '{code}'.", "code": "NOT_FOUND"},
+                            status=status.HTTP_404_NOT_FOUND)
+        data = request.data
+        record_loss(
+            batch, quantity=data.get("quantity"), cause=data.get("cause") or "NORMAL_LOSS",
+            responsible_party_id=data.get("responsiblePartyId"), process=data.get("process"),
+            outcome=data.get("outcome") or "PENDING", reference=data.get("reference"),
+            notes=data.get("notes"), loss_date=data.get("date") or None, user=request.user,
+        )
+        include_cost = _can_see_batch_cost(request.user)
+        body = serialize_batch(batch, include_cost=include_cost, detail=True)
+        body["canSeeCost"] = include_cost
+        return Response(body, status=status.HTTP_201_CREATED)
+
+    def patch(self, request, loss_id):
+        from apps.core.permissions import require_permission
+
+        from .batch_services import serialize_batch, update_loss
+        from .models import BatchLoss
+
+        loss = BatchLoss.objects.filter(client_id=request.client_id, pk=loss_id, deleted_at__isnull=True).first()
+        if loss is None:
+            return Response({"message": "Rejection record not found.", "code": "NOT_FOUND"},
+                            status=status.HTTP_404_NOT_FOUND)
+        data = request.data
+        money = any(k in data for k in ("claimStatus", "recoveredAmount"))
+        require_permission(request.user, "view_ledger" if money else "approve_qc")
+        update_loss(
+            loss, user=request.user, outcome=data.get("outcome"), claim_status=data.get("claimStatus"),
+            recovered_amount=data.get("recoveredAmount"), reference=data.get("reference"),
+            notes=data.get("notes"),
+        )
+        include_cost = _can_see_batch_cost(request.user)
+        body = serialize_batch(loss.batch, include_cost=include_cost, detail=True)
+        body["canSeeCost"] = include_cost
+        return Response(body)
+
+
+class CustomerMaterialView(APIView):
+    """
+    POST /inventory/batches/customer-receipt/
+         {customerId, itemId, locationId, rolls: [{meters}], reference?, date?}
+    POST /inventory/batches/<code>/deliver/  {rolls: [{lotTakaId, qty}], reference?}
+    GET  /inventory/batches/physical-stock/   OSCAR vs customer material, by state
+    """
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_inventory"]
+
+    def get(self, request):
+        from .batch_services import physical_stock_summary
+
+        return Response({"results": physical_stock_summary(request.client_id)})
+
+    def post(self, request, code=None):
+        from apps.core.permissions import require_permission
+
+        from .batch_services import deliver_to_owner, find_batch, receive_customer_material, serialize_batch
+
+        require_permission(request.user, "adjust_stock", "Receiving or delivering customer material needs stock rights.")
+        data = request.data
+        if code is None:
+            customer = Party.objects.filter(client_id=request.client_id, pk=data.get("customerId")).first() \
+                if data.get("customerId") else None
+            item = Item.objects.filter(client_id=request.client_id, pk=data.get("itemId")).first() \
+                if data.get("itemId") else None
+            location = Location.objects.filter(client_id=request.client_id, pk=data.get("locationId")).first() \
+                if data.get("locationId") else None
+            if customer is None or item is None or location is None:
+                raise ValidationFailed("Choose the customer, fabric and godown.",
+                                       field_errors={"customerId": ["Required."], "itemId": ["Required."],
+                                                     "locationId": ["Required."]})
+            batch, number = receive_customer_material(
+                client=request.user.client, customer=customer, item=item, location=location,
+                rolls=data.get("rolls"), reference=data.get("reference"), user=request.user,
+                received_on=data.get("date") or None,
+            )
+            body = serialize_batch(batch, detail=True)
+            body["receiptNumber"] = number
+            return Response(body, status=status.HTTP_201_CREATED)
+        batch = find_batch(request.client_id, code)
+        if batch is None:
+            return Response({"message": f"No batch found for '{code}'.", "code": "NOT_FOUND"},
+                            status=status.HTTP_404_NOT_FOUND)
+        number = deliver_to_owner(batch, rolls=data.get("rolls"), reference=data.get("reference"), user=request.user)
+        body = serialize_batch(batch, detail=True)
+        body["deliveryNumber"] = number
+        return Response(body)
+
+
+class BatchDetailView(APIView):
+    """
+    GET /inventory/batches/<code>/
+    The batch traceability workspace (what a batch QR tag opens): overview,
+    quantities, rolls and the full timeline; cost and profit only for users
+    who may see the ledger. ``code`` may also be a roll's taka ID or lot number.
+    """
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_inventory"]
+
+    def get(self, request, code):
+        from .batch_services import find_batch, serialize_batch
+
+        batch = find_batch(request.client_id, code)
+        if batch is None:
+            return Response(
+                {"message": f"No batch found for '{code}'.", "code": "NOT_FOUND"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        include_cost = _can_see_batch_cost(request.user)
+        data = serialize_batch(batch, include_cost=include_cost, detail=True)
+        data["canSeeCost"] = include_cost
+        return Response(data)
+
+    def patch(self, request, code):
+        """Set ownership: { ownership: OSCAR|CUSTOMER|THIRD_PARTY, ownerPartyId?, reason? }."""
+        from apps.core.permissions import require_permission
+
+        from .batch_services import find_batch, serialize_batch, set_ownership
+
+        require_permission(request.user, "adjust_stock", "Changing material ownership needs stock adjustment rights.")
+        batch = find_batch(request.client_id, code)
+        if batch is None:
+            return Response({"message": f"No batch found for '{code}'.", "code": "NOT_FOUND"},
+                            status=status.HTTP_404_NOT_FOUND)
+        set_ownership(
+            batch,
+            ownership=request.data.get("ownership"),
+            owner_party_id=request.data.get("ownerPartyId"),
+            user=request.user,
+            reason=request.data.get("reason"),
+        )
+        include_cost = _can_see_batch_cost(request.user)
+        data = serialize_batch(batch, include_cost=include_cost, detail=True)
+        data["canSeeCost"] = include_cost
+        return Response(data)
+
+
+class ProductionRunListView(APIView):
+    """
+    GET  /inventory/production-runs/?status=&q=&page=&page_size=
+    POST /inventory/production-runs/  {outputItemId, plannedQty, runDate?, customerId?,
+         fabricQualityId?, shadeId?, width?, gsm?, machine?, notes?}
+    In-house production (yarn -> grey fabric); agency production is PMS.
+    """
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_production"]
+
+    def get(self, request):
+        from .models import ProductionRun
+        from .production_services import serialize_run
+
+        qs = ProductionRun.objects.filter(client_id=request.client_id, deleted_at__isnull=True).select_related(
+            "output_item", "customer", "batch"
+        )
+        if request.query_params.get("status"):
+            qs = qs.filter(status=request.query_params["status"])
+        q = (request.query_params.get("q") or "").strip()
+        if q:
+            qs = qs.filter(Q(run_number__icontains=q) | Q(output_item__name__icontains=q)
+                           | Q(batch__batch_code__icontains=q) | Q(customer__name__icontains=q))
+        try:
+            page = max(1, int(request.query_params.get("page") or 1))
+            page_size = min(200, max(1, int(request.query_params.get("page_size") or 25)))
+        except ValueError:
+            page, page_size = 1, 25
+        total = qs.count()
+        rows = [serialize_run(r) for r in qs[(page - 1) * page_size: page * page_size]]
+        return Response(envelope(rows, count=total, page=page, page_size=page_size))
+
+    def post(self, request):
+        from apps.core.permissions import require_permission
+
+        from .production_services import create_run, serialize_run
+
+        require_permission(request.user, "enter_production")
+        data = request.data
+        item = Item.objects.filter(client_id=request.client_id, pk=data.get("outputItemId"), deleted_at__isnull=True).first() \
+            if data.get("outputItemId") else None
+        if item is None:
+            raise ValidationFailed("Choose the fabric to produce.", field_errors={"outputItemId": ["Required."]})
+        customer = None
+        if data.get("customerId"):
+            customer = Party.objects.filter(client_id=request.client_id, pk=data["customerId"]).first()
+            if customer is None:
+                raise ValidationFailed("Customer not found.", field_errors={"customerId": ["Not found."]})
+        fields = {
+            "customer": customer,
+            "fabric_quality": FabricQuality.objects.filter(client_id=request.client_id, pk=data.get("fabricQualityId")).first()
+            if data.get("fabricQualityId") else None,
+            "shade": Shade.objects.filter(client_id=request.client_id, pk=data.get("shadeId")).first()
+            if data.get("shadeId") else None,
+            "width": data.get("width") or None,
+            "gsm": data.get("gsm") or None,
+            "machine": data.get("machine") or None,
+            "notes": data.get("notes") or None,
+            "responsible": request.user,
+        }
+        if data.get("runDate"):
+            fields["run_date"] = data["runDate"]
+        run = create_run(client=request.user.client, output_item=item, planned_qty=data.get("plannedQty"),
+                         user=request.user, **fields)
+        return Response(serialize_run(run), status=status.HTTP_201_CREATED)
+
+
+class ProductionRunDetailView(APIView):
+    """
+    GET  /inventory/production-runs/<id>/
+    POST /inventory/production-runs/<id>/<action>/  action in
+         issue    {itemId, locationId, quantity, customerSupplied?}
+         output   {rolls: [{meters, weightKg?, width?}]}
+         expense  {costType, amount, remarks?}
+         qc       {goodQty, secondQualityQty, reprocessQty, rejectedQty, holdQty, locationId, remarks?}
+         complete {wastageQty?, wastageUom?}
+    """
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_production"]
+    ACTION_PERMISSION = {
+        "issue": "enter_production",
+        "output": "enter_production",
+        "expense": "enter_production",
+        "qc": "approve_qc",
+        "complete": "verify_production",
+        "cancel": "verify_production",
+    }
+
+    def _run(self, request, pk):
+        from .models import ProductionRun
+
+        return ProductionRun.objects.filter(client_id=request.client_id, pk=pk, deleted_at__isnull=True).first()
+
+    def get(self, request, pk):
+        from .production_services import serialize_run
+
+        run = self._run(request, pk)
+        if run is None:
+            return Response({"message": "Production run not found.", "code": "NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
+        return Response(serialize_run(run))
+
+    def post(self, request, pk, action_name=None):
+        from apps.core.permissions import require_permission
+
+        from . import production_services as prod
+        from . import qc as qc_service
+
+        if action_name not in self.ACTION_PERMISSION:
+            return Response({"message": "Unknown action.", "code": "NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
+        require_permission(request.user, self.ACTION_PERMISSION[action_name])
+        run = self._run(request, pk)
+        if run is None:
+            return Response({"message": "Production run not found.", "code": "NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
+        data = request.data
+        result = {}
+        if action_name == "issue":
+            item = Item.objects.filter(client_id=request.client_id, pk=data.get("itemId")).first() if data.get("itemId") else None
+            location = Location.objects.filter(client_id=request.client_id, pk=data.get("locationId")).first() \
+                if data.get("locationId") else None
+            if item is None or location is None:
+                raise ValidationFailed("Choose the material and the location it is issued from.",
+                                       field_errors={"itemId": ["Required."], "locationId": ["Required."]})
+            prod.issue_material(run, item=item, location=location, quantity=data.get("quantity"),
+                                customer_supplied=bool(data.get("customerSupplied")), user=request.user)
+        elif action_name == "output":
+            prod.record_output(run, rolls=data.get("rolls"), user=request.user)
+        elif action_name == "expense":
+            prod.add_expense(run, cost_type=data.get("costType"), amount=data.get("amount"),
+                             remarks=data.get("remarks"), user=request.user)
+        elif action_name == "qc":
+            result["movements"] = prod.dispose_qc(
+                run, quantities=qc_service.parse_quantities(data), good_location_id=data.get("locationId"),
+                user=request.user, remarks=data.get("remarks"),
+            )
+        elif action_name == "cancel":
+            prod.cancel_run(run, reason=data.get("reason"), user=request.user)
+        else:
+            prod.complete_run(run, wastage_qty=data.get("wastageQty"), wastage_uom=data.get("wastageUom"),
+                              user=request.user)
+        run.refresh_from_db()
+        return Response({**prod.serialize_run(run), **result})
+
+
 class StockAgeingView(APIView):
     """
     GET /inventory/stock/ageing/
@@ -6056,67 +6528,59 @@ class QCInspectionViewSet(TenantModelViewSet):
             raise Conflict("Inspection is already approved.", code="ALREADY_APPROVED")
 
         lines = list(inspection.lines.select_related("lot_taka", "lot_taka__location", "lot_taka__item"))
-        qc_loc = Location.objects.filter(client_id=inspection.client_id, code="SYS-QC-HOLD").first()
+        # Passed fabric goes to the godown the inspector picks, else the
+        # first real godown -- never a hard-coded code.
+        good_location_id = request.data.get("locationId") or Location.objects.filter(
+            client_id=inspection.client_id, is_active=True, deleted_at__isnull=True,
+            type__in=["Warehouse", "Godown"],
+        ).exclude(code__startswith="SYS-").order_by("created_at").values_list("id", flat=True).first()
+        # Line disposition -> (stock condition, movement type, taka status).
+        routing = {
+            "Pass": ("Good", "QC_PASS", "Available"),
+            "Second Quality": ("Second Quality", "QC_SECOND_QUALITY", "Second Quality"),
+            "Reprocess": ("Reprocess", "QC_REPROCESS", "Reprocess"),
+            "Reject": ("Reject", "QC_REJECT", "Reject"),
+        }
 
         for line in lines:
             lt = line.lot_taka
             if not lt:
                 continue
-
-            disp = line.disposition
-            m = line.actual_meter or lt.available_quantity or ZERO
+            m = min(D(line.actual_meter or lt.available_quantity or ZERO), D(lt.available_quantity or ZERO))
             if m <= ZERO:
                 continue
 
-            target_loc = None
-            mov_type = None
-
-            status_val = "Available"
-            qc_status_val = "Pass"
-
-            if disp == "Pass":
-                status_val = "Available"
-                qc_status_val = "Passed"
-                mov_type = "QC_PASS"
-                target_loc = Location.objects.filter(client_id=inspection.client_id, code="WH-MAIN").first() or Location.objects.filter(client_id=inspection.client_id, is_active=True).exclude(code__startswith="SYS-").first()
-            elif disp == "Second Quality":
-                status_val = "Second Quality"
-                qc_status_val = "Second Quality"
-                mov_type = "QC_SECOND_QUALITY"
-                target_loc = stock.resolve_system_location(inspection.client_id, "SECOND_QUALITY")
-            elif disp == "Reprocess":
-                status_val = "Reprocess"
-                qc_status_val = "Reprocess"
-                mov_type = "QC_REPROCESS"
-                target_loc = stock.resolve_system_location(inspection.client_id, "REPROCESS")
-            elif disp == "Reject":
-                status_val = "Reject"
-                qc_status_val = "Reject"
-                mov_type = "QC_REJECT"
-                target_loc = stock.resolve_system_location(inspection.client_id, "REJECT")
-            else:  # Hold
-                status_val = "QC Hold"
-                qc_status_val = "Hold"
-                target_loc = lt.location
-
-            if mov_type and target_loc and str(lt.location_id) != str(target_loc.id):
-                stock.relocate_lot(
+            if line.disposition not in routing:  # Hold: stays where it is
+                lt.status = "QC Hold"
+                lt.qc_status = "On Hold"
+                lt.save(update_fields=["status", "qc_status", "updated_at"])
+                continue
+            condition, mov_type, status_val = routing[line.disposition]
+            if line.disposition == "Pass" and not good_location_id:
+                raise ValidationFailed(
+                    "Choose the godown passed fabric goes to.", field_errors={"locationId": ["Required."]}
+                )
+            target_id = stock.condition_location_id(inspection.client_id, condition, good_location_id)
+            holder = lt
+            if str(lt.location_id) != str(target_id):
+                holder, _ = stock.relocate_lot(
                     client_id=inspection.client_id,
                     lot=lt,
                     quantity=m,
-                    to_location_id=target_loc.id,
+                    to_location_id=target_id,
                     out_type=mov_type,
                     in_type=mov_type,
                     reference_type="QCInspection",
                     reference_id=inspection.id,
                     reference_number=inspection.inspection_number,
                     user=request.user,
+                    qc_status=stock.CONDITION_ROUTING[condition][1],
+                    split_suffix="QC",
                 )
-
-            lt.refresh_from_db()
-            lt.status = status_val
-            lt.qc_status = qc_status_val
-            lt.save(update_fields=["status", "qc_status", "updated_at"])
+            holder.refresh_from_db()
+            holder.status = status_val
+            holder.qc_status = stock.CONDITION_ROUTING[condition][1]
+            holder.save(update_fields=["status", "qc_status", "updated_at"])
 
         inspection.status = "Approved"
         inspection.inspector = request.user

@@ -11,6 +11,10 @@ from apps.accounts.models import Client, User
 from apps.masters.models import Party
 from apps.sales.models import Quotation
 
+from unittest import skip
+
+QUOTATION_COMMENTED_OUT = "The Quotation module is commented out (its /sales/quotations/ routes are off)."
+
 
 class ManualQuotationTests(TestCase):
     def setUp(self):
@@ -41,6 +45,7 @@ class ManualQuotationTests(TestCase):
             },
         )
 
+    @skip(QUOTATION_COMMENTED_OUT)
     def test_quotation_with_a_typed_name_saves(self):
         resp = self.manual()
         self.assertEqual(resp.status_code, 201, resp.content[:500])
@@ -51,11 +56,13 @@ class ManualQuotationTests(TestCase):
         self.assertEqual(q.billing_address["phone"], "9876543210")
         self.assertEqual(str(q.total), "10500.00")
 
+    @skip(QUOTATION_COMMENTED_OUT)
     def test_no_customer_lead_or_name_is_refused(self):
         resp = self.create()
         self.assertEqual(resp.status_code, 400, resp.content[:300])
         self.assertIn("partyName", resp.data["field_errors"])
 
+    @skip(QUOTATION_COMMENTED_OUT)
     def test_approval_makes_the_customer_once(self):
         qid = self.manual().data["id"]
         resp = self.api.post(f"/api/v1/sales/quotations/{qid}/approve/", {}, format="json")

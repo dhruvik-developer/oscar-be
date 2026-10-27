@@ -29,6 +29,11 @@ router.register("forms", views.FormViewSet, basename="crm-forms")
 urlpatterns = [
     path("team-roster/", views.TeamRosterView.as_view(), name="crm-team-roster"),
     path(
+        "incentive-schemes/",
+        views.IncentiveSchemesView.as_view(),
+        name="crm-incentive-schemes",
+    ),
+    path(
         "assignment-options/",
         views.AssignmentOptionsView.as_view(),
         name="crm-assignment-options",

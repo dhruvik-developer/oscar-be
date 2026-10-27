@@ -327,18 +327,47 @@ def _owner_employee(record):
     return getattr(owner, "employee", None) if owner is not None else None
 
 
+def _lead_salesperson(lead):
+    """The salesperson a lead was attributed to (source "Sales Person"), if any.
+
+    The Create Lead form stores the picked HRMS employee in
+    ``custom_values["salesperson_id"]``; it is credited ahead of the lead
+    owner because someone chose it explicitly.
+    """
+    from django.core.exceptions import ValidationError as DjangoValidationError
+
+    from apps.hrms.models import Employee
+
+    if lead is None:
+        return None
+    employee_id = (lead.custom_values or {}).get("salesperson_id")
+    if not employee_id:
+        return None
+    try:
+        return Employee.objects.filter(
+            client_id=lead.client_id, pk=employee_id, deleted_at__isnull=True
+        ).first()
+    except (TypeError, ValueError, DjangoValidationError):
+        return None
+
+
 def fill_salesperson(document):
     """Default a sales document's salesperson when nobody picked one.
 
     Incentive is credited through ``salesperson_fk`` (PDF §12), so a document
-    left blank counts for nobody. Falls back to the CRM deal owner, then the
-    lead owner, then the customer's default salesperson. Never overwrites a
-    salesperson already on the document. Returns True when it set one.
+    left blank counts for nobody. Falls back to the salesperson the CRM lead
+    was attributed to, then the CRM deal owner, then the lead owner, then the
+    customer's default salesperson. Never overwrites a salesperson already on
+    the document. Returns True when it set one.
     """
     if getattr(document, "salesperson_fk_id", None) or (getattr(document, "salesperson", None) or "").strip():
         return False
+    from .models import order_lead
+
+    lead = getattr(document, "crm_lead", None) or order_lead(getattr(document, "sales_order", None))
     employee = (
-        _owner_employee(getattr(document, "crm_deal", None))
+        _lead_salesperson(lead)
+        or _owner_employee(getattr(document, "crm_deal", None))
         or _owner_employee(getattr(document, "crm_lead", None))
         or getattr(getattr(document, "party", None), "default_salesperson", None)
     )
@@ -506,6 +535,47 @@ LOT_TRACKED = ("LOT", "TAKA")
 SELLABLE_LOT_QC = ("Passed", "Pass")
 
 
+def _taka_ids(rows):
+    ids = set()
+    for row in rows or []:
+        if isinstance(row, dict):
+            taka_id = row.get("lotTakaId") or row.get("lot_taka_id") or row.get("id")
+            if taka_id:
+                ids.add(str(taka_id))
+    return ids
+
+
+def _line_party_id(line):
+    """The customer of the document a sales line belongs to."""
+    for attr in ("delivery_challan", "sales_invoice", "sales_order"):
+        doc = getattr(line, attr, None)
+        if doc is not None:
+            return doc.party_id
+    return None
+
+
+def owned_by_someone_else(taka, party_id):
+    """A customer's (or third party's) roll may only go back to that owner."""
+    batch = getattr(taka, "batch", None)
+    if batch is None or batch.ownership == "OSCAR":
+        return False
+    return str(batch.owner_party_id or "") != str(party_id or "")
+
+
+def own_reserved_taka_ids(line):
+    """Takas reserved for the order this line belongs to (or is drawn from).
+
+    A taka in status Reserved may only be dispatched against that order;
+    every other sale must leave it alone.
+    """
+    ids = _taka_ids(getattr(line, "reserved_takas", None))
+    order_line = getattr(line, "sales_order_line", None)
+    if order_line is not None:
+        ids |= _taka_ids(getattr(order_line, "reserved_takas", None))
+        ids |= _taka_ids(getattr(order_line, "taka_allocations", None))
+    return ids
+
+
 def allocate_takas(client_id, line, stock_qty, location_id):
     """Which takas a sale line draws on: ``[(lot_taka | None, qty), ...]``.
 
@@ -522,6 +592,8 @@ def allocate_takas(client_id, line, stock_qty, location_id):
     stock_qty = D(stock_qty)
     label = line.item_name or line.item.name
     selection = getattr(line, "taka_allocations", None) or []
+    own_reserved = own_reserved_taka_ids(line)
+    party_id = _line_party_id(line)
     base = LotTaka.objects.select_for_update().filter(
         client_id=client_id, item_id=line.item_id, deleted_at__isnull=True
     )
@@ -550,8 +622,27 @@ def allocate_takas(client_id, line, stock_qty, location_id):
                     f"{taka.qc_status} in QC and cannot be dispatched.",
                     code="QC_BLOCKED",
                 )
+            if owned_by_someone_else(taka, party_id):
+                raise BusinessRuleViolation(
+                    f"{label}: taka {taka.taka_id or taka.taka_number} belongs to "
+                    f"{taka.batch.owner_party.name if taka.batch.owner_party_id else 'a customer'} "
+                    "and can only be delivered to them.",
+                    code="NOT_OSCAR_STOCK",
+                )
+            if taka.status == LotTaka.STATUS_RESERVED and str(taka.id) not in own_reserved:
+                raise BusinessRuleViolation(
+                    f"{label}: taka {taka.taka_id or taka.taka_number} is reserved "
+                    "for another order.",
+                    code="TAKA_RESERVED",
+                )
             if qty <= ZERO:
                 continue
+            if qty > D(taka.available_quantity) + ROUNDING_TOLERANCE:
+                raise BusinessRuleViolation(
+                    f"{label}: taka {taka.taka_id or taka.taka_number} has only "
+                    f"{round4(D(taka.available_quantity))} left; {qty} selected.",
+                    code=Codes.INSUFFICIENT_STOCK,
+                )
             allocations.append((taka, qty))
             total += qty
         if abs(total - stock_qty) > ROUNDING_TOLERANCE:
@@ -563,9 +654,20 @@ def allocate_takas(client_id, line, stock_qty, location_id):
         return allocations
 
     remaining = stock_qty
-    for taka in base.filter(
-        location_id=location_id, available_quantity__gt=0, qc_status__in=SELLABLE_LOT_QC
-    ).order_by("received_date", "created_at", "taka_number"):
+    candidates = list(
+        base.filter(
+            location_id=location_id, available_quantity__gt=0, qc_status__in=SELLABLE_LOT_QC
+        ).order_by("received_date", "created_at", "taka_number")
+    )
+    # FIFO never takes another order's reserved takas; this order's own
+    # reservation is drawn first.
+    candidates = [
+        t for t in candidates
+        if (t.status != LotTaka.STATUS_RESERVED or str(t.id) in own_reserved)
+        and not owned_by_someone_else(t, party_id)
+    ]
+    candidates.sort(key=lambda t: 0 if str(t.id) in own_reserved else 1)
+    for taka in candidates:
         if remaining <= ZERO:
             break
         take = min(D(taka.available_quantity), remaining)
@@ -589,7 +691,10 @@ def post_sale_movements(*, client_id, line, stock_qty, location_id, reference_ty
     movements = []
     wac = None
     for taka, qty in allocate_takas(client_id, line, stock_qty, location_id):
-        if taka is not None and D(taka.rate) > ZERO:
+        if taka is not None and taka.batch_id and taka.batch.ownership != "OSCAR":
+            # The owner's own material going back: not OSCAR's stock, no COGS.
+            unit_cost = ZERO
+        elif taka is not None and D(taka.rate) > ZERO:
             unit_cost = D(taka.rate)
         else:
             if wac is None:
@@ -1258,17 +1363,39 @@ def compute_expiry(start_date, period, unit):
 
 @transaction.atomic
 def reserve_order_takas(order):
-    """Transition selected takas on open order lines to 'Reserved' status (PDF §11)."""
+    """Transition selected takas on open order lines to 'Reserved' status (PDF §11).
+
+    A taka already reserved for a different order is refused rather than
+    silently shared, so one roll is never promised twice.
+    """
     from apps.inventory.models import LotTaka
 
     for line in order.line_items.all():
         takas_info = getattr(line, "reserved_takas", None) or getattr(line, "taka_allocations", None) or []
         for item in takas_info:
             taka_id = item.get("lotTakaId") or item.get("lot_taka_id") or item.get("id")
-            if taka_id:
-                LotTaka.objects.filter(
-                    client_id=order.client_id, pk=taka_id, status=LotTaka.STATUS_AVAILABLE
-                ).update(status=LotTaka.STATUS_RESERVED)
+            if not taka_id:
+                continue
+            taka = LotTaka.objects.select_for_update().filter(client_id=order.client_id, pk=taka_id).first()
+            if taka is None:
+                continue
+            if taka.status == LotTaka.STATUS_RESERVED and not _reserved_by(order, taka):
+                raise BusinessRuleViolation(
+                    f"Taka {taka.taka_id or taka.taka_number} is already reserved for another order.",
+                    code="TAKA_RESERVED",
+                )
+            if taka.status == LotTaka.STATUS_AVAILABLE:
+                taka.status = LotTaka.STATUS_RESERVED
+                taka.save(update_fields=["status", "updated_at"])
+
+
+def _reserved_by(order, taka):
+    """Is this taka listed on one of ``order``'s lines?"""
+    for line in order.line_items.all():
+        rows = (getattr(line, "reserved_takas", None) or []) + (getattr(line, "taka_allocations", None) or [])
+        if str(taka.id) in _taka_ids(rows):
+            return True
+    return False
 
 
 @transaction.atomic
@@ -1332,50 +1459,50 @@ def get_picking_list(order):
         "date": order.doc_date.isoformat() if order.doc_date else None,
         "deliveryDate": order.delivery_date.isoformat() if getattr(order, "delivery_date", None) else None,
         "lines": picking_items,
-    }
-
-
-#: Keys of a manual quotation's ``billing_address`` that are contact details,
-#: not address lines.
-MANUAL_CONTACT_KEYS = ("contactPerson", "phone", "email")
-
-
-def party_from_manual_quotation(quotation, *, user=None):
-    """The customer for an approved quotation addressed by hand.
-
-    A manual quotation has no lead and no party, only the name and details
-    typed on it. On approval it needs a customer like any other (the sales
-    order is raised on one): an active customer with the same name is reused,
-    otherwise one is created from what the quotation carries.
-    """
-    from apps.masters.models import Party
-
-    name = (quotation.party_name or "").strip()
-    if not name:
-        return None
-    existing = Party.objects.filter(
-        client_id=quotation.client_id,
-        name__iexact=name,
-        type__in=("Customer", "Both"),
-        deleted_at__isnull=True,
-    ).first()
-    if existing is not None:
-        return existing
-
-    details = dict(quotation.billing_address or {})
-    address = {k: v for k, v in details.items() if k not in MANUAL_CONTACT_KEYS and v}
-    gstin = (quotation.party_gstin or "").strip() or None
-    return Party.objects.create(
-        client_id=quotation.client_id,
-        code=allocate_number(quotation.client, "CUST"),
-        type="Customer",
-        name=name,
-        phone=details.get("phone") or None,
-        email=details.get("email") or None,
-        gstin=gstin,
-        gst_treatment="Registered Business" if gstin else "Unregistered Business",
-        place_of_supply=quotation.place_of_supply,
-        billing_address=address,
-        shipping_address=dict(address),
-        created_by=user if getattr(user, "is_authenticated", False) else None,
-    )
+    }
+
+
+#: Keys of a manual quotation's ``billing_address`` that are contact details,
+#: not address lines.
+MANUAL_CONTACT_KEYS = ("contactPerson", "phone", "email")
+
+
+def party_from_manual_quotation(quotation, *, user=None):
+    """The customer for an approved quotation addressed by hand.
+
+    A manual quotation has no lead and no party, only the name and details
+    typed on it. On approval it needs a customer like any other (the sales
+    order is raised on one): an active customer with the same name is reused,
+    otherwise one is created from what the quotation carries.
+    """
+    from apps.masters.models import Party
+
+    name = (quotation.party_name or "").strip()
+    if not name:
+        return None
+    existing = Party.objects.filter(
+        client_id=quotation.client_id,
+        name__iexact=name,
+        type__in=("Customer", "Both"),
+        deleted_at__isnull=True,
+    ).first()
+    if existing is not None:
+        return existing
+
+    details = dict(quotation.billing_address or {})
+    address = {k: v for k, v in details.items() if k not in MANUAL_CONTACT_KEYS and v}
+    gstin = (quotation.party_gstin or "").strip() or None
+    return Party.objects.create(
+        client_id=quotation.client_id,
+        code=allocate_number(quotation.client, "CUST"),
+        type="Customer",
+        name=name,
+        phone=details.get("phone") or None,
+        email=details.get("email") or None,
+        gstin=gstin,
+        gst_treatment="Registered Business" if gstin else "Unregistered Business",
+        place_of_supply=quotation.place_of_supply,
+        billing_address=address,
+        shipping_address=dict(address),
+        created_by=user if getattr(user, "is_authenticated", False) else None,
+    )
