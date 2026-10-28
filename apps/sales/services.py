@@ -44,6 +44,7 @@ from apps.masters import uom
 from .models import (
     NON_RESERVING_STAGES,
     DeliveryChallan,
+    EarlyPaymentDiscountRequest,
     PaymentAllocation,
     PaymentIn,
     SalesInvoice,
@@ -281,9 +282,32 @@ def allocated_to(client_id, document_type, document_id):
     )["value"]
 
 
-def refresh_invoice_payment_status(invoice):
-    """Recompute ``amount_paid`` and ``status`` from the allocations.
+def approved_discount_total(client_id, invoice_id):
+    """Approved early-payment discounts on one invoice (each one a posted credit note)."""
+    return EarlyPaymentDiscountRequest.objects.filter(
+        client_id=client_id,
+        invoice_id=invoice_id,
+        status="Approved",
+        deleted_at__isnull=True,
+    ).aggregate(
+        value=Coalesce(
+            Sum("approved_amount"), Value(Decimal("0.00")),
+            output_field=DecimalField(max_digits=18, decimal_places=2),
+        )
+    )["value"]
 
+
+def invoice_balance(invoice):
+    """What the customer still owes: total less money received less approved discounts."""
+    remaining = D(invoice.total) - D(invoice.amount_paid) - D(invoice.settlement_discount)
+    return round2(remaining) if remaining > ZERO else ZERO
+
+
+def refresh_invoice_payment_status(invoice):
+    """Recompute ``amount_paid``, ``settlement_discount`` and ``status``.
+
+    ``amount_paid`` is money received (the allocations); approved early-payment
+    discounts settle the rest of the invoice but are kept apart from it.
     ``Overdue`` is not set here -- it is layered on at read time from
     ``due_date`` plus ``balance_due > 0`` (db.md §12, never stored).
     """
@@ -291,11 +315,12 @@ def refresh_invoice_payment_status(invoice):
         return invoice
 
     invoice.amount_paid = round2(allocated_to(invoice.client_id, "SalesInvoice", invoice.id))
+    invoice.settlement_discount = round2(approved_discount_total(invoice.client_id, invoice.id))
     finalized = invoice.posted_at is not None
     invoice.status = derive_payment_status(
-        invoice.total, invoice.amount_paid, finalized=finalized
+        invoice.total, D(invoice.amount_paid) + D(invoice.settlement_discount), finalized=finalized
     )
-    invoice.save(update_fields=["amount_paid", "status", "updated_at"])
+    invoice.save(update_fields=["amount_paid", "settlement_discount", "status", "updated_at"])
 
     if invoice.sales_order_id:
         refresh_order_payment_status(invoice.sales_order)
@@ -384,7 +409,8 @@ def invoice_outstanding(invoice):
     from apps.core.money import ageing_bucket, days_overdue, effective_due_date
 
     paid = round2(allocated_to(invoice.client_id, "SalesInvoice", invoice.id))
-    outstanding = round2(D(invoice.total) - paid)
+    discount = round2(invoice.settlement_discount)
+    outstanding = round2(D(invoice.total) - paid - discount)
     outstanding = outstanding if outstanding > ZERO else ZERO
     today = timezone.localdate()
     due = effective_due_date(invoice.doc_date, invoice.due_date, invoice.credit_days)
@@ -396,6 +422,7 @@ def invoice_outstanding(invoice):
     return {
         "total": round2(invoice.total),
         "paid": paid,
+        "approvedDiscount": discount,
         "outstanding": outstanding,
         "dueDate": due,
         "daysOverdue": overdue,
@@ -410,7 +437,7 @@ def display_status(invoice):
     if (
         invoice.due_date
         and invoice.due_date < timezone.localdate()
-        and D(invoice.total) - D(invoice.amount_paid) > ROUNDING_TOLERANCE
+        and invoice_balance(invoice) > ROUNDING_TOLERANCE
     ):
         return "Overdue"
     return invoice.status
@@ -1079,6 +1106,7 @@ def _restore_serials(client_id, reference_type, reference_id):
 def record_payment_in(
     *, client, party, amount, payment_date, mode, bank_account=None,
     reference_number=None, notes=None, allocations=None, invoice=None, user=None,
+    transaction_reference=None,
 ):
     """api.md §5.8 -- all five validations moved server-side.
 
@@ -1099,6 +1127,22 @@ def record_payment_in(
             field_errors={"bankAccountId": ["Required for non-cash payments."]},
         )
 
+    # The bank's transaction id identifies one receipt; entering it twice
+    # would post the same money twice.
+    transaction_reference = (transaction_reference or "").strip() or None
+    if transaction_reference:
+        duplicate = PaymentIn.objects.filter(
+            client_id=client.id, party=party, status="Active", deleted_at__isnull=True,
+            transaction_reference__iexact=transaction_reference,
+        ).first()
+        if duplicate is not None:
+            raise Conflict(
+                f"Receipt {duplicate.payment_number} already records transaction "
+                f"{transaction_reference} for this customer.",
+                code="DUPLICATE_RECEIPT",
+                payload={"paymentId": str(duplicate.id), "paymentNumber": duplicate.payment_number},
+            )
+
     payment = PaymentIn.objects.create(
         client=client,
         payment_number=allocate_number(client, "PAY-IN", payment_date),
@@ -1108,6 +1152,7 @@ def record_payment_in(
         mode=mode,
         bank_account=bank_account,
         reference_number=reference_number,
+        transaction_reference=transaction_reference,
         notes=notes,
         created_by=user if getattr(user, "is_authenticated", False) else None,
     )
@@ -1171,7 +1216,8 @@ def allocate_payment_in(payment, allocations, *, user=None):
             )
 
         already = round2(allocated_to(payment.client_id, "SalesInvoice", invoice.id))
-        balance = round2(D(invoice.total) - already)
+        # Approved early-payment discounts have already settled part of it.
+        balance = round2(D(invoice.total) - already - D(invoice.settlement_discount))
         if balance <= ROUNDING_TOLERANCE:
             raise BusinessRuleViolation(
                 "This invoice is already fully paid.", code=Codes.ALREADY_SETTLED
@@ -1228,6 +1274,19 @@ def cancel_payment_in(payment, *, reason=None, user=None):
     payment = PaymentIn.objects.select_for_update().get(pk=payment.pk)
     if payment.status == "Cancelled":
         raise Conflict("This payment is already cancelled.", code=Codes.ALREADY_CANCELLED)
+
+    # An approved discount was granted for this money; it is reversed on its own.
+    approved = EarlyPaymentDiscountRequest.objects.filter(
+        client_id=payment.client_id, payment=payment, status="Approved", deleted_at__isnull=True,
+    ).first()
+    if approved is not None:
+        raise BusinessRuleViolation(
+            f"Cancel early payment discount {approved.request_number} before cancelling this receipt.",
+            code=Codes.HAS_DEPENDENTS,
+        )
+    from .early_payment import cancel_open_requests_for_payment
+
+    cancel_open_requests_for_payment(payment, user=user, reason=f"Receipt {payment.payment_number} cancelled")
 
     invoice_ids = list(
         PaymentAllocation.objects.filter(

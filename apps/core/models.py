@@ -290,6 +290,10 @@ class Notification(models.Model):
     channels = models.JSONField(default=list)  # in_app | email | sms | whatsapp
     payload = models.JSONField(null=True, blank=True)
     read_at = models.DateTimeField(null=True, blank=True)
+    #: Cleared from the bell by the recipient; kept for the history page.
+    dismissed_at = models.DateTimeField(null=True, blank=True)
+    #: Hidden until this time, then back as unread ("remind me later").
+    snoozed_until = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

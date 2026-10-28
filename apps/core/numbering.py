@@ -24,6 +24,7 @@ SERIES_DEFAULTS = {
     "INV": ("INV", "fy", 4, "-"),
     "DC": ("DC", "fy", 4, "-"),
     "PAY-IN": ("PAY-IN", "fy", 4, "-"),
+    "EPD": ("EPD", "fy", 4, "-"),
     "SR": ("SR", "fy", 4, "-"),
     "WC": ("WC", "fy", 5, "-"),
     # Purchase
@@ -70,6 +71,7 @@ SERIES_DEFAULTS = {
     "PRUN": ("PRUN", "fy", 4, "-"),
     # Customer material receipts / deliveries back to the customer
     "CMR": ("CMR", "fy", 4, "-"),
+    "DSO": ("DSO", "fy", 4, "-"),
     "CMD": ("CMD", "fy", 4, "-"),
     # Taka registration out of a batch's bulk metres
     "TRG": ("TRG", "fy", 4, "-"),

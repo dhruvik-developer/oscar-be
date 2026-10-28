@@ -2,7 +2,7 @@
 from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
-from . import views
+from . import service_order_views, views
 
 router = DefaultRouter(trailing_slash=True)
 router.register("process-plans", views.ProcessPlanViewSet, basename="jobwork-process-plans")
@@ -10,6 +10,10 @@ router.register("orders", views.JobWorkOrderViewSet, basename="jobwork-orders")
 
 urlpatterns = [
     path("itc-04/", views.ITC04ReportView.as_view(), name="jobwork-itc04-report"),
+    path("service-orders/", service_order_views.ServiceOrderListView.as_view(), name="jobwork-service-orders"),
+    path("service-orders/<uuid:pk>/", service_order_views.ServiceOrderDetailView.as_view(), name="jobwork-service-order"),
+    path("service-orders/<uuid:pk>/<str:action_name>/", service_order_views.ServiceOrderDetailView.as_view(),
+         name="jobwork-service-order-action"),
     path("itc-04/export/", views.ITC04ExportView.as_view(), name="jobwork-itc04-export"),
     path("", include(router.urls)),
 ]

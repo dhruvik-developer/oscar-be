@@ -20,6 +20,7 @@ from .models import (
     BrokerCommission,
     DeliveryChallan,
     DeliveryChallanLine,
+    EarlyPaymentDiscountRequest,
     PaymentAllocation,
     PaymentIn,
     ProformaInvoice,
@@ -243,11 +244,15 @@ class SalesInvoiceSerializer(DocumentSerializer):
 
     #: ``Overdue`` is layered on at read time, never stored (db.md §12).
     displayStatus = serializers.SerializerMethodField()
+    #: Approved early-payment discounts; part of what settles the invoice, not money received.
+    settlementDiscount = serializers.DecimalField(
+        source="settlement_discount", max_digits=18, decimal_places=2, read_only=True
+    )
 
     class Meta:
         model = SalesInvoice
         fields = HEADER_FIELDS + [
-            "invoice_number", "status", "displayStatus", "due_date",
+            "invoice_number", "status", "displayStatus", "due_date", "settlementDiscount",
             "sales_order", "delivery_challan", "proforma_invoice", "location",
             "irn", "eway_bill_number", "ewayBillNumber",
             "ack_no", "ackNo", "ack_date", "ackDate", "signed_qrcode", "signedQrcode",
@@ -300,7 +305,7 @@ class PaymentInSerializer(BaseModelSerializer):
         model = PaymentIn
         fields = [
             "id", "payment_number", "customerId", "customerName", "date", "amount",
-            "mode", "bankAccountId", "reference_number", "notes",
+            "mode", "bankAccountId", "reference_number", "transaction_reference", "notes",
             "allocated_amount", "unallocatedAmount", "allocations", "status",
             "invoiceId", "allocationsInput", "created_at", "updated_at",
         ]
@@ -481,4 +486,61 @@ class BrokerCommissionSerializer(BaseModelSerializer):
             "notes", "created_at", "updated_at",
         ]
         read_only_fields = ["created_at", "updated_at"]
+
+
+class EarlyPaymentDiscountRequestSerializer(BaseModelSerializer):
+    """Read shape for discount requests; writes go through ``early_payment``."""
+
+    customerId = serializers.CharField(source="party_id", read_only=True)
+    customerName = serializers.CharField(source="party.name", read_only=True)
+    invoiceId = serializers.CharField(source="invoice_id", read_only=True)
+    paymentId = serializers.CharField(source="payment_id", read_only=True)
+    paymentNumber = serializers.CharField(source="payment.payment_number", read_only=True)
+    requestedById = serializers.CharField(source="requested_by_id", read_only=True)
+    requestedByName = serializers.SerializerMethodField()
+    reviewedByName = serializers.SerializerMethodField()
+    decidedByName = serializers.SerializerMethodField()
+    cancelledByName = serializers.SerializerMethodField()
+    creditNoteId = serializers.CharField(source="credit_note_id", read_only=True)
+    creditNoteNumber = serializers.SerializerMethodField()
+    invoiceOutstanding = serializers.SerializerMethodField()
+
+    class Meta:
+        model = EarlyPaymentDiscountRequest
+        fields = [
+            "id", "request_number", "status", "customerId", "customerName",
+            "invoiceId", "invoice_number", "invoice_date", "invoice_total",
+            "payment_terms", "credit_days", "due_date",
+            "paymentId", "paymentNumber", "payment_date", "eligible_amount", "days_paid_early",
+            "requested_amount", "proposed_amount", "approved_amount",
+            "customer_request_date", "reason", "notes", "attachments",
+            "requestedById", "requestedByName", "submitted_at",
+            "reviewedByName", "reviewed_at", "decidedByName", "decided_at", "decision_reason",
+            "creditNoteId", "creditNoteNumber",
+            "cancelledByName", "cancelled_at", "cancellation_reason",
+            "invoiceOutstanding", "created_at", "updated_at",
+        ]
+        read_only_fields = fields
+
+    @staticmethod
+    def _name(user):
+        return (getattr(user, "name", None) or getattr(user, "email", None)) if user else None
+
+    def get_requestedByName(self, obj):
+        return self._name(obj.requested_by)
+
+    def get_reviewedByName(self, obj):
+        return self._name(obj.reviewed_by)
+
+    def get_decidedByName(self, obj):
+        return self._name(obj.decided_by)
+
+    def get_cancelledByName(self, obj):
+        return self._name(obj.cancelled_by)
+
+    def get_creditNoteNumber(self, obj):
+        return obj.credit_note.note_number if obj.credit_note_id else None
+
+    def get_invoiceOutstanding(self, obj):
+        return services.invoice_balance(obj.invoice)
 

@@ -263,6 +263,7 @@ class ReportView(APIView):
                 revenue=money_sum("taxable_value"),
                 invoiced=money_sum("total"),
                 received=money_sum("amount_paid"),
+                discounted=money_sum("settlement_discount"),
                 invoiceCount=Count("id"),
             )
             .order_by("-revenue")
@@ -278,7 +279,7 @@ class ReportView(APIView):
                         "revenue": round2(row["revenue"]),
                         "invoiced": round2(row["invoiced"]),
                         "received": round2(row["received"]),
-                        "outstanding": round2(row["invoiced"] - row["received"]),
+                        "outstanding": round2(row["invoiced"] - row["received"] - row["discounted"]),
                         "invoiceCount": row["invoiceCount"],
                         "sharePct": round(float(row["revenue"] / total * 100), 1),
                     }

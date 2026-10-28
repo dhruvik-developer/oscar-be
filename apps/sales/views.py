@@ -10,6 +10,7 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from apps.core.exceptions import (
     BusinessRuleViolation,
@@ -21,6 +22,7 @@ from apps.core.exceptions import (
 from apps.core.money import ZERO, D, round2, round4
 from apps.core.numbering import allocate_number
 from apps.core.pagination import envelope
+from apps.core.permissions import HasModulePermission
 from apps.core.printing import PdfNotAvailable, print_payload, send_payload
 from apps.core.viewsets import TenantModelViewSet
 from apps.inventory import services as stock
@@ -32,6 +34,7 @@ from .models import (
     CHALLAN_BILLABLE_STATUSES,
     DeliveryChallan,
     DeliveryChallanLine,
+    EarlyPaymentDiscountRequest,
     PaymentAllocation,
     PaymentIn,
     ProformaInvoice,
@@ -52,6 +55,7 @@ from .serializers import (
     BrokerCommissionSerializer,
     ConvertLinesSerializer,
     DeliveryChallanSerializer,
+    EarlyPaymentDiscountRequestSerializer,
     InvoiceOutstandingSerializer,
     PaymentInSerializer,
     ProformaInvoiceSerializer,
@@ -1340,6 +1344,8 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
         "write": ["create_invoice"],
         "finalize": ["finalize_invoice"],
         "cancel": ["cancel_invoice"],
+        # Finer checks (draft vs finalized) live in early_payment.change_payment_terms.
+        "payment_terms": ["view_sales"],
     }
 
     def filter_queryset(self, queryset):
@@ -1347,7 +1353,7 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
         if self.request.query_params.get("overdue") == "true":
             queryset = queryset.filter(
                 due_date__lt=timezone.localdate(),
-                total__gt=F("amount_paid"),
+                total__gt=F("amount_paid") + F("settlement_discount"),
             ).exclude(status__in=["Cancelled", "Draft", "Paid"])
         return queryset
 
@@ -1356,15 +1362,71 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
             count=Count("id"),
             totalValue=money_sum("total"),
             paid=money_sum("amount_paid"),
+            approvedDiscount=money_sum("settlement_discount"),
             draft=Count("id", filter=Q(status="Draft")),
             overdue=Count(
                 "id",
-                filter=Q(due_date__lt=timezone.localdate(), total__gt=F("amount_paid"))
+                filter=Q(
+                    due_date__lt=timezone.localdate(),
+                    total__gt=F("amount_paid") + F("settlement_discount"),
+                )
                 & ~Q(status__in=["Cancelled", "Draft", "Paid"]),
             ),
         )
-        rows["outstanding"] = round2(rows["totalValue"] - rows["paid"])
+        rows["outstanding"] = round2(rows["totalValue"] - rows["paid"] - rows["approvedDiscount"])
         return rows
+
+    @action(detail=False, methods=["get"], url_path="payment-term-options")
+    def payment_term_options(self, request):
+        """The term choices for the invoice form (none is applied by default)."""
+        from .early_payment import PAYMENT_TERM_OPTIONS
+
+        return Response({"options": PAYMENT_TERM_OPTIONS})
+
+    @action(detail=True, methods=["post"], url_path="payment-terms")
+    def payment_terms(self, request, pk=None):
+        """``POST /sales/invoices/{id}/payment-terms/`` -- terms, due date and the reason."""
+        from datetime import date as date_cls
+
+        from .early_payment import change_payment_terms
+
+        data = request.data or {}
+        due = data.get("dueDate")
+        if due:
+            try:
+                due = date_cls.fromisoformat(str(due)[:10])
+            except ValueError:
+                raise ValidationFailed("Enter the due date as YYYY-MM-DD.", field_errors={"dueDate": ["Invalid date."]})
+        invoice = change_payment_terms(
+            self.get_object(),
+            credit_days=data.get("creditDays"),
+            label=data.get("paymentTerms"),
+            due_date=due or None,
+            reason=data.get("reason"),
+            user=request.user,
+        )
+        return Response(self.get_serializer(invoice).data)
+
+    @action(detail=True, methods=["get"], url_path="terms-history")
+    def terms_history(self, request, pk=None):
+        """Who changed this invoice's terms or due date, when, from what, and why."""
+        from apps.core.models import AuditLog
+
+        invoice = self.get_object()
+        rows = AuditLog.objects.filter(
+            client_id=invoice.client_id, entity_type="SalesInvoice", entity_id=invoice.id,
+            action="payment_terms_change",
+        ).order_by("-created_at", "-id")
+        return Response({"results": [
+            {
+                "actorName": row.actor_name,
+                "at": row.created_at.isoformat(),
+                "before": row.before,
+                "after": row.after,
+                "reason": row.comments or row.description,
+            }
+            for row in rows
+        ]})
 
     def _discount_gate(self, invoice):
         from . import discount_control
@@ -1564,6 +1626,7 @@ class PaymentInViewSet(TenantModelViewSet):
             mode=data["mode"],
             bank_account=data.get("bank_account"),
             reference_number=data.get("reference_number"),
+            transaction_reference=data.get("transaction_reference"),
             notes=data.get("notes"),
             allocations=allocations,
             invoice=invoice,
@@ -2313,3 +2376,285 @@ class PartyDiscountViewSet(TenantModelViewSet):
         return Response({"year": year, "parties": results})
 
 
+# ---------------------------------------------------------------------------
+# Early payment discounts and the receivables dashboard
+# ---------------------------------------------------------------------------
+def _parse_date(value, field):
+    from datetime import date as date_cls
+
+    if not value:
+        return None
+    try:
+        return date_cls.fromisoformat(str(value)[:10])
+    except ValueError:
+        raise ValidationFailed("Enter dates as YYYY-MM-DD.", field_errors={field: ["Invalid date."]})
+
+
+class EarlyPaymentDiscountRequestViewSet(TenantModelViewSet):
+    """``/sales/discount-requests/`` -- early payment discount requests.
+
+    Writes are the workflow actions (``early_payment``); a row is never edited
+    after it leaves Draft, and never deleted.
+    """
+
+    queryset = EarlyPaymentDiscountRequest.objects.select_related(
+        "party", "payment", "invoice", "requested_by", "reviewed_by", "decided_by",
+        "cancelled_by", "credit_note",
+    )
+    serializer_class = EarlyPaymentDiscountRequestSerializer
+    audit_entity_type = "EarlyPaymentDiscountRequest"
+    status_field = "status"
+    default_date_field = "payment_date"
+    allowed_date_fields = ("payment_date", "created_at", "decided_at", "invoice_date")
+    search_fields = ["request_number", "invoice_number", "party__name"]
+    ordering = ["-created_at"]
+    filter_map = {"customerId": "party_id", "invoiceId": "invoice_id", "paymentId": "payment_id"}
+    http_method_names = ["get", "post", "patch", "head", "options"]
+    permission_map = {
+        "read": ["view_sales"],
+        "create": ["request_payment_discount"],
+        "partial_update": ["request_payment_discount"],
+        "submit": ["request_payment_discount"],
+        "review": ["approve_payment_discount"],
+        "propose": ["approve_payment_discount"],
+        "approve": ["approve_payment_discount"],
+        "reject": ["approve_payment_discount"],
+        # The requester may withdraw their own; early_payment.cancel_request checks.
+        "cancel": ["view_sales"],
+    }
+
+    def get_aggregates(self, queryset):
+        rows = queryset.aggregate(
+            count=Count("id"),
+            requested=money_sum("requested_amount"),
+            approved=money_sum("approved_amount", filter=Q(status="Approved")),
+            pending=Count("id", filter=Q(status__in=["Submitted", "Under Review"])),
+            draft=Count("id", filter=Q(status="Draft")),
+        )
+        return rows
+
+    def _respond(self, req, code=status.HTTP_200_OK):
+        req.refresh_from_db()
+        return Response(self.get_serializer(req).data, status=code)
+
+    def create(self, request, *args, **kwargs):
+        from .early_payment import create_request
+
+        data = request.data or {}
+        client_id = self.get_client_id()
+        invoice = SalesInvoice.objects.filter(
+            pk=data.get("invoiceId"), client_id=client_id, deleted_at__isnull=True
+        ).first()
+        if invoice is None:
+            raise ValidationFailed("Choose the invoice.", field_errors={"invoiceId": ["Not found."]})
+        payment = PaymentIn.objects.filter(
+            pk=data.get("paymentId"), client_id=client_id, deleted_at__isnull=True
+        ).first()
+        if payment is None:
+            raise ValidationFailed("Choose the receipt the customer paid with.", field_errors={"paymentId": ["Not found."]})
+        req = create_request(
+            client=request.user.client,
+            invoice=invoice,
+            payment=payment,
+            requested_amount=data.get("requestedAmount"),
+            reason=data.get("reason"),
+            customer_request_date=_parse_date(data.get("customerRequestDate"), "customerRequestDate"),
+            notes=data.get("notes"),
+            attachments=data.get("attachments") or [],
+            submit=bool(data.get("submit")),
+            user=request.user,
+        )
+        return self._respond(req, status.HTTP_201_CREATED)
+
+    def partial_update(self, request, *args, **kwargs):
+        from .early_payment import update_request
+
+        data = request.data or {}
+        changes = {}
+        if "requestedAmount" in data:
+            changes["requested_amount"] = data.get("requestedAmount")
+        if "reason" in data:
+            changes["reason"] = data.get("reason")
+        if "notes" in data:
+            changes["notes"] = data.get("notes")
+        if "customerRequestDate" in data:
+            changes["customer_request_date"] = _parse_date(data.get("customerRequestDate"), "customerRequestDate")
+        if "attachments" in data:
+            changes["attachments"] = data.get("attachments") or []
+        req = self.get_object()
+        if req.requested_by_id and req.requested_by_id != request.user.id and not request.user.is_superuser:
+            from apps.core.exceptions import PermissionDenied
+
+            raise PermissionDenied("Only the person who raised this draft can edit it.")
+        return self._respond(update_request(req, user=request.user, **changes))
+
+    def update(self, request, *args, **kwargs):
+        return self.partial_update(request, *args, **kwargs)
+
+    @action(detail=True, methods=["post"])
+    def submit(self, request, pk=None):
+        from .early_payment import submit_request
+
+        return self._respond(submit_request(self.get_object(), user=request.user))
+
+    @action(detail=True, methods=["post"])
+    def review(self, request, pk=None):
+        from .early_payment import start_review
+
+        data = request.data or {}
+        return self._respond(start_review(
+            self.get_object(), user=request.user,
+            proposed_amount=data.get("proposedAmount"), comments=data.get("comments"),
+        ))
+
+    @action(detail=True, methods=["post"])
+    def propose(self, request, pk=None):
+        from .early_payment import propose_amount
+
+        data = request.data or {}
+        return self._respond(propose_amount(
+            self.get_object(), amount=data.get("proposedAmount"), reason=data.get("reason"), user=request.user,
+        ))
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        from .early_payment import approve_request
+
+        data = request.data or {}
+        return self._respond(approve_request(
+            self.get_object(), user=request.user, amount=data.get("approvedAmount"), reason=data.get("reason"),
+        ))
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        from .early_payment import reject_request
+
+        return self._respond(reject_request(self.get_object(), user=request.user, reason=(request.data or {}).get("reason")))
+
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        from .early_payment import cancel_request
+
+        return self._respond(cancel_request(self.get_object(), user=request.user, reason=(request.data or {}).get("reason")))
+
+    @action(detail=True, methods=["get"])
+    def history(self, request, pk=None):
+        from .early_payment import request_history
+
+        return Response({"results": request_history(self.get_object())})
+
+
+class ReceivablesView(APIView):
+    """``GET /sales/receivables/`` -- the customer payments dashboard.
+
+    KPIs plus one row per finalized invoice: terms, due date, invoice amount,
+    money received, approved discount and what is still outstanding.
+
+    Query: ``customerId``, ``search`` (invoice no. / customer), ``date_from`` /
+    ``date_to`` (invoice date), ``status`` (Unpaid | Partially Paid | Paid |
+    Due | Overdue), ``page``, ``page_size``.
+    """
+
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_sales"]
+
+    def get(self, request):
+        from django.db.models import ExpressionWrapper
+
+        params = request.query_params
+        client_id = request.client_id
+        today = timezone.localdate()
+        money = DecimalField(max_digits=18, decimal_places=2)
+        outstanding = ExpressionWrapper(
+            F("total") - F("amount_paid") - F("settlement_discount"), output_field=money
+        )
+
+        scope = SalesInvoice.objects.filter(
+            client_id=client_id, deleted_at__isnull=True, posted_at__isnull=False,
+        ).exclude(status__in=["Draft", "Cancelled"]).annotate(open_balance=outstanding)
+        if params.get("customerId"):
+            scope = scope.filter(party_id=params["customerId"])
+        date_from = _parse_date(params.get("date_from"), "date_from")
+        date_to = _parse_date(params.get("date_to"), "date_to")
+        if date_from:
+            scope = scope.filter(doc_date__gte=date_from)
+        if date_to:
+            scope = scope.filter(doc_date__lte=date_to)
+        search = (params.get("search") or "").strip()
+        if search:
+            scope = scope.filter(Q(invoice_number__icontains=search) | Q(party_name__icontains=search))
+
+        open_rows = scope.filter(open_balance__gt=0)
+        due_q = Q(due_date__gte=today) | Q(due_date__isnull=True)
+        kpi = open_rows.aggregate(
+            totalOutstanding=money_sum("open_balance"),
+            dueAmount=money_sum("open_balance", filter=due_q),
+            dueCount=Count("id", filter=due_q),
+            overdueAmount=money_sum("open_balance", filter=Q(due_date__lt=today)),
+            overdueCount=Count("id", filter=Q(due_date__lt=today)),
+        )
+        receipts = PaymentIn.objects.filter(client_id=client_id, status="Active", deleted_at__isnull=True)
+        discounts = EarlyPaymentDiscountRequest.objects.filter(client_id=client_id, deleted_at__isnull=True)
+        if params.get("customerId"):
+            receipts = receipts.filter(party_id=params["customerId"])
+            discounts = discounts.filter(party_id=params["customerId"])
+        if date_from:
+            receipts = receipts.filter(payment_date__gte=date_from)
+            discounts = discounts.filter(payment_date__gte=date_from)
+        if date_to:
+            receipts = receipts.filter(payment_date__lte=date_to)
+            discounts = discounts.filter(payment_date__lte=date_to)
+        kpi.update(receipts.aggregate(receivedAmount=money_sum("amount"), receivedCount=Count("id")))
+        kpi.update(discounts.aggregate(
+            pendingDiscountCount=Count("id", filter=Q(status__in=["Submitted", "Under Review"])),
+            pendingDiscountAmount=money_sum("requested_amount", filter=Q(status__in=["Submitted", "Under Review"])),
+            approvedDiscountCount=Count("id", filter=Q(status="Approved")),
+            approvedDiscountAmount=money_sum("approved_amount", filter=Q(status="Approved")),
+        ))
+
+        rows = scope
+        wanted = params.get("status")
+        if wanted == "Overdue":
+            rows = rows.filter(open_balance__gt=0, due_date__lt=today)
+        elif wanted == "Due":
+            rows = rows.filter(due_q, open_balance__gt=0)
+        elif wanted in ("Unpaid", "Partially Paid", "Paid"):
+            rows = rows.filter(status=wanted)
+        rows = rows.order_by("due_date", "-doc_date", "id")
+
+        try:
+            page = max(1, int(params.get("page") or 1))
+            page_size = min(200, max(1, int(params.get("page_size") or 25)))
+        except ValueError:
+            page, page_size = 1, 25
+        count = rows.count()
+        chunk = list(rows.select_related("party")[(page - 1) * page_size: page * page_size])
+        pending = dict(
+            EarlyPaymentDiscountRequest.objects.filter(
+                client_id=client_id, invoice_id__in=[i.id for i in chunk],
+                status__in=["Draft", "Submitted", "Under Review"], deleted_at__isnull=True,
+            ).values("invoice_id").annotate(n=Count("id")).values_list("invoice_id", "n")
+        )
+        results = []
+        for inv in chunk:
+            balance = services.invoice_balance(inv)
+            due = inv.due_date
+            results.append({
+                "id": str(inv.id),
+                "invoiceNumber": inv.invoice_number,
+                "customerId": str(inv.party_id) if inv.party_id else None,
+                "customerName": inv.party_name or getattr(inv.party, "name", ""),
+                "invoiceDate": inv.doc_date,
+                "dueDate": due,
+                "paymentTerms": inv.payment_terms,
+                "creditDays": inv.credit_days,
+                "invoiceAmount": round2(inv.total),
+                "paidAmount": round2(inv.amount_paid),
+                "approvedDiscount": round2(inv.settlement_discount),
+                "outstandingAmount": balance,
+                "customerCredit": round2(max(D(inv.amount_paid) + D(inv.settlement_discount) - D(inv.total), ZERO)),
+                "paymentStatus": services.display_status(inv),
+                "daysOverdue": (today - due).days if due and due < today and balance > ZERO else 0,
+                "openDiscountRequests": pending.get(inv.id, 0),
+            })
+        return Response(envelope(results, count=count, page=page, page_size=page_size, aggregates=kpi))

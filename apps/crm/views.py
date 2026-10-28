@@ -926,6 +926,14 @@ class StageTaskViewSet(TenantModelViewSet):
     permission_map = {"read": ["view_task"], "write": ["manage_pipeline"]}
 
 
+def _task_body(task, lead_name):
+    """The line under a "New task" notification: who it is for and when."""
+    parts = [f"Lead: {lead_name}" if lead_name else "Lead task"]
+    if task.due_date:
+        parts.append(f"due {task.due_date.strftime('%d %b')}" + (f" {task.due_time}" if task.due_time else ""))
+    return " · ".join(parts)
+
+
 class TaskViewSet(TenantModelViewSet):
     queryset = Task.objects.select_related("lead", "deal", "assignee")
     serializer_class = TaskSerializer
@@ -986,7 +994,7 @@ class TaskViewSet(TenantModelViewSet):
                 type="crm.task_assigned",
                 category="crm",
                 title=f"New task: {task.title}",
-                body=f"{lead_name} task assigned to you." if lead_name else "A lead task was assigned to you.",
+                body=_task_body(task, lead_name),
                 entity_type="CrmTask",
                 entity_id=task.id,
                 actor=self.request.user,
@@ -1004,7 +1012,7 @@ class TaskViewSet(TenantModelViewSet):
                 type="crm.task_assigned",
                 category="crm",
                 title=f"New task: {task.title}",
-                body=f"{lead_name} task assigned to you." if lead_name else "A lead task was assigned to you.",
+                body=_task_body(task, lead_name),
                 entity_type="CrmTask",
                 entity_id=task.id,
                 actor=self.request.user,

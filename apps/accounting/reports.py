@@ -288,8 +288,10 @@ def ageing(client_id, kind="receivable", as_of=None):
     buckets = empty_ageing_buckets()
     rows = []
     for document in documents:
+        # Sales invoices are also settled by approved early-payment discounts.
         outstanding = round2(
             D(document.total) - D(document.amount_paid) - D(document.returned_total)
+            - D(getattr(document, "settlement_discount", 0) or 0)
         )
         if outstanding <= ZERO:
             continue
@@ -522,7 +524,9 @@ def salesperson_broker_overdue_view(client_id, as_of=None):
     by_broker = {}
 
     for inv in invoices:
-        outstanding = round2(D(inv.total) - D(inv.amount_paid) - D(inv.returned_total))
+        outstanding = round2(
+            D(inv.total) - D(inv.amount_paid) - D(inv.returned_total) - D(inv.settlement_discount)
+        )
         if outstanding <= ZERO:
             continue
         credit_days = getattr(inv, "credit_days", None)

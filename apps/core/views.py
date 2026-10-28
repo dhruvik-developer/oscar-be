@@ -199,9 +199,24 @@ class NotificationViewSet(ReadOnlyTenantViewSet):
     filter_map = {"category": "category", "type": "type"}
     ordering = ["-created_at"]
 
+    search_fields = ["title", "body"]
+
     def get_queryset(self):
-        queryset = super().get_queryset().filter(recipient=self.request.user)
-        if self.request.query_params.get("unread") == "true":
+        """The recipient's own notifications. ``?view=`` picks the box:
+        ``inbox`` (default: not dismissed, not snoozed), ``snoozed``,
+        ``archived`` (dismissed) or ``all``."""
+        queryset = super().get_queryset().filter(recipient=self.request.user).select_related("actor")
+        params = self.request.query_params
+        view = params.get("view") or "inbox"
+        now = timezone.now()
+        awake = Q(snoozed_until__isnull=True) | Q(snoozed_until__lte=now)
+        if view == "inbox":
+            queryset = queryset.filter(dismissed_at__isnull=True).filter(awake)
+        elif view == "snoozed":
+            queryset = queryset.filter(dismissed_at__isnull=True, snoozed_until__gt=now)
+        elif view == "archived":
+            queryset = queryset.filter(dismissed_at__isnull=False)
+        if params.get("unread") == "true":
             queryset = queryset.filter(read_at__isnull=True)
         return queryset
 
@@ -211,14 +226,103 @@ class NotificationViewSet(ReadOnlyTenantViewSet):
             "total": queryset.count(),
         }
 
+    def _mine(self):
+        return Notification.objects.filter(client_id=self.request.client_id, recipient=self.request.user)
+
+    @action(detail=True, methods=["post"])
+    def dismiss(self, request, pk=None):
+        """Clear it from the bell (kept under Archived)."""
+        notification = self._mine().filter(pk=pk).first()
+        if notification is None:
+            raise NotFound()
+        notification.dismissed_at = timezone.now()
+        notification.read_at = notification.read_at or notification.dismissed_at
+        notification.save(update_fields=["dismissed_at", "read_at"])
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=True, methods=["post"])
+    def restore(self, request, pk=None):
+        notification = self._mine().filter(pk=pk).first()
+        if notification is None:
+            raise NotFound()
+        notification.dismissed_at = None
+        notification.snoozed_until = None
+        notification.save(update_fields=["dismissed_at", "snoozed_until"])
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=True, methods=["post"])
+    def snooze(self, request, pk=None):
+        """``{until}`` (ISO datetime) or ``{minutes}``: hide it until then; it
+        comes back unread."""
+        from datetime import timedelta
+
+        from django.utils.dateparse import parse_datetime
+
+        notification = self._mine().filter(pk=pk).first()
+        if notification is None:
+            raise NotFound()
+        until = parse_datetime(str(request.data.get("until") or "")) if request.data.get("until") else None
+        if until is None:
+            try:
+                minutes = int(request.data.get("minutes") or 0)
+            except (TypeError, ValueError):
+                minutes = 0
+            if minutes <= 0:
+                raise ValidationFailed("Pick when to be reminded.", field_errors={"until": ["Required."]})
+            until = timezone.now() + timedelta(minutes=min(minutes, 60 * 24 * 30))
+        if timezone.is_naive(until):
+            until = timezone.make_aware(until)
+        if until <= timezone.now():
+            raise ValidationFailed("The reminder time must be in the future.", field_errors={"until": ["Future time."]})
+        notification.snoozed_until = until
+        notification.read_at = None
+        notification.save(update_fields=["snoozed_until", "read_at"])
+        return Response({"snoozedUntil": until.isoformat()})
+
+    @action(detail=False, methods=["post"], url_path="clear-read")
+    def clear_read(self, request):
+        """Dismiss every read notification still in the inbox."""
+        now = timezone.now()
+        updated = self._mine().filter(read_at__isnull=False, dismissed_at__isnull=True).update(dismissed_at=now)
+        return Response({"updated": updated})
+
+    @action(detail=False, methods=["post"])
+    def bulk(self, request):
+        """``{ids: [...], action: read|unread|dismiss|restore}`` for the history page."""
+        ids = [i for i in (request.data.get("ids") or []) if i][:500]
+        verb = request.data.get("action")
+        if not ids or verb not in ("read", "unread", "dismiss", "restore"):
+            raise ValidationFailed("Pick notifications and an action.", field_errors={"action": ["Invalid."]})
+        rows = self._mine().filter(pk__in=ids)
+        now = timezone.now()
+        if verb == "read":
+            updated = rows.filter(read_at__isnull=True).update(read_at=now)
+        elif verb == "unread":
+            updated = rows.update(read_at=None)
+        elif verb == "dismiss":
+            updated = rows.filter(dismissed_at__isnull=True).update(dismissed_at=now)
+            rows.filter(read_at__isnull=True).update(read_at=now)
+        else:
+            updated = rows.update(dismissed_at=None, snoozed_until=None)
+        return Response({"updated": updated})
+
     @action(detail=True, methods=["post"])
     def read(self, request, pk=None):
         mark_read(self.get_object())
         return Response(status=status.HTTP_204_NO_CONTENT)
 
+    @action(detail=True, methods=["post"])
+    def unread(self, request, pk=None):
+        """Put a notification back in the unread list (the bell's "Mark as unread")."""
+        notification = self.get_object()
+        notification.read_at = None
+        notification.save(update_fields=["read_at"])
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
     @action(detail=False, methods=["post"], url_path="read-all")
     def read_all(self, request):
         queryset = self.get_queryset().filter(read_at__isnull=True)
+        # ``get_queryset`` is the inbox; a snoozed notification stays snoozed.
         category = request.data.get("category")
         if category:
             queryset = queryset.filter(category=category)
@@ -232,8 +336,10 @@ class NotificationViewSet(ReadOnlyTenantViewSet):
         table scan (db.md §2.6)."""
         rows = (
             Notification.objects.filter(
-                client_id=request.client_id, recipient=request.user, read_at__isnull=True
+                client_id=request.client_id, recipient=request.user, read_at__isnull=True,
+                dismissed_at__isnull=True,
             )
+            .filter(Q(snoozed_until__isnull=True) | Q(snoozed_until__lte=timezone.now()))
             .values("category")
             .annotate(count=Count("id"))
         )

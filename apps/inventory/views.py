@@ -2347,6 +2347,35 @@ class InventoryDashboardView(APIView):
         })
 
 
+def _qc_stage(request):
+    """``?stage=grey|dyeing`` (or the older ``source_type`` Purchase / Job Work).
+
+    Grey Fabric QC: purchase / manual GRNs (grey inward). Dyeing QC: job work
+    inwards -- fabric back from a dyeing vendor, whoever owns it (OSCAR grey,
+    purchased grey or a customer's fabric).
+    """
+    stage = (request.query_params.get("stage") or "").strip().lower()
+    if stage in ("grey", "dyeing"):
+        return stage
+    legacy = (request.query_params.get("source_type") or "").strip().lower()
+    if legacy.startswith("purchase"):
+        return "grey"
+    if legacy.startswith("job"):
+        return "dyeing"
+    return None
+
+
+def _reprocess_stage_q(client_id, stage):
+    """A reprocess raised by GRN QC carries the GRN number as ``inward_no``."""
+    grn_numbers = GoodsReceipt.objects.filter(client_id=client_id).exclude(
+        grn_number__isnull=True).values("grn_number")
+    if stage == "grey":
+        return Q(inward_no__in=grn_numbers)
+    if stage == "dyeing":
+        return ~Q(inward_no__in=grn_numbers)
+    return Q()
+
+
 class QCDashboardView(APIView):
     """
     GET /inventory/qc/dashboard/
@@ -2420,6 +2449,11 @@ class QCDashboardView(APIView):
             inwards_qs = inwards_qs.filter(
                 Q(job_work_order__vendor_name=supplier_filter) | Q(job_work_order__vendor__name=supplier_filter)
             )
+        stage = _qc_stage(request)
+        if stage == "dyeing":
+            receipts_qs = receipts_qs.none()
+        elif stage == "grey":
+            inwards_qs = inwards_qs.none()
 
         # Lines in date range
         lines_qs = GoodsReceiptLine.objects.filter(
@@ -2455,7 +2489,7 @@ class QCDashboardView(APIView):
         reprocess_in_range = JWOReprocess.objects.filter(
             client_id=client_id,
             date__range=[start_date, end_date],
-        ).aggregate(
+        ).filter(_reprocess_stage_q(client_id, stage)).aggregate(
             q=Coalesce(Sum("qty"), Value(Decimal("0.0000")), output_field=QTY)
         )["q"]
         rework_qty = lines_qs.filter(goods_receipt__qc_status="Rework").aggregate(
@@ -2551,6 +2585,8 @@ class QCDashboardView(APIView):
                 goods_receipt__client_id=client_id,
                 goods_receipt__receipt_date__range=[m_date, next_m - timedelta(days=1)],
             )
+            if stage == "dyeing":
+                m_lines = m_lines.none()
             m_good = m_lines.filter(goods_receipt__qc_status__in=["Approved", "Partially Approved"]).aggregate(
                 q=Coalesce(Sum(Coalesce("weighed_qty", "received_qty") - F("rejected_qty")), Value(Decimal("0.0000")), output_field=QTY)
             )["q"]
@@ -2562,7 +2598,7 @@ class QCDashboardView(APIView):
             )["q"]
             m_rep = JWOReprocess.objects.filter(
                 client_id=client_id, date__range=[m_date, next_m - timedelta(days=1)]
-            ).aggregate(q=Coalesce(Sum("qty"), Value(Decimal("0.0000")), output_field=QTY))["q"]
+            ).filter(_reprocess_stage_q(client_id, stage)).aggregate(q=Coalesce(Sum("qty"), Value(Decimal("0.0000")), output_field=QTY))["q"]
             trend_months.append({
                 "month": m_label,
                 "good": float(m_good),
@@ -2805,6 +2841,11 @@ class QCPendingInspectionsView(APIView):
         date_from_str = request.query_params.get("date_from") or request.query_params.get("start_date")
         date_to_str = request.query_params.get("date_to") or request.query_params.get("end_date")
         source_type = request.query_params.get("source_type") or "All"
+        stage = _qc_stage(request)
+        if stage == "grey":
+            source_type = "Purchase"
+        elif stage == "dyeing":
+            source_type = "Job Work"
         supplier = request.query_params.get("supplier") or "All"
         quality = request.query_params.get("quality") or "All"
         design = request.query_params.get("design") or "All"
@@ -3187,6 +3228,9 @@ class QCRegisterView(APIView):
             .prefetch_related("lines__item")
             .order_by("-receipt_date", "-created_at")
         )
+        stage = _qc_stage(request)
+        if stage == "dyeing":
+            qs = qs.none()
 
         if from_date:
             qs = qs.filter(receipt_date__gte=from_date)
@@ -3285,7 +3329,7 @@ class QCRegisterView(APIView):
                 "receiptId": str(r.id),
                 "date": r.receipt_date.strftime("%d-%m-%Y") if r.receipt_date else "",
                 "rawDate": r.receipt_date.isoformat() if r.receipt_date else "",
-                "sourceType": "Purchase" if (r.purchase_bill_id or r.purchase_order_id) else "Job Work",
+                "sourceType": "Purchase" if (r.purchase_bill_id or r.purchase_order_id) else "Manual",
                 "refNo": r.grn_number,
                 "grnNo": r.grn_number,
                 "supplier": r.party.name if r.party else None,
@@ -3316,6 +3360,8 @@ class QCRegisterView(APIView):
             .select_related("job_work_order", "job_work_order__vendor", "job_work_order__process_plan")
             .order_by("-date", "-created_at")
         )
+        if stage == "grey":
+            inwards_qs = inwards_qs.none()
         if from_date:
             inwards_qs = inwards_qs.filter(date__gte=from_date)
         if to_date:
@@ -3638,8 +3684,15 @@ class QCDispositionView(APIView):
             .prefetch_related("lines__item")
             .order_by("-receipt_date", "-created_at")
         )
-        receipts = list(receipts_qs[:40])
-        if receipt_id and not any(str(r.id) == str(receipt_id) for r in receipts):
+        stage = _qc_stage(request)
+        if receipt_id:
+            # A link to one record opens the stage that record belongs to.
+            if GoodsReceipt.objects.filter(client_id=client_id, id=receipt_id).exists():
+                stage = "grey"
+            elif JWOInward.objects.filter(client_id=client_id, id=receipt_id).exists():
+                stage = "dyeing"
+        receipts = [] if stage == "dyeing" else list(receipts_qs[:40])
+        if receipt_id and stage != "dyeing" and not any(str(r.id) == str(receipt_id) for r in receipts):
             receipts += list(receipts_qs.filter(id=receipt_id))
 
         receipts_list = []
@@ -3657,7 +3710,7 @@ class QCDispositionView(APIView):
             .select_related("job_work_order", "job_work_order__vendor", "job_work_order__process_plan")
             .order_by("-date", "-created_at")
         )
-        for inw in inwards_qs[:20]:
+        for inw in ([] if stage == "grey" else inwards_qs[:40]):
             jwo = inw.job_work_order
             plan = jwo.process_plan if jwo else None
             rec_q = float(inw.qty or 0)
@@ -3926,6 +3979,12 @@ class QCReportsView(APIView):
             .select_related("job_work_order", "job_work_order__vendor", "job_work_order__process_plan")
             .order_by("-date", "-created_at")
         )
+        stage = _qc_stage(request)
+        reprocess_qs = reprocess_qs.filter(_reprocess_stage_q(client_id, stage))
+        if stage == "dyeing":
+            receipts_qs = receipts_qs.none()
+        elif stage == "grey":
+            inwards_qs = inwards_qs.none()
 
         # 2. Aggregations for Reports
 
@@ -4356,7 +4415,7 @@ class QCReinspectionView(APIView):
                 "created_by", "updated_by",
             )
             .order_by("-date", "-created_at")
-        )
+        ).filter(_reprocess_stage_q(client_id, _qc_stage(request)))
         if from_date:
             reprocess_qs = reprocess_qs.filter(date__gte=from_date)
         if to_date:
@@ -6531,6 +6590,17 @@ class QCInspectionViewSet(TenantModelViewSet):
     default_date_field = "inspection_date"
     search_fields = ["inspection_number", "source_document_number"]
     ordering = ["-inspection_date", "-created_at"]
+
+    def filter_queryset(self, queryset):
+        """``?stage=grey`` = grey inward inspections, ``?stage=dyeing`` = job
+        work inward (finished / dyed) inspections."""
+        queryset = super().filter_queryset(queryset)
+        stage = _qc_stage(self.request)
+        if stage == "dyeing":
+            queryset = queryset.filter(source_document_type="JWO_INWARD")
+        elif stage == "grey":
+            queryset = queryset.filter(source_document_type__in=["GRN", "PO", "INTERNAL"])
+        return queryset
 
     @transaction.atomic
     def perform_create(self, serializer):

@@ -443,9 +443,9 @@ def _attention(client_id, day, production, qc):
 
     overdue = 0
     for invoice in _posted_invoices(client_id).only(
-        "doc_date", "due_date", "credit_days", "total", "amount_paid"
+        "doc_date", "due_date", "credit_days", "total", "amount_paid", "settlement_discount"
     ):
-        if D(invoice.total) - D(invoice.amount_paid) <= ZERO:
+        if D(invoice.total) - D(invoice.amount_paid) - D(invoice.settlement_discount) <= ZERO:
             continue
         due = effective_due_date(invoice.doc_date, invoice.due_date, invoice.credit_days)
         if due and due < day:
