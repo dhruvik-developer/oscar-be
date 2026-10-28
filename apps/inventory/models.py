@@ -196,11 +196,20 @@ class StockMovement(TenantModel, LegacyIdMixin):
 
 
 class StockTransfer(TenantModel, LegacyIdMixin):
-    """Posts a ``TRANSFER_OUT``/``TRANSFER_IN`` pair sharing a reference."""
+    """Inter-warehouse transfer.
+
+    Draft -> Requested (stock reserved at the source) -> Approved -> In Transit
+    (dispatch moves it into the in-transit store) -> Partially Received /
+    Received (receipt moves it into the destination) -> Completed. Every move is
+    a ``TRANSFER_OUT``/``TRANSFER_IN`` pair, so the company total never changes.
+    """
 
     STATUSES = [
+        ("Draft", "Draft"),
         ("Requested", "Requested"),
+        ("Approved", "Approved"),
         ("In Transit", "In Transit"),
+        ("Partially Received", "Partially Received"),
         ("Received", "Received"),
         ("Completed", "Completed"),
         ("Cancelled", "Cancelled"),
@@ -223,6 +232,18 @@ class StockTransfer(TenantModel, LegacyIdMixin):
     )
     shipped_by = models.TextField(null=True, blank=True)
     notes = models.TextField(null=True, blank=True)
+    approved_at = models.DateTimeField(null=True, blank=True)
+    dispatched_at = models.DateTimeField(null=True, blank=True)
+    received_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    received_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    #: The document the transfer was raised for, e.g. a sales order short at
+    #: its dispatch warehouse.
+    reference_type = models.TextField(null=True, blank=True)
+    reference_id = models.UUIDField(null=True, blank=True)
+    reference_number = models.TextField(null=True, blank=True)
 
     class Meta:
         db_table = "stock_transfers"
@@ -250,14 +271,46 @@ class StockTransferLine(TenantModel):
     item = models.ForeignKey("masters.Item", on_delete=models.PROTECT, related_name="+")
     qty = models.DecimalField(max_digits=18, decimal_places=4)
     received_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
-    #: The takas selected for this line: ``[{"lotTakaId": uuid, "qty": "12.5"}]``.
-    #: A taka may be moved partly; dispatch splits it.
+    #: The takas selected for this line: ``[{"lotTakaId": uuid, "qty": "12.5",
+    #: "dispatched": "0", "priorStatus": "Available"}]``. A taka may be moved
+    #: partly; dispatch splits it.
     takas = models.JSONField(default=list, blank=True)
+    dispatched_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    #: What sits in the in-transit store for this line:
+    #: ``[{"lotTakaId": holder uuid, "sourceTakaId": uuid, "qty": "15", "received": "0"}]``.
+    #: Loose (non-taka) quantity is tracked by ``dispatched_qty - received_qty``.
+    in_transit = models.JSONField(default=list, blank=True)
+    #: Dispatched but never received, settled at completion.
+    discrepancy_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    discrepancy_reason = models.TextField(null=True, blank=True)
+    #: How the discrepancy was settled: RETURNED (back to the source) or WRITTEN_OFF.
+    discrepancy_action = models.TextField(null=True, blank=True)
 
     class Meta:
         db_table = "stock_transfer_lines"
         constraints = [
             models.CheckConstraint(condition=models.Q(qty__gt=0), name="ck_stl_qty")
+        ]
+
+
+class WarehouseStockLevel(TenantModel):
+    """Minimum stock of one item at one warehouse, for the low-stock alert."""
+
+    location = models.ForeignKey(
+        "masters.Location", on_delete=models.CASCADE, related_name="stock_levels"
+    )
+    item = models.ForeignKey("masters.Item", on_delete=models.CASCADE, related_name="+")
+    min_qty = models.DecimalField(max_digits=18, decimal_places=4)
+
+    class Meta:
+        db_table = "warehouse_stock_levels"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "location", "item"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_warehouse_stock_level",
+            ),
+            models.CheckConstraint(condition=models.Q(min_qty__gte=0), name="ck_wsl_min_qty"),
         ]
 
 

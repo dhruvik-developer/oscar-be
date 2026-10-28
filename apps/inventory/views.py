@@ -16,7 +16,7 @@ from apps.core.exceptions import BusinessRuleViolation, Codes, Conflict, Validat
 from apps.core.money import ZERO, D, round2, round4
 from apps.core.numbering import allocate_number
 from apps.core.pagination import envelope
-from apps.core.permissions import HasModulePermission
+from apps.core.permissions import HasModulePermission, require_permission
 from datetime import date, timedelta
 
 from apps.core.viewsets import ReadOnlyTenantViewSet, TenantModelViewSet
@@ -527,8 +527,15 @@ class StockAdjustmentView(APIView):
 # Transfers (api.md §7)
 # ---------------------------------------------------------------------------
 class StockTransferViewSet(TenantModelViewSet):
+    """Inter-warehouse transfers; the workflow lives in ``warehouse_services``.
+
+    Draft -> Requested (reserve) -> Approved -> In Transit (dispatch, partial
+    allowed) -> Partially Received / Received -> Completed. Cancel is allowed
+    until anything is received.
+    """
+
     queryset = StockTransfer.objects.select_related(
-        "from_location", "to_location"
+        "from_location", "to_location", "requested_by", "approved_by", "received_by"
     ).prefetch_related("items__item")
     serializer_class = StockTransferSerializer
     audit_entity_type = "StockTransfer"
@@ -537,7 +544,8 @@ class StockTransferViewSet(TenantModelViewSet):
     permission_map = {"write": ["create_transfer"]}
     status_field = "status"
     default_date_field = "transfer_date"
-    search_fields = ["transfer_number", "notes"]
+    search_fields = ["transfer_number", "notes", "reference_number"]
+    filter_map = {"sourceLocationId": "from_location_id", "destLocationId": "to_location_id"}
     ordering = ["-transfer_date", "-created_at"]
 
     def _validate_takas(self, line, from_location_id):
@@ -582,154 +590,131 @@ class StockTransferViewSet(TenantModelViewSet):
             )
         return rows
 
-    @transaction.atomic
-    def perform_create(self, serializer):
-        lines = serializer.validated_data.pop("items", [])
+    def create(self, request, *args, **kwargs):
+        from . import warehouse_services
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        lines = data.get("items") or []
         if not lines:
             raise ValidationFailed(
                 "A transfer needs at least one item.",
                 field_errors={"items": ["Add at least one line."]},
             )
-        from_location = serializer.validated_data["from_location"]
         for line in lines:
-            line["takas"] = self._validate_takas(line, from_location.id)
-        serializer.validated_data["transfer_number"] = allocate_number(
-            self.request.user.client, "TR", serializer.validated_data.get("transfer_date")
-        )
-        # Stock moves only through the dispatch action.
-        serializer.validated_data["status"] = "Requested"
-        serializer.validated_data.setdefault("requested_by", self.request.user)
-        transfer = super().perform_create(serializer)
+            line["takas"] = self._validate_takas(line, data["from_location"].id)
+        draft = str(request.data.get("asDraft", "")).lower() in ("1", "true", "yes")
+        with transaction.atomic():
+            transfer = warehouse_services.create_transfer(
+                client=request.user.client, user=request.user,
+                from_location=data["from_location"], to_location=data["to_location"],
+                transfer_date=data.get("transfer_date") or timezone.localdate(),
+                lines=lines, notes=data.get("notes"), shipped_by=data.get("shipped_by"),
+                draft=draft,
+            )
+            self.write_audit("create", transfer, description="Transfer drafted" if draft else "Transfer requested")
+        return Response(self.get_serializer(transfer).data, status=status.HTTP_201_CREATED)
 
-        StockTransferLine.objects.bulk_create(
-            [
-                StockTransferLine(client_id=self.get_client_id(), stock_transfer=transfer, **line)
-                for line in lines
-            ]
+    def update(self, request, *args, **kwargs):
+        transfer = self.get_object()
+        if transfer.status != "Draft":
+            raise Conflict(
+                f"A {transfer.status} transfer cannot be edited; cancel it and raise a new one.",
+                code=Codes.BAD_TARGET,
+            )
+        changes = {}
+        if "notes" in request.data:
+            changes["notes"] = request.data.get("notes") or None
+        if "shipped_by" in request.data:
+            changes["shipped_by"] = request.data.get("shipped_by") or None
+        for key, value in changes.items():
+            setattr(transfer, key, value)
+        if changes:
+            transfer.save(update_fields=[*changes, "updated_at"])
+        return Response(self.get_serializer(transfer).data)
+
+    def perform_destroy(self, instance):
+        if instance.status != "Draft":
+            raise Conflict("Only a draft transfer can be deleted; cancel it instead.", code=Codes.BAD_TARGET)
+        super().perform_destroy(instance)
+
+    def _run(self, request, fn, audit, description, permission=None, **kwargs):
+        if permission:
+            require_permission(request.user, permission)
+        transfer = self.get_object()
+        with transaction.atomic():
+            transfer = fn(transfer, request.user, **kwargs)
+            self.write_audit(audit, transfer, description=description)
+        transfer = self.get_queryset().get(pk=transfer.pk)
+        return Response(self.get_serializer(transfer).data)
+
+    @action(detail=True, methods=["post"], url_path="request")
+    def submit(self, request, pk=None):
+        """Draft -> Requested: reserves the stock at the source."""
+        from . import warehouse_services
+
+        return self._run(
+            request, lambda t, _u: warehouse_services.reserve(t), "request", "Transfer requested"
         )
-        return transfer
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        from . import warehouse_services
+
+        return self._run(
+            request, warehouse_services.approve, "approve", "Transfer approved",
+            permission="approve_transfer",
+        )
 
     # ``dispatch`` is APIView's own entry point: a method of that name here
     # shadows it and breaks every request to this viewset. Keep the URL,
     # rename the method.
     @action(detail=True, methods=["post"], url_path="dispatch", url_name="dispatch")
     def dispatch_action(self, request, pk=None):
-        """Posts ``TRANSFER_OUT`` / ``TRANSFER_IN`` per selected taka (api.md §7.2).
+        """Source -> in-transit store. ``lines: [{lineId, qty}]`` for a
+        partial dispatch; nothing dispatches all that is waiting."""
+        from . import warehouse_services
 
-        A taka moved in part is split: the moved part becomes a child taka at
-        the destination. Lines without takas move item quantity; items with
-        takas at the source but none selected take them oldest-first.
-        """
-        transfer = self.get_object()
-        if transfer.status != "Requested":
-            raise Conflict(
-                f"This transfer is already {transfer.status}.", code=Codes.BAD_TARGET
-            )
-
-        with transaction.atomic():
-            common = dict(
-                client_id=request.client_id,
-                reference_type="StockTransfer",
-                reference_id=transfer.id,
-                reference_number=transfer.transfer_number,
-                source_document_type="StockTransfer",
-                source_document_id=transfer.id,
-                movement_date=transfer.transfer_date,
-                user=request.user,
-            )
-            for line in transfer.items.filter(deleted_at__isnull=True).select_related("item"):
-                stock.assert_sufficient_stock(
-                    request.client_id, line.item, line.qty,
-                    transfer.from_location_id, line.item.name,
-                )
-                selections = [(r["lotTakaId"], D(r["qty"])) for r in (line.takas or [])]
-                if not selections:
-                    # FIFO over the takas at the source, if the item has any.
-                    remaining = D(line.qty)
-                    for lot in LotTaka.objects.filter(
-                        client_id=request.client_id, item_id=line.item_id,
-                        location_id=transfer.from_location_id, available_quantity__gt=0,
-                        deleted_at__isnull=True,
-                    ).order_by("received_date", "created_at"):
-                        if remaining <= ZERO:
-                            break
-                        take = min(D(lot.available_quantity), remaining)
-                        selections.append((lot.id, take))
-                        remaining -= take
-                    on_takas = sum((q for _, q in selections), ZERO)
-                    loose = round4(D(line.qty) - on_takas)
-                else:
-                    loose = ZERO
-                for lot_id, qty in selections:
-                    stock.relocate_lot(
-                        lot=lot_id, quantity=qty, to_location_id=transfer.to_location_id,
-                        out_type="TRANSFER_OUT", in_type="TRANSFER_IN", split_suffix="TR",
-                        **common,
-                    )
-                if loose > ZERO:
-                    stock.relocate_item_qty(
-                        item=line.item, quantity=loose,
-                        from_location_id=transfer.from_location_id,
-                        to_location_id=transfer.to_location_id,
-                        out_type="TRANSFER_OUT", in_type="TRANSFER_IN",
-                        unit_cost=line.item.cost_price, **common,
-                    )
-
-            transfer.status = "In Transit"
-            transfer.save(update_fields=["status", "updated_at"])
-            self.write_audit("dispatch", transfer, description="Transfer dispatched")
-
-        return Response(self.get_serializer(transfer).data)
+        return self._run(
+            request, warehouse_services.dispatch, "dispatch", "Transfer dispatched",
+            lines=request.data.get("lines") or None,
+            shipped_by=request.data.get("shippedBy") or request.data.get("shipped_by"),
+        )
 
     @action(detail=True, methods=["post"])
     def receive(self, request, pk=None):
-        transfer = self.get_object()
-        if transfer.status != "In Transit":
-            raise Conflict(
-                "Only a transfer in transit can be received.", code=Codes.BAD_TARGET
-            )
-        with transaction.atomic():
-            transfer.items.filter(deleted_at__isnull=True).update(received_qty=F("qty"))
-            transfer.status = "Received"
-            transfer.save(update_fields=["status", "updated_at"])
-            self.write_audit("receive", transfer, description="Transfer received")
-        return Response(self.get_serializer(transfer).data)
+        """In-transit store -> destination; ``lines`` for a partial receipt."""
+        from . import warehouse_services
+
+        return self._run(
+            request, warehouse_services.receive, "receive", "Transfer received",
+            lines=request.data.get("lines") or None,
+        )
+
+    @action(detail=True, methods=["post"])
+    def complete(self, request, pk=None):
+        """Close it; settle anything still in transit (return or write off)."""
+        from . import warehouse_services
+
+        return self._run(
+            request, warehouse_services.complete, "complete", "Transfer completed",
+            settlements=request.data.get("settlements") or None,
+        )
 
     @action(detail=True, methods=["post"])
     def cancel(self, request, pk=None):
-        """Reverses exactly this transfer's movements (taka by taka, newest
-        first) and folds the split-off child takas back into their parents."""
-        transfer = self.get_object()
-        if transfer.status == "Cancelled":
-            raise Conflict("This transfer is already cancelled.", code=Codes.ALREADY_CANCELLED)
+        """Reverses exactly this transfer's movements and releases every
+        reservation; refused once anything has been received."""
+        from . import warehouse_services
 
-        with transaction.atomic():
-            if transfer.status in ("In Transit", "Received", "Completed"):
-                stock.reverse_movements(
-                    reference_type="StockTransfer",
-                    reference_id=transfer.id,
-                    client_id=request.client_id,
-                    user=request.user,
-                    notes="Transfer cancelled",
-                )
-                # Split children created by this transfer are now empty: the
-                # quantity is back on the parent taka.
-                LotTaka.objects.filter(
-                    client_id=request.client_id,
-                    source_document_type="StockTransfer",
-                    source_document_id=transfer.id,
-                    available_quantity=0,
-                    deleted_at__isnull=True,
-                ).update(deleted_at=timezone.now(), status="Closed", updated_at=timezone.now())
-            transfer.status = "Cancelled"
-            transfer.save(update_fields=["status", "updated_at"])
-            self.write_audit("cancel", transfer, description=request.data.get("reason"))
-        return Response(self.get_serializer(transfer).data)
+        reason = request.data.get("reason")
+        return self._run(
+            request, lambda t, u: warehouse_services.cancel(t, u, reason=reason),
+            "cancel", reason or "Transfer cancelled",
+        )
 
 
-# ---------------------------------------------------------------------------
-# Faulty parts, service usage, zone requests
-# ---------------------------------------------------------------------------
 class FaultyPartViewSet(TenantModelViewSet):
     queryset = FaultyPart.objects.select_related("item", "vendor", "serial")
     serializer_class = FaultyPartSerializer

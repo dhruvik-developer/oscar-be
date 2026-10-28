@@ -334,6 +334,8 @@ class Location(TenantModel, LegacyIdMixin):
     capacity = models.DecimalField(max_digits=18, decimal_places=4, default=0, null=True, blank=True)
     capacity_uom = models.TextField(default="Meter (m)", null=True, blank=True)
     manager = models.TextField(null=True, blank=True)
+    #: Warehouse contact (phone / email). City, state and PIN live in ``address``.
+    contact = models.TextField(null=True, blank=True)
     is_active = models.BooleanField(default=True)
 
     class Meta:
