@@ -348,6 +348,8 @@ SYSTEM_LOCATIONS = {
     "REPROCESS": ("SYS-REPROCESS", "Reprocess Stock", "Zone"),
     "SECOND_QUALITY": ("SYS-SECOND-QUALITY", "Second Quality Stock", "Zone"),
     "REJECT": ("SYS-REJECT", "Reject / Scrap", "Scrap"),
+    # Stock dispatched on an inter-warehouse transfer and not yet received.
+    "IN_TRANSIT": ("SYS-IN-TRANSIT", "Goods In Transit", "Transit"),
 }
 
 #: Stock at these locations is physically on hand but not available to sell

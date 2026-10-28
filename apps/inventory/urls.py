@@ -28,7 +28,7 @@ from apps.masters.views import (
     UnitViewSet,
 )
 
-from . import views
+from . import views, warehouse_views
 
 router = DefaultRouter(trailing_slash=True)
 router.register("items", ItemViewSet, basename="inventory-items")
@@ -64,6 +64,14 @@ urlpatterns = [
     path("dashboard/", views.InventoryDashboardView.as_view(), name="inventory-dashboard"),
     path("traceability/", views.LotTraceabilityView.as_view(), name="inventory-traceability"),
     path("batches/", views.BatchListView.as_view(), name="inventory-batches"),
+    path("warehouses/", warehouse_views.WarehouseListView.as_view(), name="inventory-warehouses"),
+    path("warehouses/dashboard/", warehouse_views.WarehouseDashboardView.as_view(), name="inventory-warehouse-dashboard"),
+    path("warehouses/stock/", warehouse_views.WarehouseStockView.as_view(), name="inventory-warehouse-stock"),
+    path("warehouses/availability/", warehouse_views.WarehouseAvailabilityView.as_view(), name="inventory-warehouse-availability"),
+    path("warehouses/shortage-transfer/", warehouse_views.WarehouseShortageTransferView.as_view(), name="inventory-warehouse-shortage-transfer"),
+    path("warehouses/stock-levels/", warehouse_views.WarehouseStockLevelView.as_view(), name="inventory-warehouse-stock-levels"),
+    path("warehouses/ledger/", warehouse_views.WarehouseLedgerView.as_view(), name="inventory-warehouse-ledger"),
+    path("warehouses/<uuid:pk>/", warehouse_views.WarehouseDetailView.as_view(), name="inventory-warehouse-detail"),
     path("production-runs/", views.ProductionRunListView.as_view(), name="inventory-production-runs"),
     path("production-runs/<uuid:pk>/", views.ProductionRunDetailView.as_view(), name="inventory-production-run"),
     path("production-runs/<uuid:pk>/<str:action_name>/", views.ProductionRunDetailView.as_view(),
