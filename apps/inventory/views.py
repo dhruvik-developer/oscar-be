@@ -6016,6 +6016,38 @@ class BatchListView(APIView):
         body["canSeeCost"] = _can_see_batch_cost(request.user)
         return Response(body)
 
+    def post(self, request):
+        """POST /inventory/batches/ -- add OSCAR's own fabric by hand.
+        { itemId, locationId, rolls: [{meters}], rate, reason, supplierId?, fabricQualityId?,
+          shadeId?, width?, gsm?, date?, sendToQc? }  The batch code is generated, never sent."""
+        from apps.core.permissions import require_permission
+
+        from .batch_services import create_manual_batch, serialize_batch
+
+        require_permission(request.user, "adjust_stock", "Adding stock by hand needs stock adjustment rights.")
+        data = request.data
+        cid = request.client_id
+
+        def pick(model, key):
+            return model.objects.filter(client_id=cid, pk=data.get(key)).first() if data.get(key) else None
+
+        item, location = pick(Item, "itemId"), pick(Location, "locationId")
+        if item is None or location is None:
+            raise ValidationFailed("Choose the fabric and the godown.",
+                                   field_errors={"itemId": ["Required."], "locationId": ["Required."]})
+        batch = create_manual_batch(
+            client=request.user.client, item=item, location=location, rolls=data.get("rolls"),
+            total_meters=data.get("totalMeters"),
+            rate=data.get("rate"), reason=data.get("reason"), supplier=pick(Party, "supplierId"),
+            fabric_quality=pick(FabricQuality, "fabricQualityId"), shade=pick(Shade, "shadeId"),
+            width=data.get("width") or None, gsm=data.get("gsm") or None,
+            received_on=data.get("date") or None, send_to_qc=bool(data.get("sendToQc")), user=request.user,
+        )
+        include_cost = _can_see_batch_cost(request.user)
+        body = serialize_batch(batch, include_cost=include_cost, detail=True)
+        body["canSeeCost"] = include_cost
+        return Response(body, status=status.HTTP_201_CREATED)
+
 
 class BatchEligibleStockView(APIView):
     """
@@ -6166,7 +6198,8 @@ class CustomerMaterialView(APIView):
                                                      "locationId": ["Required."]})
             batch, number = receive_customer_material(
                 client=request.user.client, customer=customer, item=item, location=location,
-                rolls=data.get("rolls"), reference=data.get("reference"), user=request.user,
+                rolls=data.get("rolls"), total_meters=data.get("totalMeters"),
+                reference=data.get("reference"), user=request.user,
                 received_on=data.get("date") or None,
             )
             body = serialize_batch(batch, detail=True)
@@ -6177,9 +6210,96 @@ class CustomerMaterialView(APIView):
             return Response({"message": f"No batch found for '{code}'.", "code": "NOT_FOUND"},
                             status=status.HTTP_404_NOT_FOUND)
         number = deliver_to_owner(batch, rolls=data.get("rolls"), reference=data.get("reference"), user=request.user)
-        body = serialize_batch(batch, detail=True)
+        include_cost = _can_see_batch_cost(request.user)
+        body = serialize_batch(batch, include_cost=include_cost, detail=True)
+        body["canSeeCost"] = include_cost
         body["deliveryNumber"] = number
         return Response(body)
+
+
+class BatchTakaRegistrationView(APIView):
+    """
+    POST /inventory/batches/<code>/register-takas/  { takas: [{meters, weightKg?, width?, gsm?}] }
+    Cut individual takas out of a batch received as bulk metres.
+    """
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_inventory"]
+
+    def post(self, request, code):
+        from apps.core.permissions import require_permission
+
+        from .batch_services import find_batch, register_takas, serialize_batch
+
+        require_permission(request.user, "adjust_stock", "Registering takas needs stock rights.")
+        batch = find_batch(request.client_id, code)
+        if batch is None:
+            return Response({"message": f"No batch found for '{code}'.", "code": "NOT_FOUND"},
+                            status=status.HTTP_404_NOT_FOUND)
+        register_takas(batch, takas=request.data.get("takas"), user=request.user)
+        include_cost = _can_see_batch_cost(request.user)
+        body = serialize_batch(batch, include_cost=include_cost, detail=True)
+        body["canSeeCost"] = include_cost
+        return Response(body, status=status.HTTP_201_CREATED)
+
+
+class StockPositionScreenView(APIView):
+    """
+    GET  /inventory/stock-position/<screen>/  screen in overview | samples | scrap |
+         usable | reprocessing | customer-returns.  Filters: q, itemId, designId,
+         shadeId, locationId, batch, ownership, status, from, to, page, page_size.
+         ``?export=csv`` returns every filtered row as CSV.
+    POST /inventory/stock-position/scrap/<action>/  action in route-rework | dispose
+         { lotTakaId, quantity, reason }
+    Cost / value columns only for users with ledger access.
+    """
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_inventory"]
+
+    def get(self, request, screen):
+        import csv
+
+        from .stock_position_services import SCREENS
+
+        builder = SCREENS.get(screen)
+        if builder is None:
+            return Response({"message": "Unknown stock position screen.", "code": "NOT_FOUND"},
+                            status=status.HTTP_404_NOT_FOUND)
+        include_cost = _can_see_batch_cost(request.user)
+        data = builder(request.client_id, request.query_params, include_cost=include_cost)
+        if request.query_params.get("export") == "csv":
+            rows = data["results"]
+            columns = []
+            for row in rows:
+                for key, value in row.items():
+                    if key not in columns and not isinstance(value, (list, dict)):
+                        columns.append(key)
+            response = HttpResponse(content_type="text/csv")
+            response["Content-Disposition"] = f'attachment; filename="stock-{screen}.csv"'
+            writer = csv.writer(response)
+            writer.writerow(columns)
+            for row in rows:
+                writer.writerow([row.get(c, "") if row.get(c) is not None else "" for c in columns])
+            return response
+        data["canSeeCost"] = include_cost
+        return Response(data)
+
+    def post(self, request, screen, action_name=None):
+        from apps.core.permissions import require_permission
+
+        from . import stock_position_services as sp
+
+        if screen != "scrap" or action_name not in ("route-rework", "dispose"):
+            return Response({"message": "Unknown action.", "code": "NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
+        data = request.data
+        if action_name == "route-rework":
+            require_permission(request.user, "approve_qc", "Routing rejected stock to rework needs QC approval rights.")
+            sp.route_to_rework(request.client_id, lot_taka_id=data.get("lotTakaId"), quantity=data.get("quantity"),
+                               reason=data.get("reason"), user=request.user)
+        else:
+            require_permission(request.user, "adjust_stock", "Approving a scrap disposal needs stock adjustment rights.")
+            sp.dispose_scrap(request.client_id, lot_taka_id=data.get("lotTakaId"), quantity=data.get("quantity"),
+                             reason=data.get("reason"), user=request.user)
+        return Response({"ok": True})
 
 
 class BatchDetailView(APIView):

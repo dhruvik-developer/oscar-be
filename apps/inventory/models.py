@@ -59,6 +59,10 @@ MOVEMENT_TYPES = [
     # Never costed -- it is not OSCAR's inventory.
     ("CUSTOMER_IN", "CUSTOMER_IN"),
     ("CUSTOMER_OUT", "CUSTOMER_OUT"),
+    # A batch received as bulk metres, later registered taka by taka: out of
+    # the bulk record, into the new taka, same godown.
+    ("TAKA_REGISTER_OUT", "TAKA_REGISTER_OUT"),
+    ("TAKA_REGISTER_IN", "TAKA_REGISTER_IN"),
 ]
 
 #: Movements that reverse an earlier one, keyed to what they reverse.
@@ -100,6 +104,8 @@ SELF_REVERSING_TYPES = (
     "PRODUCTION_OUTPUT",
     "CUSTOMER_IN",
     "CUSTOMER_OUT",
+    "TAKA_REGISTER_OUT",
+    "TAKA_REGISTER_IN",
 )
 
 #: Valid values of ``LotTaka.qc_status`` (kept as-is for Phase 1).

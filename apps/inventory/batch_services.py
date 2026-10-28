@@ -128,6 +128,25 @@ def _purchase_order_for(taka):
     return receipt.purchase_order if receipt is not None and receipt.purchase_order_id else None
 
 
+#: The ``LotTaka.tags`` marker of a batch's bulk record: metres received as a
+#: whole, not yet registered as individual takas.
+BULK_TAG = "BULK"
+
+
+def is_bulk(taka):
+    return BULK_TAG in (taka.tags or [])
+
+
+def _rolls_or_bulk(rolls, total_meters):
+    """``rolls`` as given, or one bulk roll of ``total_meters``."""
+    rolls = [r for r in (rolls or []) if D(r.get("meters") or 0) > ZERO]
+    if rolls:
+        return rolls, False
+    if D(total_meters or 0) > ZERO:
+        return [{"meters": total_meters}], True
+    return [], False
+
+
 def find_batch(client_id, code):
     """A batch by its code, or by any of its rolls' taka ID / barcode / lot."""
     from .models import Batch, LotTaka
@@ -152,7 +171,7 @@ def find_batch(client_id, code):
 def _takas(batch):
     return list(
         batch.takas.filter(deleted_at__isnull=True)
-        .select_related("item", "location", "fabric_quality", "design", "shade", "supplier")
+        .select_related("item", "item__category", "location", "fabric_quality", "design", "shade", "supplier")
         .order_by("created_at")
     )
 
@@ -202,6 +221,10 @@ def batch_quantities(batch, takas=None):
         "secondQuality": round4(buckets["secondQuality"]),
         "rejected": round4(buckets["rejected"]),
         "withJobWorker": round4(buckets["withJobWorker"]),
+        # Bulk metres still waiting to be registered as takas.
+        "unregistered": round4(sum(
+            (D(t.available_quantity or 0) for t in takas if is_bulk(t)), ZERO
+        )),
         "sentForJobWork": round4(jw_out),
         "returnedFromJobWork": round4(jw_in),
         "sold": round4(D(sold) - D(returned)),
@@ -595,10 +618,36 @@ def batch_timeline(batch, takas=None, include_cost=False):
     return events
 
 
+def item_hsn(item):
+    """GST HSN of a fabric: the item's own, else its category's default."""
+    if item is None:
+        return None
+    category = getattr(item, "category", None)
+    return (item.hsn_code or "").strip() or (getattr(category, "default_hsn_code", None) or "").strip() or None
+
+
+def batch_hsn(batch, takas):
+    """HSN codes of the fabric(s) in the batch, from the item master -- never
+    typed on the batch. Returns (codes, items_missing_hsn)."""
+    items = {t.item_id: t.item for t in takas if t.item_id}
+    if not items and batch.item_id:
+        items = {batch.item_id: batch.item}
+    codes, missing = [], []
+    for item in items.values():
+        code = item_hsn(item)
+        if code:
+            if code not in codes:
+                codes.append(code)
+        else:
+            missing.append(item.name)
+    return codes, missing
+
+
 def serialize_batch(batch, *, takas=None, include_cost=False, detail=False):
     takas = takas if takas is not None else _takas(batch)
     qty = batch_quantities(batch, takas)
     first = takas[0] if takas else None
+    hsn_codes, hsn_missing = batch_hsn(batch, takas)
     data = {
         "id": str(batch.id),
         "batchCode": batch.batch_code,
@@ -606,6 +655,10 @@ def serialize_batch(batch, *, takas=None, include_cost=False, detail=False):
         "ownership": batch.ownership,
         "ownerPartyName": batch.owner_party.name if batch.owner_party_id else None,
         "item": (batch.item or getattr(first, "item", None)).name if (batch.item_id or first) else None,
+        "hsnCode": ", ".join(hsn_codes) or None,
+        "hsnCodes": hsn_codes,
+        # Fabric(s) whose item master has no HSN -- fix it there, not on the batch.
+        "hsnMissingFor": hsn_missing,
         "fabricQuality": getattr(getattr(first, "fabric_quality", None), "name", None),
         "design": getattr(getattr(first, "design", None), "name", None),
         "shade": getattr(getattr(first, "shade", None), "name", None),
@@ -681,7 +734,7 @@ def eligible_sale_stock(client_id, item_id, *, location_id=None, batch_code=None
     grouped = {}
     for t in takas:
         reserved_here = str(t.id) in own
-        if t.status == "Reserved" and not reserved_here:
+        if (t.status == "Reserved" and not reserved_here) or is_bulk(t):
             continue
         b = grouped.setdefault(t.batch_id, {
             "batchCode": t.batch.batch_code if t.batch_id else t.lot_number,
@@ -871,7 +924,7 @@ def set_ownership(batch, *, ownership, owner_party_id=None, user=None, reason=No
 
 @transaction.atomic
 def receive_customer_material(*, client, customer, item, location, rolls, reference=None, user=None,
-                              received_on=None):
+                              received_on=None, total_meters=None):
     """Customer's own fabric arriving (for processing / job work on their behalf).
 
     Opens a CUSTOMER-owned batch; the rolls carry no cost and post no journal,
@@ -885,9 +938,10 @@ def receive_customer_material(*, client, customer, item, location, rolls, refere
     from . import services as stock
     from .models import Batch, LotTaka
 
-    rolls = [r for r in (rolls or []) if D(r.get("meters") or 0) > ZERO]
+    rolls, bulk = _rolls_or_bulk(rolls, total_meters)
     if not rolls:
-        raise ValidationFailed("Enter at least one roll with metres.", field_errors={"rolls": ["Required."]})
+        raise ValidationFailed("Enter the total metres, or the metres of each taka.",
+                               field_errors={"totalMeters": ["Required."]})
     client_id = getattr(client, "id", client)
     receipt_no = allocate_number(client, "CMR", received_on)
     receipt_id = uuid.uuid4()
@@ -912,7 +966,8 @@ def receive_customer_material(*, client, customer, item, location, rolls, refere
         code = allocate_number(client, "TAK")
         taka = LotTaka.objects.create(
             client_id=client_id, batch=batch, item=item, location=location, lot_number=lot_number,
-            taka_number=str(index), taka_id=code, barcode=code, received_quantity=meters,
+            taka_number="BULK" if bulk else str(index), taka_id=code, barcode=code, received_quantity=meters,
+            tags=[BULK_TAG] if bulk else [],
             available_quantity=ZERO, uom=item.uom, status="Available", qc_status="Passed",
             source_document_type="CustomerMaterialReceipt", source_document_id=receipt_id,
             source_document_number=receipt_no, supplier=customer,
@@ -1024,3 +1079,205 @@ def physical_stock_summary(client_id):
         rows.append({k: (str(round4(v)) if isinstance(v, Decimal) else v) for k, v in row.items()})
     rows.sort(key=lambda r: (r["ownership"] != "OSCAR", r.get("ownerPartyName") or ""))
     return rows
+
+
+@transaction.atomic
+def create_manual_batch(*, client, item, location, rolls, rate, reason, supplier=None, fabric_quality=None,
+                        shade=None, width=None, gsm=None, received_on=None, send_to_qc=False, user=None,
+                        total_meters=None):
+    """Add OSCAR's own fabric by hand (opening stock, stock found on a count).
+
+    The batch code is always generated (OSCAR-GRY-<year>-<n>); it is never
+    typed. Stock, batch cost and the ledger move together:
+    ADJUSTMENT in at ``rate`` (Dr Inventory | Cr Stock Adjustment, the
+    existing stock-adjustment policy) and a "Grey purchase" cost entry of the
+    same value. ``send_to_qc`` puts the rolls at QC Hold, pending inspection.
+    """
+    import uuid
+
+    from apps.accounting import services as ledger
+    from apps.core.audit import record_audit
+    from apps.core.exceptions import ValidationFailed
+    from apps.core.numbering import allocate_number
+
+    from . import costing_services
+    from . import services as stock
+    from .models import Batch, LotTaka
+
+    client_id = getattr(client, "id", client)
+    if isinstance(received_on, str):
+        from datetime import date
+
+        try:
+            received_on = date.fromisoformat(received_on[:10])
+        except ValueError:
+            raise ValidationFailed("Date must be YYYY-MM-DD.", field_errors={"date": ["Invalid date."]})
+    rolls, bulk = _rolls_or_bulk(rolls, total_meters)
+    if not rolls:
+        raise ValidationFailed("Enter the batch's total metres, or the metres of each taka.",
+                               field_errors={"totalMeters": ["Required."]})
+    rate = round4(D(rate or 0))
+    if rate <= ZERO:
+        raise ValidationFailed("Enter the value per metre of this fabric.", field_errors={"rate": ["Must be above 0."]})
+    if not (reason or "").strip():
+        raise ValidationFailed("Say why this stock is added by hand.", field_errors={"reason": ["Required."]})
+    if (location.code or "").startswith("SYS-"):
+        raise ValidationFailed("Choose a real godown.", field_errors={"locationId": ["System locations are not allowed."]})
+
+    target = stock.system_location(client_id, "QC_HOLD") if send_to_qc else location
+    lot_number = allocate_number(client, "LOT", received_on)
+    batch = Batch.objects.create(
+        client_id=client_id,
+        batch_code=allocate_number(client, "BAT", received_on),
+        origin="MANUAL",
+        ownership="OSCAR",
+        item=item,
+        supplier=supplier,
+        source_document_type="ManualBatch",
+        uom=item.uom,
+        notes=reason,
+        **({"created_on": received_on} if received_on else {}),
+    )
+    Batch.objects.filter(pk=batch.pk).update(source_document_id=batch.id, source_document_number=batch.batch_code)
+    total_qty = ZERO
+    for index, roll in enumerate(rolls, start=1):
+        meters = round4(D(roll.get("meters")))
+        code = allocate_number(client, "TAK")
+        taka = LotTaka.objects.create(
+            client_id=client_id, batch=batch, item=item, location=target, lot_number=lot_number,
+            taka_number="BULK" if bulk else str(index), taka_id=code, barcode=code, received_quantity=meters,
+            available_quantity=ZERO, uom=item.uom, rate=rate, supplier=supplier,
+            tags=[BULK_TAG] if bulk else [],
+            fabric_quality=fabric_quality, shade=shade, width=width, gsm=gsm,
+            status="QC Hold" if send_to_qc else "Available",
+            qc_status="Pending" if send_to_qc else "Passed",
+            source_document_type="ManualBatch", source_document_id=batch.id,
+            source_document_number=batch.batch_code,
+            **({"received_date": received_on} if received_on else {}),
+        )
+        stock.post_movement(
+            client_id=client_id, item=item, location=target, type="ADJUSTMENT", quantity=meters,
+            unit_cost=rate, reference_type="ManualBatch", reference_id=batch.id,
+            reference_number=batch.batch_code, lot_taka=taka, user=user,
+            notes=f"Batch added by hand: {reason}",
+        )
+        total_qty += meters
+    value = round2(total_qty * rate)
+    ledger.post_entry(
+        client=client_id,
+        postings=[
+            ledger.debit(ledger.system_account(client_id, "stock"), value,
+                         description=f"Batch {batch.batch_code}: {total_qty} {item.uom or ''} {item.name}"),
+            ledger.credit(ledger.system_account(client_id, "stock_adjustment"), value,
+                          description=f"Added by hand: {reason}"),
+        ],
+        entry_date=received_on or timezone_today(),
+        narration=f"Batch {batch.batch_code} added by hand ({reason})",
+        source_document_type="ManualBatch",
+        source_document_id=batch.id,
+        user=user,
+    )
+    costing_services.post_lot_cost(
+        client_id=client_id, lot_number=lot_number, cost_type="Grey purchase", amount=value,
+        quantity=total_qty, source_document_type="ManualBatch", source_document_id=batch.id,
+        source_document_number=batch.batch_code, user=user, remarks=reason,
+    )
+    record_audit(
+        client=client_id, actor=user, action="create", entity_type="Batch", entity_id=batch.id,
+        entity_label=batch.batch_code, description=f"Batch added by hand: {total_qty} at {rate}/unit",
+        comments=reason,
+    )
+    batch.refresh_from_db()
+    return batch
+
+
+def timezone_today():
+    from django.utils import timezone
+
+    return timezone.localdate()
+
+
+
+@transaction.atomic
+def register_takas(batch, *, takas, user=None):
+    """Turn a batch's bulk metres into individual takas.
+
+    ``takas`` = [{meters, weightKg?, width?, gsm?}]. Each new taka is cut
+    from the batch's bulk record (same godown, lot, rate and QC state; the
+    batch never changes), with a pair of TAKA_REGISTER movements, so stock,
+    cost and history stay whole. Asking for more than the bulk holds is
+    refused; whatever is not registered stays as bulk.
+    """
+    import uuid
+
+    from apps.core.audit import record_audit
+    from apps.core.exceptions import BusinessRuleViolation, ValidationFailed
+    from apps.core.numbering import allocate_number
+
+    from . import services as stock
+    from .models import LotTaka
+
+    rows = [t for t in (takas or []) if D(t.get("meters") or 0) > ZERO]
+    if not rows:
+        raise ValidationFailed("Enter the metres of each taka.", field_errors={"takas": ["Required."]})
+    bulk_rows = list(
+        LotTaka.objects.select_for_update().filter(
+            client_id=batch.client_id, batch=batch, deleted_at__isnull=True, available_quantity__gt=0,
+            tags__contains=[BULK_TAG],
+        ).order_by("created_at")
+    )
+    available = sum((D(b.available_quantity) for b in bulk_rows), ZERO)
+    wanted = sum((round4(D(t["meters"])) for t in rows), ZERO)
+    if not bulk_rows:
+        raise BusinessRuleViolation(f"{batch.batch_code} has no metres left to register as takas.",
+                                    code="NOTHING_TO_REGISTER")
+    if wanted > available:
+        raise BusinessRuleViolation(
+            f"{batch.batch_code} has {round4(available)} unregistered; the takas add up to {round4(wanted)}.",
+            code="OVER_REGISTER",
+        )
+
+    reference_id = uuid.uuid4()
+    reference_no = allocate_number(batch.client_id, "TRG")
+    used = {t.taka_number for t in LotTaka.objects.filter(client_id=batch.client_id, batch=batch)}
+    next_no = 1
+    created = []
+    for row in rows:
+        meters = round4(D(row["meters"]))
+        source = next(b for b in bulk_rows if D(b.available_quantity) > ZERO)
+        while str(next_no) in used:
+            next_no += 1
+        used.add(str(next_no))
+        if meters > D(source.available_quantity):
+            raise BusinessRuleViolation(
+                f"A taka of {meters} does not fit in what is left of the bulk record "
+                f"({round4(D(source.available_quantity))}); split it smaller.",
+                code="OVER_REGISTER",
+            )
+        code = allocate_number(batch.client_id, "TAK")
+        taka = LotTaka.objects.create(
+            client_id=batch.client_id, batch=batch, parent_taka=source, item_id=source.item_id,
+            fabric_quality_id=source.fabric_quality_id, design_id=source.design_id, shade_id=source.shade_id,
+            supplier_id=source.supplier_id, location_id=source.location_id, lot_number=source.lot_number,
+            taka_number=str(next_no), taka_id=code, barcode=code, received_quantity=meters,
+            available_quantity=ZERO, uom=source.uom, rate=source.rate, status=source.status,
+            qc_status=source.qc_status, received_date=source.received_date,
+            roll_weight=row.get("weightKg") or None, width=row.get("width") or source.width,
+            gsm=row.get("gsm") or source.gsm,
+            source_document_type=source.source_document_type, source_document_id=source.source_document_id,
+            source_document_number=source.source_document_number, source_line_id=source.source_line_id,
+        )
+        common = dict(
+            client_id=batch.client_id, item=source.item_id, location=source.location_id,
+            reference_type="TakaRegistration", reference_id=reference_id, reference_number=reference_no,
+            user=user, notes=f"Taka {code} registered from {batch.batch_code}",
+        )
+        stock.post_movement(type="TAKA_REGISTER_OUT", quantity=-meters, lot_taka=source, **common)
+        stock.post_movement(type="TAKA_REGISTER_IN", quantity=meters, lot_taka=taka, **common)
+        source.refresh_from_db()
+        created.append(taka)
+    record_audit(
+        client=batch.client_id, actor=user, action="register_takas", entity_type="Batch", entity_id=batch.id,
+        entity_label=batch.batch_code, description=f"{len(created)} taka(s), {wanted} registered ({reference_no})",
+    )
+    return created

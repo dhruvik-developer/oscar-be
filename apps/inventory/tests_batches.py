@@ -235,7 +235,7 @@ class BatchOwnershipTests(BatchTestBase):
         eligible = self.api.get(f"/api/v1/inventory/batches/eligible/?itemId={self.item.id}").json()["results"]
         self.assertEqual(eligible, [])
 
-    def test_customer_roll_goes_only_to_its_owner(self):
+    def test_customer_roll_is_never_sold_even_to_its_owner(self):
         from types import SimpleNamespace
 
         from apps.core.exceptions import BusinessRuleViolation
@@ -243,17 +243,17 @@ class BatchOwnershipTests(BatchTestBase):
 
         batch_services.set_ownership(self.batch, ownership="CUSTOMER", owner_party_id=self.customer.id)
         self.taka.refresh_from_db()
-
-        def line(party):
-            doc = SimpleNamespace(party_id=party.id)
-            return SimpleNamespace(
-                item=self.item, item_id=self.item.id, item_name=self.item.name, delivery_challan=doc,
-                taka_allocations=[{"lotTakaId": str(self.taka.id), "qty": "10"}], reserved_takas=[],
-            )
-
-        self.assertEqual(len(allocate_takas(self.tenant.id, line(self.customer), Decimal("10"), self.godown.id)), 1)
-        with self.assertRaises(BusinessRuleViolation):
-            allocate_takas(self.tenant.id, line(self.vendor), Decimal("10"), self.godown.id)
+        selected = SimpleNamespace(
+            item=self.item, item_id=self.item.id, item_name=self.item.name,
+            taka_allocations=[{"lotTakaId": str(self.taka.id), "qty": "10"}], reserved_takas=[],
+        )
+        with self.assertRaises(BusinessRuleViolation) as ctx:
+            allocate_takas(self.tenant.id, selected, Decimal("10"), self.godown.id)
+        self.assertEqual(ctx.exception.code, "NOT_OSCAR_STOCK")
+        fifo = SimpleNamespace(item=self.item, item_id=self.item.id, item_name=self.item.name,
+                               taka_allocations=[], reserved_takas=[])
+        with self.assertRaises(BusinessRuleViolation):     # nothing of OSCAR's to draw on
+            allocate_takas(self.tenant.id, fifo, Decimal("10"), self.godown.id)
 
 
 class InHouseProductionTests(BatchTestBase):
@@ -477,6 +477,17 @@ class ProductionAccountingTests(InHouseProductionTests):
         self.assertEqual(yarn, Decimal("200.0000"))
         self.assertEqual(act("cancel", {}).status_code, 409)      # cannot cancel twice
 
+    def test_profit_and_loss_shows_absorbed_labour_as_contra_not_double(self):
+        from apps.accounting.reports import profit_and_loss
+
+        self.run_flow()
+        pl = profit_and_loss(self.tenant.id)
+        absorbed = [a for a in pl["expenseAccounts"] if a["code"] == "5610"]
+        self.assertEqual(len(absorbed), 1)
+        self.assertEqual(absorbed[0]["amount"], Decimal("-5000.00"))   # labour moved into WIP / stock
+        self.assertEqual(pl["operatingExpenses"], Decimal("-5000.00"))   # payroll (not run here) books the +5000
+        self.assertEqual(pl["cogs"], Decimal("0"))                       # nothing sold yet
+
     def test_entries_are_not_duplicated_by_retrying_completion(self):
         from apps.accounting.models import JournalEntry
 
@@ -620,3 +631,208 @@ class QCPurchaseReturnTests(BatchTestBase):
             "rolls": [{"lotTakaId": str(self.taka.id), "qty": "5"}], "reason": "not rejected",
         }, format="json")
         self.assertEqual(resp.status_code, 422, resp.content)
+
+
+class ManualBatchTests(BatchTestBase):
+    """A batch added by hand: generated code, stock, cost and ledger together."""
+
+    def setUp(self):
+        super().setUp()
+        from apps.accounting import services as ledger
+
+        ledger.seed_chart_of_accounts(self.tenant)
+
+    def add(self, **extra):
+        body = {"itemId": str(self.item.id), "locationId": str(self.godown.id),
+                "rolls": [{"meters": "100"}, {"meters": "50"}], "rate": "40", "reason": "Opening stock"}
+        body.update(extra)
+        return self.api.post("/api/v1/inventory/batches/", body, format="json")
+
+    def test_code_is_generated_and_stock_cost_ledger_agree(self):
+        from apps.accounting.models import JournalLine
+
+        resp = self.add(batchCode="MY-OWN-CODE")              # a typed code is ignored
+        self.assertEqual(resp.status_code, 201, resp.content)
+        body = resp.json()
+        self.assertRegex(body["batchCode"], r"^OSCAR-GRY-\d{4}-\d{4}$")
+        self.assertEqual(body["origin"], "MANUAL")
+        self.assertEqual(body["quantities"]["available"], "150.0000")
+        self.assertEqual(body["costing"]["totalCost"], "6000.00")
+        self.assertEqual(body["costing"]["costPerUnit"], "40.0000")
+        lines = JournalLine.objects.filter(journal_entry__source_document_type="ManualBatch")
+        self.assertEqual({l.account.system_key: (l.debit, l.credit) for l in lines},
+                         {"stock": (Decimal("6000.00"), Decimal("0")), "stock_adjustment": (Decimal("0"), Decimal("6000.00"))})
+        second = self.add().json()["batchCode"]
+        self.assertNotEqual(second, body["batchCode"])
+
+    def test_rate_and_reason_are_required(self):
+        self.assertEqual(self.add(rate="0").status_code, 400)
+        self.assertEqual(self.add(reason="").status_code, 400)
+
+    def test_send_to_qc_holds_the_rolls(self):
+        body = self.add(sendToQc=True).json()
+        self.assertEqual(body["quantities"]["qcHold"], "150.0000")
+        self.assertEqual(body["quantities"]["available"], "0.0000")
+
+
+class TakaRegistrationTests(ManualBatchTests):
+    """Batch first as total metres, takas registered out of it later."""
+
+    def bulk_batch(self):
+        resp = self.add(rolls=[], totalMeters="1000")
+        self.assertEqual(resp.status_code, 201, resp.content)
+        return resp.json()
+
+    def register(self, code, metres):
+        return self.api.post(f"/api/v1/inventory/batches/{code}/register-takas/",
+                             {"takas": [{"meters": m} for m in metres]}, format="json")
+
+    def test_takas_are_cut_from_the_batch_and_the_rest_stays_unregistered(self):
+        from apps.accounting.models import JournalEntry
+
+        body = self.bulk_batch()
+        code = body["batchCode"]
+        self.assertEqual(body["quantities"]["unregistered"], "1000.0000")
+        journals = JournalEntry.objects.count()
+
+        resp = self.register(code, ["102", "98.5", "110"])
+        self.assertEqual(resp.status_code, 201, resp.content)
+        after = resp.json()
+        self.assertEqual(after["batchCode"], code)                       # same batch
+        self.assertEqual(after["quantities"]["unregistered"], "689.5000")
+        self.assertEqual(after["quantities"]["available"], "1000.0000")  # nothing lost
+        self.assertEqual(after["quantities"]["received"], "1000.0000")
+        new = [t for t in after["takas"] if t["takaNumber"] in ("1", "2", "3")]
+        self.assertEqual(sorted(t["availableQuantity"] for t in new), ["102.0000", "110.0000", "98.5000"])
+        self.assertEqual(len({t["takaId"] for t in new}), 3)
+        self.assertEqual(after["costing"]["totalCost"], "40000.00")      # cost unchanged
+        self.assertEqual(JournalEntry.objects.count(), journals)         # no new journal
+
+        more = self.register(code, ["50"]).json()
+        self.assertEqual(more["quantities"]["unregistered"], "639.5000")
+        self.assertIn("4", {t["takaNumber"] for t in more["takas"]})
+
+    def test_cannot_register_more_than_is_left(self):
+        code = self.bulk_batch()["batchCode"]
+        self.assertEqual(self.register(code, ["600", "500"]).status_code, 422)
+
+    def test_bulk_metres_are_not_sold_before_takas_exist(self):
+        from types import SimpleNamespace
+
+        from apps.core.exceptions import BusinessRuleViolation
+        from apps.sales.services import allocate_takas
+
+        self.item.tracking_type = "TAKA"
+        self.item.save(update_fields=["tracking_type"])
+        code = self.bulk_batch()["batchCode"]
+        bulk = LotTaka.objects.get(batch__batch_code=code)
+        line = SimpleNamespace(item=self.item, item_id=self.item.id, item_name=self.item.name,
+                               taka_allocations=[{"lotTakaId": str(bulk.id), "qty": "10"}], reserved_takas=[])
+        with self.assertRaises(BusinessRuleViolation):
+            allocate_takas(self.tenant.id, line, Decimal("10"), self.godown.id)
+        self.register(code, ["100"])
+        line.taka_allocations = []
+        drawn = allocate_takas(self.tenant.id, line, Decimal("10"), self.godown.id)
+        self.assertEqual(drawn[0][0].taka_number, "1")
+
+
+class BatchHsnTests(BatchTestBase):
+    """A batch shows its fabric's HSN from the item master; nothing typed on the batch."""
+
+    def test_hsn_comes_from_item_then_category(self):
+        from apps.masters.models import ItemCategory
+
+        taka = self.receive(lot="H1")
+        body = batch_services.serialize_batch(taka.batch)
+        self.assertIsNone(body["hsnCode"])
+        self.assertEqual(body["hsnMissingFor"], [self.item.name])
+
+        category = ItemCategory.objects.create(client=self.tenant, name="Cotton", default_hsn_code="5208")
+        self.item.category = category
+        self.item.save(update_fields=["category"])
+        self.assertEqual(batch_services.serialize_batch(taka.batch)["hsnCode"], "5208")
+
+        self.item.hsn_code = "52083190"
+        self.item.save(update_fields=["hsn_code"])
+        body = self.api.get(f"/api/v1/inventory/batches/{taka.batch.batch_code}/").json()
+        self.assertEqual(body["hsnCode"], "52083190")
+        self.assertEqual(body["hsnMissingFor"], [])
+
+
+class StockPositionScreenTests(BatchTestBase):
+    """The six Stock Position datasets come from where rolls are; nothing double-counted."""
+
+    def setUp(self):
+        super().setUp()
+        from apps.accounting import services as ledger
+
+        ledger.seed_chart_of_accounts(self.tenant)
+        self.good = self.receive(lot="SP-GOOD", meters="100")
+        self.good.qc_status = "Passed"
+        self.good.save(update_fields=["qc_status"])
+        bad = self.receive(lot="SP-BAD", meters="40")
+        self.rejected, _ = stock.relocate_lot(
+            client_id=self.tenant.id, lot=bad, quantity=Decimal("40"),
+            to_location_id=stock.system_location(self.tenant.id, "REJECT").id,
+            out_type="QC_REJECT", in_type="QC_REJECT", reference_type="QCInspection",
+            reference_id=uuid.uuid4(), reference_number="QC-SP",
+        )
+        self.api_get = lambda screen, **q: self.api.get(f"/api/v1/inventory/stock-position/{screen}/", q)
+
+    def test_overview_buckets_and_customer_material_kept_apart(self):
+        self.api.post("/api/v1/inventory/batches/customer-receipt/", {
+            "customerId": str(self.customer.id), "itemId": str(self.item.id),
+            "locationId": str(self.godown.id), "totalMeters": "30",
+        }, format="json")
+        body = self.api_get("overview").json()
+        k = body["kpis"]
+        self.assertEqual(k["physical"], "170.0000")
+        self.assertEqual(k["available"], "100.0000")          # OSCAR-owned only
+        self.assertEqual(k["customerHeld"], "30.0000")
+        self.assertEqual(k["qcHoldRejected"], "40.0000")
+        self.assertTrue(body["canSeeCost"])
+        only_rejected = self.api_get("overview", status="rejected").json()
+        self.assertEqual(only_rejected["count"], 1)
+
+    def test_usable_excludes_rejected_customer_and_bulk_from_sale(self):
+        self.add_bulk = self.api.post("/api/v1/inventory/batches/", {
+            "itemId": str(self.item.id), "locationId": str(self.godown.id), "totalMeters": "500",
+            "rate": "40", "reason": "Opening",
+        }, format="json")
+        k = self.api_get("usable").json()["kpis"]
+        self.assertEqual(k["forSale"], "100.0000")              # bulk 500 not sellable until takas
+        self.assertEqual(k["forProduction"], "600.0000")
+
+    def test_rework_leaves_scrap_and_disposal_posts_once(self):
+        from apps.accounting.models import JournalLine
+
+        before = self.api_get("scrap").json()["kpis"]
+        self.assertEqual(before["qcRejected"], "40.0000")
+        r = self.api.post("/api/v1/inventory/stock-position/scrap/route-rework/", {
+            "lotTakaId": str(self.rejected.id), "quantity": "15", "reason": "Can be re-dyed"}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        after = self.api_get("scrap").json()["kpis"]
+        self.assertEqual(after["qcRejected"], "25.0000")          # not double-counted
+        self.assertEqual(self.api_get("reprocessing").json()["kpis"]["awaitingReprocessInStore"], "15.0000")
+
+        self.rejected.refresh_from_db()
+        LotTaka.objects.filter(pk=self.rejected.pk).update(rate=Decimal("50"))
+        d = self.api.post("/api/v1/inventory/stock-position/scrap/dispose/", {
+            "lotTakaId": str(self.rejected.id), "quantity": "25", "reason": "Approved by owner"}, format="json")
+        self.assertEqual(d.status_code, 200, d.content)
+        self.assertEqual(self.api_get("scrap").json()["kpis"].get("qcRejected", "0"), "0")
+        lines = JournalLine.objects.filter(journal_entry__source_document_type="StockAdjustment")
+        self.assertEqual(sum(l.debit for l in lines), Decimal("1250.00"))
+        again = self.api.post("/api/v1/inventory/stock-position/scrap/dispose/", {
+            "lotTakaId": str(self.rejected.id), "quantity": "1", "reason": "x"}, format="json")
+        self.assertEqual(again.status_code, 422)
+
+    def test_csv_export_and_unknown_screen(self):
+        resp = self.api_get("overview", export="csv")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(b"batchCode", resp.content)
+        self.assertEqual(self.api_get("nope").status_code, 404)
+
+    def test_all_screens_respond(self):
+        for screen in ("overview", "samples", "scrap", "usable", "reprocessing", "customer-returns"):
+            self.assertEqual(self.api_get(screen).status_code, 200, screen)

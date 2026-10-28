@@ -56,6 +56,7 @@ REPORT_CATALOGUE = [
     ("hrms-attrition", "Attrition", "HRMS", ["date_from", "date_to"]),
     ("annual-commercial-leakage", "Annual Commercial Leakage", "Accounts", ["date_from", "date_to"]),
     ("party-profitability", "Party Profitability", "Sales", ["date_from", "date_to"]),
+    ("salesperson-profitability", "Salesperson Profitability", "Sales", ["date_from", "date_to"]),
     ("design-colour-analysis", "Design & Colour Fabric Analysis", "Inventory", ["date_from", "date_to"]),
     ("stock-ageing-mis", "Stock Ageing MIS", "Inventory", ["asOf"]),
 ]
@@ -80,6 +81,7 @@ REPORT_PERMISSIONS = {
     "sales-register": ["view_sales"],
     "sales-dashboard": ["view_sales"],
     "party-profitability": ["view_sales"],
+    "salesperson-profitability": ["view_sales"],
     "vendor-allocation": ["view_purchase"],
     "purchase-register": ["view_purchase"],
     "crm-pipeline": ["view_lead"],
@@ -224,6 +226,10 @@ class ReportView(APIView):
     def _report_party_profitability(self, request, client_id, date_from, date_to, as_of):
         from .mis_reports import party_profitability_report
         return Response(party_profitability_report(client_id, date_from=date_from, date_to=date_to))
+
+    def _report_salesperson_profitability(self, request, client_id, date_from, date_to, as_of):
+        from .mis_reports import salesperson_profitability_report
+        return Response(salesperson_profitability_report(client_id, date_from=date_from, date_to=date_to))
 
     def _report_design_colour_analysis(self, request, client_id, date_from, date_to, as_of):
         from .mis_reports import design_colour_analysis

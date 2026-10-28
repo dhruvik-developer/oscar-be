@@ -71,6 +71,8 @@ SERIES_DEFAULTS = {
     # Customer material receipts / deliveries back to the customer
     "CMR": ("CMR", "fy", 4, "-"),
     "CMD": ("CMD", "fy", 4, "-"),
+    # Taka registration out of a batch's bulk metres
+    "TRG": ("TRG", "fy", 4, "-"),
     "INC": ("INC", "fy", 4, "-"),
     # Job work
     "PP": ("PP", "fy", 3, "-"),

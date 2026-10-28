@@ -145,3 +145,26 @@ class FinalPoTests(DailyEntryLockTests):
         self._verify()
         with self.assertRaises(ValidationFailed):
             services.generate_final_job_work_po(self.instruction, user=self.user)
+
+    def test_generate_po_without_agreed_rate_fails(self):
+        self._make_vendor_and_item()
+        self.instruction.agreed_rate = Decimal("0")
+        self.instruction.agreed_job_rate = Decimal("0")
+        self.instruction.save(update_fields=["agreed_rate", "agreed_job_rate"])
+        self._verify()
+        with self.assertRaises(ValidationFailed) as ctx:
+            services.generate_final_job_work_po(self.instruction, user=self.user)
+        self.assertIn("rate", ctx.exception.field_errors)
+
+    def test_generate_po_for_unknown_fabric_fails(self):
+        from apps.masters.models import Item
+
+        self._make_vendor_and_item()
+        self.instruction.fabric = "NOT-IN-MASTER"
+        self.instruction.save(update_fields=["fabric"])
+        self._verify()
+        items_before = Item.objects.filter(client=self.client_obj).count()
+        with self.assertRaises(ValidationFailed) as ctx:
+            services.generate_final_job_work_po(self.instruction, user=self.user)
+        self.assertIn("itemId", ctx.exception.field_errors)
+        self.assertEqual(Item.objects.filter(client=self.client_obj).count(), items_before)

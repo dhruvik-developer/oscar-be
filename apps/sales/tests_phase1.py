@@ -525,3 +525,64 @@ class PartyProfitabilityTests(Phase1Base):
         self.assertEqual(row["cogs"], 0.0)
         self.assertEqual(row["costStatus"], "incomplete")
         self.assertEqual(len(row["invoicesWithoutActualCost"]), 1)
+
+    def test_salesperson_report_uses_actual_figures(self):
+        from apps.reports.mis_reports import salesperson_profitability_report
+
+        self.invoice(10, 100)
+        self.invoice(20, 80)
+        resp = self.api.get("/api/v1/reports/salesperson-profitability/")
+        self.assertEqual(resp.status_code, 200, resp.content[:300])
+        row = salesperson_profitability_report(self.tenant.id)["rows"][0]
+        self.assertEqual(row["netSales"], 2600.0)
+        self.assertEqual(row["cogs"], 1500.0)
+        self.assertEqual(row["collection"], 0.0)          # nothing received yet -- not 82% of sales
+        self.assertEqual(row["incentive"], 0.0)           # no incentive calculated -- not 1.5%
+        self.assertEqual(row["grossProfit"], 1100.0)
+        self.assertEqual(row["contribution"], 1100.0)
+
+
+class ReturnNeedsQcTests(Phase1Base):
+    """Returned goods land in QC Hold; only QC may accept them straight into stock."""
+
+    def _return(self, api, condition):
+        order = self.order(qty=10)
+        challan_id = self.dispatch(order["id"])
+        invoice_id = self.post(f"/sales/challans/{challan_id}/convert-to-invoice/").json()["id"]
+        self.post(f"/sales/invoices/{invoice_id}/finalize/")
+        line = SalesInvoice.objects.get(pk=invoice_id).line_items.get()
+        return api.post("/api/v1/sales/returns/", {
+            "salesInvoiceId": invoice_id, "partyId": str(self.customer.id), "date": str(timezone.localdate()),
+            "locationId": str(self.location.id),
+            "lineItems": [{"itemId": str(self.fabric.id), "qty": 4, "returnedQty": 4, "rate": 100, "tax": 0,
+                           "salesInvoiceLineId": str(line.id), "condition": condition}],
+        }, format="json")
+
+    def _clerk_api(self, permissions):
+        """A real role holding exactly ``permissions`` (no QC approval)."""
+        from apps.accounts.models import Role, RolePermission
+        from apps.accounts.permission_catalogue import sync_permissions
+
+        sync_permissions()
+        role = Role.objects.create(client=self.tenant, code="RET-CLERK", name="Returns clerk")
+        for pid in permissions:
+            RolePermission.objects.create(role=role, permission_id=pid)
+        clerk = User.objects.create_user(email="returns-clerk@example.com", password="pass",
+                                         client=self.tenant, name="Returns clerk", role=role)
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {build_tokens(clerk)['access']}")
+        return api
+
+    def test_clerk_without_qc_rights_cannot_accept_returns_as_good(self):
+        api = self._clerk_api({"view_sales", "process_returns", "create_sales_order"})
+        refused = self._return(api, "Good")
+        self.assertEqual(refused.status_code, 403, refused.content[:400])
+        self.assertEqual(refused.json()["code"], "approve_qc")
+
+    def test_clerk_return_to_hold_is_allowed(self):
+        api = self._clerk_api({"view_sales", "process_returns", "create_sales_order"})
+        ok = self._return(api, "Hold")
+        self.assertEqual(ok.status_code, 201, ok.content[:400])
+
+    def test_qc_can_accept_as_good(self):
+        self.assertEqual(self._return(self.api, "Good").status_code, 201)   # superuser

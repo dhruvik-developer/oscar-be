@@ -676,10 +676,18 @@ def generate_final_job_work_po(instruction, *, user=None, custom_data=None):
     raw_rate = custom_data.get("rate") or custom_data.get("agreedJobRate")
     rate = D(str(raw_rate)) if raw_rate is not None else D(instruction.agreed_rate or instruction.agreed_job_rate or 0)
     
+    # A final PO bills what was verified at the agreed rate -- never a
+    # guessed quantity or a made-up rate.
     if accepted_qty <= ZERO:
-        accepted_qty = round4(D(completion.get("totalProduced") or instruction.order_meter or 100))
+        raise ValidationFailed(
+            f"{instruction.instruction_number or 'This instruction'} has no verified accepted quantity to bill.",
+            field_errors={"acceptedQty": ["Verify the production before generating the final PO."]},
+        )
     if rate <= ZERO:
-        rate = D("28.50")
+        raise ValidationFailed(
+            "Enter the agreed job rate for the final PO.",
+            field_errors={"rate": ["The instruction has no agreed rate."]},
+        )
 
     # The agency must exist as a vendor party (matched by ID or name).
     vendor = None
@@ -711,28 +719,22 @@ def generate_final_job_work_po(instruction, *, user=None, custom_data=None):
 
     fabric_text = (custom_data.get("fabric") or instruction.fabric or "").strip()
     fabric_item = None
-    if fabric_text:
+    if custom_data.get("itemId"):
+        fabric_item = Item.objects.filter(
+            client_id=instruction.client_id, pk=custom_data["itemId"], deleted_at__isnull=True
+        ).first()
+    if fabric_item is None and fabric_text:
         fabric_item = (
             Item.objects.filter(client_id=instruction.client_id, deleted_at__isnull=True)
-            .exclude(item_kind="Service")
             .filter(Q(sku__iexact=fabric_text) | Q(name__iexact=fabric_text) | Q(fabric_quality__iexact=fabric_text))
             .order_by("created_at")
             .first()
         )
     if fabric_item is None:
-        fabric_item = (
-            Item.objects.filter(client_id=instruction.client_id, deleted_at__isnull=True)
-            .exclude(item_kind="Service")
-            .order_by("created_at")
-            .first()
-        )
-    if fabric_item is None:
-        fabric_item = Item.objects.create(
-            client=instruction.client,
-            name=fabric_text or "Chiffon Grey Fabric",
-            item_kind="Goods",
-            tax_pct=D("5.00"),
-            uom=instruction.rate_uom or "Meter",
+        # Never bill an unrelated or invented item: the fabric must be a master item.
+        raise ValidationFailed(
+            f"Fabric '{fabric_text or '-'}' is not an item in the master; create it or choose the item.",
+            field_errors={"itemId": ["No item matches this fabric."]},
         )
 
     if fabric_item.tax_pct is None:

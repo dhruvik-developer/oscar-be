@@ -336,6 +336,115 @@ def party_profitability_report(client_id, date_from=None, date_to=None):
     }
 
 
+def salesperson_profitability_report(client_id, date_from=None, date_to=None):
+    """Salesperson-wise sales, actual COGS, collection, returns and incentive (PDF §15).
+
+    Same sources as the party report: sales net of GST, COGS from the ledger,
+    collection from payment allocations on the invoices, incentive from the
+    incentive calculations whose period overlaps the report period. No ratio
+    is assumed; unknown cost is flagged.
+    """
+    from apps.sales.models import PaymentAllocation
+
+    today = timezone.localdate()
+    date_from = date_from or (today - timedelta(days=90))
+    date_to = date_to or today
+    if isinstance(date_from, str): date_from = date.fromisoformat(date_from[:10])
+    if isinstance(date_to, str): date_to = date.fromisoformat(date_to[:10])
+
+    invoices = list(SalesInvoice.objects.filter(
+        client_id=client_id, doc_date__gte=date_from, doc_date__lte=date_to, deleted_at__isnull=True,
+    ).exclude(status__in=["Draft", "Cancelled"]).select_related("salesperson_fk"))
+    cogs_by_invoice = _ledger_cogs(client_id, "SalesInvoice", [inv.id for inv in invoices])
+    collected = {}
+    for doc_id, amount in PaymentAllocation.objects.filter(
+        client_id=client_id, payment_side="in", document_type="SalesInvoice",
+        document_id__in=[inv.id for inv in invoices], deleted_at__isnull=True,
+    ).values_list("document_id", "amount"):
+        collected[doc_id] = collected.get(doc_id, ZERO) + D(amount)
+
+    people = {}
+
+    def row_for(key, name):
+        return people.setdefault(key, {
+            "employeeId": key if key != "-" else None, "name": name, "invoiceCount": 0,
+            "sales": ZERO, "discount": ZERO, "cogs": ZERO, "collection": ZERO,
+            "returns": ZERO, "returnsCogs": ZERO, "incentive": ZERO,
+            "costStatus": "actual", "invoicesWithoutActualCost": [],
+        })
+
+    invoice_owner = {}
+    for inv in invoices:
+        key = str(inv.salesperson_fk_id) if inv.salesperson_fk_id else (inv.salesperson or "-")
+        name = inv.salesperson_fk.name if inv.salesperson_fk_id else (inv.salesperson or "Not assigned")
+        row = row_for(key, name)
+        invoice_owner[inv.id] = key
+        row["invoiceCount"] += 1
+        row["sales"] += D(inv.taxable_value or 0) or (D(inv.total or 0) - D(inv.total_tax or 0))
+        row["discount"] += D(inv.total_discount or 0)
+        row["collection"] += collected.get(inv.id, ZERO)
+        basis = _invoice_cost_basis(inv)
+        if basis == "no-stock":
+            continue
+        posted = cogs_by_invoice.get(inv.id)
+        if posted is None or posted <= ZERO:
+            basis = "missing"
+        else:
+            row["cogs"] += posted
+        if basis != "actual":
+            row["invoicesWithoutActualCost"].append(inv.invoice_number or str(inv.id))
+            if basis == "missing" or row["costStatus"] == "actual":
+                row["costStatus"] = "incomplete" if basis == "missing" else "estimated"
+
+    returns = list(SalesReturn.objects.filter(
+        client_id=client_id, doc_date__gte=date_from, doc_date__lte=date_to, deleted_at__isnull=True,
+    ).exclude(status="Cancelled"))
+    return_cogs = _ledger_cogs(client_id, "SalesReturn", [r.id for r in returns])
+    for sr in returns:
+        key = invoice_owner.get(sr.sales_invoice_id)
+        if key is None:
+            continue
+        people[key]["returns"] += D(sr.taxable_value or 0) or (D(sr.total or 0) - D(sr.total_tax or 0))
+        people[key]["returnsCogs"] += -return_cogs.get(sr.id, ZERO)
+
+    for calc in IncentiveCalculation.objects.filter(
+        client_id=client_id, deleted_at__isnull=True, period_start__lte=date_to, period_end__gte=date_from,
+    ).exclude(status="Reversed"):
+        key = str(calc.salesperson_id or calc.employee_id)
+        if key in people:
+            people[key]["incentive"] += D(calc.incentive_amount or 0)
+
+    rows = []
+    for p in people.values():
+        net_sales = p["sales"] - p["returns"]
+        cogs = round2(p["cogs"] - p["returnsCogs"])
+        gross = round2(net_sales - cogs)
+        contribution = round2(gross - p["incentive"])
+        rows.append({
+            "employeeId": p["employeeId"],
+            "name": p["name"],
+            "invoiceCount": p["invoiceCount"],
+            "netSales": float(round2(net_sales)),
+            "discount": float(round2(p["discount"])),
+            "returns": float(round2(p["returns"])),
+            "collection": float(round2(p["collection"])),
+            "cogs": float(cogs),
+            "grossProfit": float(gross),
+            "gpMarginPct": float(round2(gross / net_sales * Decimal("100"))) if net_sales > ZERO else 0.0,
+            "incentive": float(round2(p["incentive"])),
+            "contribution": float(contribution),
+            "costStatus": p["costStatus"],
+            "invoicesWithoutActualCost": p["invoicesWithoutActualCost"],
+        })
+    rows.sort(key=lambda r: r["netSales"], reverse=True)
+    return {
+        "periodFrom": date_from.isoformat(),
+        "periodTo": date_to.isoformat(),
+        "results": rows,
+        "rows": rows,
+    }
+
+
 def design_colour_analysis(client_id, date_from=None, date_to=None):
     """Fabric Design & Colour Shade production, sales, balance, and ageing (PDF §15)."""
     takas = LotTaka.objects.filter(client_id=client_id, deleted_at__isnull=True).select_related("design", "shade", "fabric_quality")

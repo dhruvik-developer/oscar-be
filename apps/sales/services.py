@@ -545,21 +545,16 @@ def _taka_ids(rows):
     return ids
 
 
-def _line_party_id(line):
-    """The customer of the document a sales line belongs to."""
-    for attr in ("delivery_challan", "sales_invoice", "sales_order"):
-        doc = getattr(line, attr, None)
-        if doc is not None:
-            return doc.party_id
-    return None
+def not_oscar_stock(taka):
+    """A customer's (or third party's) roll is never sold on a sales document.
 
-
-def owned_by_someone_else(taka, party_id):
-    """A customer's (or third party's) roll may only go back to that owner."""
+    It goes back to its owner through "Deliver to owner"
+    (``inventory.batch_services.deliver_to_owner``); OSCAR bills only its
+    processing charge, on a line that holds no stock. Selling the roll itself
+    would book its full value as OSCAR's revenue.
+    """
     batch = getattr(taka, "batch", None)
-    if batch is None or batch.ownership == "OSCAR":
-        return False
-    return str(batch.owner_party_id or "") != str(party_id or "")
+    return batch is not None and batch.ownership != "OSCAR"
 
 
 def own_reserved_taka_ids(line):
@@ -593,7 +588,6 @@ def allocate_takas(client_id, line, stock_qty, location_id):
     label = line.item_name or line.item.name
     selection = getattr(line, "taka_allocations", None) or []
     own_reserved = own_reserved_taka_ids(line)
-    party_id = _line_party_id(line)
     base = LotTaka.objects.select_for_update().filter(
         client_id=client_id, item_id=line.item_id, deleted_at__isnull=True
     )
@@ -622,11 +616,16 @@ def allocate_takas(client_id, line, stock_qty, location_id):
                     f"{taka.qc_status} in QC and cannot be dispatched.",
                     code="QC_BLOCKED",
                 )
-            if owned_by_someone_else(taka, party_id):
+            if "BULK" in (taka.tags or []):
                 raise BusinessRuleViolation(
-                    f"{label}: taka {taka.taka_id or taka.taka_number} belongs to "
-                    f"{taka.batch.owner_party.name if taka.batch.owner_party_id else 'a customer'} "
-                    "and can only be delivered to them.",
+                    f"{label}: {taka.taka_id} is the batch's unregistered bulk metres; register takas first.",
+                    code="REGISTER_TAKAS_FIRST",
+                )
+            if not_oscar_stock(taka):
+                raise BusinessRuleViolation(
+                    f"{label}: taka {taka.taka_id or taka.taka_number} is "
+                    f"{taka.batch.owner_party.name if taka.batch.owner_party_id else 'customer'}'s material. "
+                    "Return it with Deliver to owner and bill only the processing charge.",
                     code="NOT_OSCAR_STOCK",
                 )
             if taka.status == LotTaka.STATUS_RESERVED and str(taka.id) not in own_reserved:
@@ -664,7 +663,8 @@ def allocate_takas(client_id, line, stock_qty, location_id):
     candidates = [
         t for t in candidates
         if (t.status != LotTaka.STATUS_RESERVED or str(t.id) in own_reserved)
-        and not owned_by_someone_else(t, party_id)
+        and not not_oscar_stock(t)
+        and "BULK" not in (t.tags or [])
     ]
     candidates.sort(key=lambda t: 0 if str(t.id) in own_reserved else 1)
     for taka in candidates:
@@ -691,10 +691,7 @@ def post_sale_movements(*, client_id, line, stock_qty, location_id, reference_ty
     movements = []
     wac = None
     for taka, qty in allocate_takas(client_id, line, stock_qty, location_id):
-        if taka is not None and taka.batch_id and taka.batch.ownership != "OSCAR":
-            # The owner's own material going back: not OSCAR's stock, no COGS.
-            unit_cost = ZERO
-        elif taka is not None and D(taka.rate) > ZERO:
+        if taka is not None and D(taka.rate) > ZERO:
             unit_cost = D(taka.rate)
         else:
             if wac is None:

@@ -1737,6 +1737,16 @@ class SalesReturnViewSet(PostedReturnGuardMixin, SalesDocumentViewSet):
                 "qty", "rate", "discount_pct", "tax_pct", "item", "uom", "uom_factor", "updated_at",
             ])
 
+            if stock.normalize_condition(line.condition or "Hold") != "Hold":
+                # Any condition but Hold is a QC decision (Good puts the goods
+                # straight back into usable stock); only QC may make it.
+                from apps.core.permissions import require_permission
+
+                require_permission(
+                    self.request.user, "approve_qc",
+                    "Returned goods go to QC Hold; only QC can accept, regrade or reject them on receipt.",
+                )
+
             if line.item_id and line.item.holds_stock and location_id:
                 # Phase 1.4: route by condition (Good -> return location,
                 # Hold -> QC Hold, Reprocess / Second Quality / Reject -> their
