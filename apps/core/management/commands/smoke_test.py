@@ -32,6 +32,7 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument("--email", default="admin@sweven.test")
         parser.add_argument("--password", default="Sweven@2026")
+        parser.add_argument("--role", default=None, help="Role code to sign in with (default: the account's own).")
 
     def handle(self, *args, **options):
         from django.conf import settings
@@ -128,7 +129,7 @@ class Command(BaseCommand):
         response = self.call(
             "POST",
             "/auth/login/",
-            {"email": self.options_email, "password": self.options_password},
+            {"email": self.options_email, "password": self.options_password, "role": self.login_role()},
             expect=200,
             auth=False,
         )
@@ -472,4 +473,17 @@ class Command(BaseCommand):
     def execute(self, *args, **options):
         self.options_email = options.get("email") or self.options_email
         self.options_password = options.get("password") or self.options_password
+        self.options_role = options.get("role")
         return super().execute(*args, **options)
+
+    def login_role(self):
+        """The role the sign-in form would send: --role, else the account's own."""
+        from apps.accounts.login_roles import ADMIN_CODE
+        from apps.accounts.models import User
+
+        if self.options_role:
+            return self.options_role
+        user = User.objects.filter(email=self.options_email.lower(), deleted_at__isnull=True).select_related("role").first()
+        if user is None:
+            return ""
+        return user.role.code if user.role_id else (ADMIN_CODE if user.is_superuser else "")

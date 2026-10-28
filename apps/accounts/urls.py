@@ -16,6 +16,7 @@ auth_urlpatterns = [
     path("login/verify-otp/", views.LoginVerifyOtpView.as_view(), name="auth-login-verify-otp"),
     path("login/resend-otp/", views.LoginResendOtpView.as_view(), name="auth-login-resend-otp"),
     path("support/", views.SupportInfoView.as_view(), name="auth-support"),
+    path("login-roles/", views.LoginRoleOptionsView.as_view(), name="auth-login-roles"),
     path("login-history/", views.LoginHistoryView.as_view(), name="auth-login-history"),
     path("refresh/", views.RefreshView.as_view(), name="auth-refresh"),
     path("logout/", views.LogoutView.as_view(), name="auth-logout"),

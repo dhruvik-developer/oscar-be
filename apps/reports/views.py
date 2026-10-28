@@ -209,11 +209,15 @@ class ReportView(APIView):
 
     def _report_sales_dashboard(self, request, client_id, date_from, date_to, as_of):
         """The business-position dashboard, every figure computed server-side."""
+        from apps.inventory.views import _can_see_batch_cost
+
         from .dashboard import business_dashboard
 
         day = request.query_params.get("date") or as_of
         try:
-            return Response(business_dashboard(client_id, day=day))
+            return Response(business_dashboard(
+                client_id, day=day, include_batch_profit=_can_see_batch_cost(request.user),
+            ))
         except ValueError:
             raise ValidationFailed(
                 "Date must be YYYY-MM-DD.", field_errors={"date": ["Expected YYYY-MM-DD."]}

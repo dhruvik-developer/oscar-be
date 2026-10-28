@@ -836,3 +836,53 @@ class StockPositionScreenTests(BatchTestBase):
     def test_all_screens_respond(self):
         for screen in ("overview", "samples", "scrap", "usable", "reprocessing", "customer-returns"):
             self.assertEqual(self.api_get(screen).status_code, 200, screen)
+
+
+class DashboardBatchProfitTests(BatchTestBase):
+    """The business dashboard lists profit / loss per batch, losses first."""
+
+    def sell(self, taka, qty, rate):
+        from apps.sales.models import SalesInvoice, SalesInvoiceLine
+
+        invoice = SalesInvoice.objects.create(
+            client=self.tenant, party=self.customer, party_name=self.customer.name,
+            doc_date=timezone.localdate(), invoice_number=f"INV-{uuid.uuid4().hex[:5]}",
+            status="Unpaid", posted_at=timezone.now(),
+        )
+        SalesInvoiceLine.objects.create(
+            sales_invoice=invoice, client=self.tenant, item=self.item, qty=Decimal(qty),
+            rate=Decimal(rate), amount=Decimal(qty) * Decimal(rate),
+        )
+        stock.post_movement(
+            client_id=self.tenant.id, item=self.item, location=self.godown, type="SALE",
+            quantity=-Decimal(qty), reference_type="SalesInvoice", reference_id=invoice.id,
+            reference_number=invoice.invoice_number, lot_taka=taka,
+        )
+
+    def test_loss_making_batch_leads_and_cost_is_ledger_gated(self):
+        from apps.reports import dashboard
+
+        good = self.receive(lot="L-GOOD", meters="100")
+        bad = self.receive(lot="L-BAD", meters="100")
+        self.receive(lot="L-UNSOLD", meters="100")
+        for lot in ("L-GOOD", "L-BAD", "L-UNSOLD"):
+            LotCostEntry.objects.create(client=self.tenant, lot_number=lot, cost_type="Grey purchase", amount=Decimal("5000"))
+        self.sell(good, "100", "80")   # 8,000 - 5,000 = +3,000
+        self.sell(bad, "100", "40")    # 4,000 - 5,000 = -1,000
+
+        result = dashboard._batch_profit(self.tenant.id, timezone.localdate())
+        self.assertEqual(result["batches"], 2)               # the unsold batch is left out
+        self.assertEqual((result["profitable"], result["lossMaking"]), (1, 1))
+        self.assertEqual(result["totalLoss"], Decimal("-1000.00"))
+        self.assertEqual(result["net"], Decimal("2000.00"))
+        worst = result["worst"][0]
+        self.assertEqual(worst["batchCode"], bad.batch.batch_code)
+        self.assertEqual(worst["netResult"], "-1000.00")
+        self.assertEqual(worst["marginPct"], Decimal("-25.00"))
+        self.assertEqual([r["batchCode"] for r in result["best"]], [good.batch.batch_code])
+
+        body = self.api.get("/api/v1/reports/sales-dashboard/").json()
+        self.assertEqual(body["batchProfit"]["lossMaking"], 1)
+        self.assertNotIn("grossProfit", body["kpis"])
+
+        self.assertIsNone(dashboard.business_dashboard(self.tenant.id)["batchProfit"])

@@ -101,13 +101,13 @@ class RBACWorkflowsTestCase(TestCase):
 
     def test_inactive_user_cannot_login(self):
         api = APIClient()
-        res = api.post("/api/v1/auth/login/", {"email": "inactive@oscar.com", "password": "Password123!"})
+        res = api.post("/api/v1/auth/login/", {"email": "inactive@oscar.com", "password": "Password123!", "role": "PURCHASE_OFFICER"})
         self.assertEqual(res.status_code, status.HTTP_401_UNAUTHORIZED)
         self.assertEqual(res.data.get("code"), "ACCOUNT_INACTIVE")
 
     def test_active_user_login_and_me_hydration(self):
         api = APIClient()
-        res = api.post("/api/v1/auth/login/", {"email": "po@oscar.com", "password": "Password123!"})
+        res = api.post("/api/v1/auth/login/", {"email": "po@oscar.com", "password": "Password123!", "role": "PURCHASE_OFFICER"})
         self.assertEqual(res.status_code, status.HTTP_200_OK)
         token = res.data.get("access")
         self.assertTrue(token)
@@ -140,7 +140,7 @@ class RBACWorkflowsTestCase(TestCase):
         )
 
         api_po = APIClient()
-        login_po = api_po.post("/api/v1/auth/login/", {"email": "po@oscar.com", "password": "Password123!"})
+        login_po = api_po.post("/api/v1/auth/login/", {"email": "po@oscar.com", "password": "Password123!", "role": "PURCHASE_OFFICER"})
         api_po.credentials(HTTP_AUTHORIZATION=f"Bearer {login_po.data['access']}")
 
         sub_res = api_po.post(f"/api/v1/purchase/orders/{po.id}/submit-for-approval/")
@@ -161,7 +161,7 @@ class RBACWorkflowsTestCase(TestCase):
         self.assertEqual(self_appr.data.get("code"), "SELF_APPROVAL_NOT_PERMITTED")
 
         api_pm = APIClient()
-        login_pm = api_pm.post("/api/v1/auth/login/", {"email": "pm@oscar.com", "password": "Password123!"})
+        login_pm = api_pm.post("/api/v1/auth/login/", {"email": "pm@oscar.com", "password": "Password123!", "role": "PURCHASE_MGR"})
         api_pm.credentials(HTTP_AUTHORIZATION=f"Bearer {login_pm.data['access']}")
 
         pm_appr = api_pm.post(f"/api/v1/purchase/orders/{po.id}/approve/", {"remarks": "Verified and approved"})
@@ -200,7 +200,7 @@ class RBACWorkflowsTestCase(TestCase):
         )
 
         api_pm = APIClient()
-        login_pm = api_pm.post("/api/v1/auth/login/", {"email": "pm@oscar.com", "password": "Password123!"})
+        login_pm = api_pm.post("/api/v1/auth/login/", {"email": "pm@oscar.com", "password": "Password123!", "role": "PURCHASE_MGR"})
         api_pm.credentials(HTTP_AUTHORIZATION=f"Bearer {login_pm.data['access']}")
 
         ret_res = api_pm.post(
@@ -231,7 +231,7 @@ class RBACWorkflowsTestCase(TestCase):
         )
 
         api_pm = APIClient()
-        login_pm = api_pm.post("/api/v1/auth/login/", {"email": "pm@oscar.com", "password": "Password123!"})
+        login_pm = api_pm.post("/api/v1/auth/login/", {"email": "pm@oscar.com", "password": "Password123!", "role": "PURCHASE_MGR"})
         api_pm.credentials(HTTP_AUTHORIZATION=f"Bearer {login_pm.data['access']}")
 
         badge_res = api_pm.get("/api/v1/approvals/requests/badge/")
@@ -260,7 +260,7 @@ class RBACWorkflowsTestCase(TestCase):
         )
 
         api_admin = APIClient()
-        login_admin = api_admin.post("/api/v1/auth/login/", {"email": "admin@oscar.com", "password": "Password123!"})
+        login_admin = api_admin.post("/api/v1/auth/login/", {"email": "admin@oscar.com", "password": "Password123!", "role": "SYS_ADMIN"})
         api_admin.credentials(HTTP_AUTHORIZATION=f"Bearer {login_admin.data['access']}")
 
         res = api_admin.post(f"/api/v1/purchase/orders/{po.id}/approve/")

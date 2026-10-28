@@ -29,11 +29,12 @@ from apps.core.exceptions import (
 from apps.core.pagination import envelope
 from apps.core.printing import EmailDeliveryFailed
 from apps.core.permissions import AllowPublic, HasModulePermission
-from apps.core.throttling import LoginThrottle, PasswordChangeThrottle
+from apps.core.throttling import LoginThrottle, PasswordChangeThrottle, PublicEndpointThrottle
 from apps.core.viewsets import TenantModelViewSet
 from apps.core.tenancy import set_current_client_id
 
 from .authentication import build_tokens
+from .login_roles import login_role_options, role_matches
 from .login_otp import LOGIN_OTP_TTL, mask_email, resend_challenge, start_challenge, verify_challenge
 from .password_reset import (
     OTP_EXCHANGE_TTL,
@@ -184,6 +185,14 @@ class LoginView(APIView):
         if user.client.status != "Active":
             raise NotAuthenticated(
                 "This workspace is not active.", code="TENANT_INACTIVE"
+            )
+        # Checked only after the password, like the status messages above.
+        # The role is not a failed password guess, so it does not count
+        # towards the lockout.
+        if not role_matches(user, serializer.validated_data["role"]):
+            _audit_login(user, request, "login_failed", "Sign-in refused: selected role is not assigned")
+            raise NotAuthenticated(
+                "The selected role is not assigned to this account.", code="ROLE_MISMATCH"
             )
 
         if user.requires_two_factor:
@@ -648,6 +657,22 @@ class SupportInfoView(APIView):
             "phone": settings.SUPPORT_PHONE,
             "hours": settings.SUPPORT_HOURS,
         })
+
+
+class LoginRoleOptionsView(APIView):
+    """``GET /auth/login-roles/?tenant=`` -- the sign-in page's role list.
+
+    Public: it is shown before sign-in. Returns role labels held by active
+    users only -- never who holds them.
+    """
+
+    authentication_classes = []
+    permission_classes = [AllowPublic]
+    throttle_classes = [PublicEndpointThrottle]
+
+    def get(self, request):
+        slug = (request.query_params.get("tenant") or "").strip() or None
+        return Response({"roles": login_role_options(slug)})
 
 
 class SessionDetailView(APIView):
