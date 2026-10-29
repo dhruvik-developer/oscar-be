@@ -437,6 +437,25 @@ def dispose_receipt(
             receipt, job_work_order, quantities["reprocess"], remarks, user
         )
 
+    verdict = record_receipt_verdict(
+        receipt, quantities, user=user, remarks=remarks, measurements=measurements,
+        stock_posted=not record_only, reprocess_order=reprocess_order,
+    )
+    return {
+        "verdict": verdict,
+        "receipt": receipt,
+        "quantities": quantities,
+        "stockPosted": not record_only,
+        "movements": moved,
+        "reprocessOrder": reprocess_order,
+    }
+
+
+def record_receipt_verdict(receipt, quantities, *, user=None, remarks=None, measurements=None,
+                           stock_posted=True, reprocess_order=None):
+    """Add a QC result to the receipt's running totals and set its verdict,
+    bill QC status and audit trail. Shared by the quantity disposition and
+    the roll-by-roll QC entry. Returns the verdict."""
     meta = _load_meta(receipt)
     cumulative = {
         category: D(str(meta.get("cumulative", {}).get(category, 0)))
@@ -456,7 +475,7 @@ def dispose_receipt(
         "cumulative": {k: str(v) for k, v in cumulative.items()},
         "remarks": remarks or "",
         "measurements": measurements or meta.get("measurements") or [],
-        "stockPosted": not record_only,
+        "stockPosted": stock_posted,
         "reprocessNo": getattr(reprocess_order, "no", None) or meta.get("reprocessNo"),
         "updatedAt": timezone.now().isoformat(),
     }
@@ -488,15 +507,7 @@ def dispose_receipt(
         after={k: str(v) for k, v in quantities.items()},
         comments=remarks or None,
     )
-
-    return {
-        "verdict": verdict,
-        "receipt": receipt,
-        "quantities": quantities,
-        "stockPosted": not record_only,
-        "movements": moved,
-        "reprocessOrder": reprocess_order,
-    }
+    return verdict
 
 
 def _create_reprocess_order(receipt, job_work_order, quantity, remarks, user):

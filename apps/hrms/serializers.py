@@ -94,6 +94,16 @@ class DepartmentSerializer(BaseModelSerializer):
             "description", "employees", "teams", "created_at", "updated_at",
         ]
 
+    def validate(self, attrs):
+        """A department without a code gets one from its name (Dyeing -> DYEING)."""
+        from apps.masters.serializers import slug_code, unique_code
+
+        attrs = super().validate(attrs)
+        if self.instance is None and not attrs.get("code"):
+            peers = Department.objects.filter(client_id=self.context.get("client_id"), deleted_at__isnull=True)
+            attrs["code"] = unique_code(peers, slug_code(attrs.get("name"), "DEPT"))
+        return attrs
+
     def get_employees(self, department):
         return getattr(department, "employee_count", None)
 

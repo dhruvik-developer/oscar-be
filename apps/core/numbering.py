@@ -48,6 +48,10 @@ SERIES_DEFAULTS = {
     "LOT": ("LOT", "fy", 5, "-"),
     # Permanent fabric batch ID, kept through every process: OSCAR-GRY-2026-0001
     "BAT": ("OSCAR-GRY", "yearly", 4, "-"),
+    # A batch that comes in already dyed: OSCAR-DYD-2026-0001
+    "BATD": ("OSCAR-DYD", "yearly", 4, "-"),
+    # QC started from a batch (send to QC, inspection result)
+    "BQC": ("BQC", "fy", 4, "-"),
     # QC reprocess orders (JWOReprocess)
     "RP": ("RP", "fy", 4, "-"),
     # Accounts

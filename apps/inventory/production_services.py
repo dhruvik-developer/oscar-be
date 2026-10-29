@@ -58,7 +58,9 @@ def _audit(run, user, action, description, after=None):
 
 
 @transaction.atomic
-def create_run(*, client, output_item, planned_qty, user=None, **fields):
+def create_run(*, client, output_item, planned_qty, user=None, open_batch=False, **fields):
+    """``open_batch`` opens the run's grey batch now (so production can be
+    entered day by day from the batch); otherwise the first output opens it."""
     planned_qty = round4(D(planned_qty or 0))
     if planned_qty <= ZERO:
         raise ValidationFailed("Enter the planned quantity.", field_errors={"plannedQty": ["Must be above 0."]})
@@ -71,12 +73,32 @@ def create_run(*, client, output_item, planned_qty, user=None, **fields):
         created_by=user if getattr(user, "is_authenticated", False) else None,
         **fields,
     )
+    if open_batch:
+        from .batch_services import batch_series, set_ownership
+        from .models import Batch
+
+        run.batch = Batch.objects.create(
+            client_id=run.client_id,
+            batch_code=allocate_number(run.client_id, batch_series("GREY"), run.run_date),
+            origin="PRODUCTION",
+            fabric_type="GREY",
+            item=output_item,
+            source_document_type="ProductionRun",
+            source_document_number=run.run_number,
+            source_document_id=run.id,
+            created_on=run.run_date,
+            uom=run.uom,
+        )
+        run.save(update_fields=["batch", "updated_at"])
+        if run.customer_id:
+            set_ownership(run.batch, ownership="CUSTOMER", owner_party_id=run.customer_id, user=user,
+                          reason=f"Manufactured for the customer on {run.run_number}")
     _audit(run, user, "create", f"Production run {run.run_number} created")
     return run
 
 
 @transaction.atomic
-def issue_material(run, *, item, location, quantity, customer_supplied=False, user=None):
+def issue_material(run, *, item, location, quantity, customer_supplied=False, yarn_lot=None, user=None):
     """Issue yarn / raw material to the run: stock goes down now, at WAC,
     and its cost moves from Inventory to Work in Progress."""
     from apps.accounting import services as ledger
@@ -106,6 +128,7 @@ def issue_material(run, *, item, location, quantity, customer_supplied=False, us
     issue = ProductionMaterialIssue.objects.create(
         client_id=run.client_id, run=run, item=item, location=location, quantity=quantity,
         unit_cost=unit_cost, amount=round2(unit_cost * quantity), customer_supplied=customer_supplied,
+        yarn_lot=(yarn_lot or "").strip() or None,
         movement=movement, created_by=user if getattr(user, "is_authenticated", False) else None,
     )
     # Dr Work in Progress | Cr Inventory -- at the cost the stock left at.
@@ -133,11 +156,68 @@ def issue_material(run, *, item, location, quantity, customer_supplied=False, us
 
 
 @transaction.atomic
-def record_output(run, *, rolls, user=None):
+def return_material(run, *, issue, quantity, user=None):
+    """Unused yarn / material goes back to the store it was issued from, at
+    the cost it left at: a reversing issue row (negative quantity), stock in,
+    and Dr Inventory | Cr Work in Progress. Never more than is still out."""
+    from apps.accounting import services as ledger
+
+    run = _locked(run)
+    _assert_open(run)
+    issue = ProductionMaterialIssue.objects.select_for_update().filter(
+        client_id=run.client_id, run=run, pk=getattr(issue, "pk", issue), deleted_at__isnull=True,
+        quantity__gt=0,
+    ).select_related("item", "location").first()
+    if issue is None:
+        raise ValidationFailed("Choose the issue the material is returned from.", field_errors={"issueId": ["Not found."]})
+    quantity = round4(D(quantity or 0))
+    if quantity <= ZERO:
+        raise ValidationFailed("Enter the quantity returned.", field_errors={"quantity": ["Must be above 0."]})
+    returned = -sum((D(r.quantity) for r in issue.returns.filter(deleted_at__isnull=True)), ZERO)
+    outstanding = D(issue.quantity) - returned
+    if quantity > outstanding:
+        raise BusinessRuleViolation(
+            f"Only {round4(outstanding)} of this issue is still with the run ({returned} already returned).",
+            code="OVER_RETURN",
+        )
+    movement = stock.post_movement(
+        client_id=run.client_id, item=issue.item, location=issue.location, type="PRODUCTION_ISSUE",
+        quantity=quantity, unit_cost=issue.unit_cost, reference_type="ProductionRun", reference_id=run.id,
+        reference_number=run.run_number, notes="Unused material returned", user=user,
+    )
+    amount = round2(D(issue.unit_cost) * quantity)
+    back = ProductionMaterialIssue.objects.create(
+        client_id=run.client_id, run=run, item=issue.item, location=issue.location, quantity=-quantity,
+        unit_cost=issue.unit_cost, amount=-amount, customer_supplied=issue.customer_supplied,
+        yarn_lot=issue.yarn_lot, returns_issue=issue, movement=movement,
+        created_by=user if getattr(user, "is_authenticated", False) else None,
+    )
+    if amount > ZERO:
+        _post_journal(
+            run,
+            postings=[
+                ledger.debit(ledger.system_account(run.client_id, "stock"), amount,
+                             description=f"{issue.item.name} returned from {run.run_number}"),
+                ledger.credit(ledger.system_account(run.client_id, "wip"), amount,
+                              description=f"{run.run_number}: {quantity} {issue.item.name} returned"),
+            ],
+            source_type="ProductionIssue",
+            source_id=back.id,
+            narration=f"Production {run.run_number}: unused {issue.item.name} returned",
+            entry_date=back.issued_on,
+            user=user,
+        )
+    _audit(run, user, "return_material", f"Returned {quantity} {issue.item.name}")
+    return back
+
+
+@transaction.atomic
+def record_output(run, *, rolls, on_date=None, user=None):
     """Record produced rolls: each becomes a taka of the run's batch at QC Hold.
 
     ``rolls`` = [{meters, weightKg?, width?}]. Partial output is fine; later
-    rolls join the same lot and batch.
+    rolls join the same lot and batch. ``on_date`` is the production day
+    (daily entry); it defaults to today and cannot be in the future.
     """
     from apps.inventory.batch_services import set_ownership
 
@@ -146,6 +226,17 @@ def record_output(run, *, rolls, user=None):
     rolls = [r for r in (rolls or []) if D(r.get("meters") or 0) > ZERO]
     if not rolls:
         raise ValidationFailed("Enter at least one roll with metres.", field_errors={"rolls": ["Required."]})
+    if isinstance(on_date, str):
+        from datetime import date
+
+        try:
+            on_date = date.fromisoformat(on_date[:10])
+        except ValueError:
+            raise ValidationFailed("Date must be YYYY-MM-DD.", field_errors={"date": ["Invalid date."]})
+    if on_date and on_date > timezone.localdate():
+        raise ValidationFailed("Production cannot be entered for a future day.", field_errors={"date": ["Future date."]})
+    if on_date and on_date < run.run_date:
+        raise ValidationFailed("That day is before the run started.", field_errors={"date": ["Before run date."]})
     qc_location = stock.system_location(run.client_id, "QC_HOLD")
     if not run.lot_number:
         run.lot_number = allocate_number(run.client_id, "LOT")
@@ -156,6 +247,8 @@ def record_output(run, *, rolls, user=None):
         taka_code = allocate_number(run.client_id, "TAK")
         taka = LotTaka.objects.create(
             client_id=run.client_id,
+            # A run opened with its batch fills that batch.
+            batch_id=run.batch_id,
             item=run.output_item,
             fabric_quality=run.fabric_quality,
             shade=run.shade,
@@ -175,6 +268,7 @@ def record_output(run, *, rolls, user=None):
             source_document_type="Production",
             source_document_id=run.id,
             source_document_number=run.run_number,
+            **({"received_date": on_date} if on_date else {}),
         )
         stock.post_movement(
             client_id=run.client_id,
@@ -186,6 +280,7 @@ def record_output(run, *, rolls, user=None):
             reference_id=run.id,
             reference_number=run.run_number,
             lot_taka=taka,
+            movement_date=on_date,
             user=user,
         )
         created.append(taka)
@@ -446,16 +541,21 @@ def serialize_run(run):
         "costsPosted": run.costs_posted,
         "notes": run.notes,
         "issues": [{
-            "id": str(i.id), "item": i.item.name, "location": i.location.name,
+            "id": str(i.id), "item": i.item.name, "uom": i.item.uom, "location": i.location.name,
             "quantity": str(i.quantity), "unitCost": str(i.unit_cost), "amount": str(i.amount),
             "customerSupplied": i.customer_supplied, "issuedOn": i.issued_on.isoformat(),
-        } for i in run.issues.filter(deleted_at__isnull=True).select_related("item", "location")],
+            "yarnLot": i.yarn_lot,
+            "returnsIssueId": str(i.returns_issue_id) if i.returns_issue_id else None,
+            "returnedQty": str(-sum((D(r.quantity) for r in i.returns.all() if r.deleted_at is None), ZERO)),
+        } for i in run.issues.filter(deleted_at__isnull=True).select_related("item", "location")
+            .prefetch_related("returns")],
         "expenses": [{
             "id": str(e.id), "costType": e.cost_type, "amount": str(e.amount), "remarks": e.remarks,
         } for e in run.expenses.filter(deleted_at__isnull=True)],
         "rolls": [{
             "id": str(t.id), "takaId": t.taka_id, "meters": str(t.received_quantity),
-            "status": t.status, "qcStatus": t.qc_status,
+            "status": t.status, "qcStatus": t.qc_status, "date": t.received_date.isoformat()
+            if hasattr(t.received_date, "isoformat") else t.received_date,
         } for t in takas if t.parent_taka_id is None],
         "accounting": run_accounting(run),
     }

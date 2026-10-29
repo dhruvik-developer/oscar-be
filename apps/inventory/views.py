@@ -2824,6 +2824,77 @@ class QCDashboardView(APIView):
         })
 
 
+class QCEntryView(APIView):
+    """
+    GET  /inventory/qc/entry/?stage=grey|dyeing   lots with rolls waiting at QC Hold
+    GET  /inventory/qc/entry/?key=<lot key>        that lot's rolls (with the saved draft)
+    POST /inventory/qc/entry/  {key, rolls: [{lotTakaId, actualMeter?, weightKg?, width?, gsm?,
+                                result, remarks?, defects?: [{defectId, count?}]}],
+                                approve?, locationId?, jwoId?, remarks?}
+    Roll-by-roll QC (see ``qc_entry``). Approving moves the stock.
+    """
+
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_inventory"]
+
+    def get(self, request):
+        from . import qc_entry
+
+        key = request.query_params.get("key")
+        if key:
+            return Response(qc_entry.lot_detail(request.client_id, key))
+        stage = _qc_stage(request)
+        return Response({"results": qc_entry.waiting_lots(
+            request.client_id, stage=stage if stage in ("grey", "dyeing") else None)})
+
+    def post(self, request):
+        from apps.core.permissions import require_permission
+
+        from . import qc_entry
+
+        approve = bool(request.data.get("approve"))
+        require_permission(request.user, "approve_qc" if approve else "manage_inventory",
+                           "Approving QC needs QC approval rights." if approve else None)
+        return Response(qc_entry.save_qc(
+            client=request.user.client, key=request.data.get("key"), rolls=request.data.get("rolls"),
+            approve=approve, location_id=request.data.get("locationId") or None,
+            jwo_id=request.data.get("jwoId") or None, remarks=request.data.get("remarks") or None,
+            user=request.user,
+        ))
+
+
+class QCReprocessStockView(APIView):
+    """GET /inventory/qc/reprocess-stock/ -- rolls in reprocess stock, by batch, with open reprocess orders."""
+
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_inventory"]
+
+    def get(self, request):
+        from .qc_entry import reprocess_rolls
+
+        return Response({"results": reprocess_rolls(request.client_id)})
+
+
+class QCWorkView(APIView):
+    """
+    GET /inventory/qc/work/?stage=grey|dyeing&q=&state=waiting|inspected|hold|rework|done
+    One QC worklist: every lot with its state and the one next step (see
+    ``qc_work``). Saving uses /qc/disposition/ and /qc/reinspection/.
+    """
+
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_inventory"]
+
+    def get(self, request):
+        from .qc_work import qc_worklist
+
+        stage = _qc_stage(request)
+        return Response(qc_worklist(
+            request.client_id, stage=stage if stage in ("grey", "dyeing") else None,
+            q=request.query_params.get("q") or None, state=request.query_params.get("state") or None,
+        ))
+
+
 class QCPendingInspectionsView(APIView):
     """
     GET /inventory/qc/pending/
@@ -3537,9 +3608,8 @@ class QCRegisterView(APIView):
         if item is None:
             field_errors["itemId"] = ["Choose the item."]
 
+        # Blank: allocated from the LOT series once the entry is valid.
         lot_no = (data.get("lotNo") or "").strip()
-        if not lot_no:
-            field_errors["lotNo"] = ["Enter the lot number."]
         try:
             received_qty = round4(D(data.get("receivedQty")))
         except Exception:  # noqa: BLE001
@@ -3563,6 +3633,8 @@ class QCRegisterView(APIView):
 
         with transaction.atomic():
             grn_no = allocate_number(request.user.client, "GRN", rec_date)
+            if not lot_no:
+                lot_no = allocate_number(request.user.client, "LOT", rec_date)
             grn = GoodsReceipt.objects.create(
                 client_id=client_id,
                 grn_number=grn_no,
@@ -6004,10 +6076,44 @@ def _can_see_batch_cost(user):
     return "*" in granted or "view_ledger" in granted
 
 
+def _batch_permissions(user):
+    """Which Batch 360 operations this user may start (the server checks each
+    again; this only decides which buttons the screen shows)."""
+    from apps.core.permissions import has_permission
+
+    return {
+        "adjustStock": has_permission(user, "adjust_stock"),
+        "qc": has_permission(user, "approve_qc"),
+        "production": has_permission(user, "enter_production"),
+        "verifyProduction": has_permission(user, "verify_production"),
+        "jobWork": has_permission(user, "manage_jobwork"),
+        "sell": has_permission(user, "create_invoice") or has_permission(user, "create_sales_order"),
+        "purchaseReturn": has_permission(user, "approve_qc"),
+        "cost": _can_see_batch_cost(user),
+    }
+
+
+def _batch_body(request, batch, status_code=status.HTTP_200_OK, **extra):
+    """The Batch 360 detail as every batch endpoint returns it."""
+    from .batch_services import serialize_batch
+
+    include_cost = _can_see_batch_cost(request.user)
+    body = serialize_batch(batch, include_cost=include_cost, detail=True)
+    body["canSeeCost"] = include_cost
+    body["permissions"] = _batch_permissions(request.user)
+    body.update(extra)
+    return Response(body, status=status_code)
+
+
 class BatchListView(APIView):
     """
     GET /inventory/batches/?q=&origin=&ownership=&supplierId=&from=&to=&status=&page=&page_size=
+        &itemId=&designId=&shadeId=&locationId=&holding=available|reserved|qcHold|rework|
+         secondQuality|rejected|withJobWorker
     The batch registry: one row per permanent batch ID with derived quantities.
+    Design / shade / godown / holding look at the rolls in hand, so "navy in
+    Surat" finds every batch with such a roll. ``summary`` totals the stock of
+    all matching batches (not just the page).
     """
     permission_classes = [HasModulePermission]
     required_permissions = ["view_inventory"]
@@ -6030,7 +6136,7 @@ class BatchListView(APIView):
                 | Q(takas__lot_number__icontains=q)
                 | Q(takas__taka_id__icontains=q)
             ).distinct()
-        for param, field in (("origin", "origin"), ("ownership", "ownership"),
+        for param, field in (("origin", "origin"), ("ownership", "ownership"), ("fabricType", "fabric_type"),
                              ("supplierId", "supplier_id"), ("itemId", "item_id")):
             if params.get(param):
                 qs = qs.filter(**{field: params[param]})
@@ -6038,6 +6144,12 @@ class BatchListView(APIView):
             qs = qs.filter(created_on__gte=params["from"])
         if params.get("to"):
             qs = qs.filter(created_on__lte=params["to"])
+        # Roll-level filters, in one condition so the same roll must match them all.
+        from .batch_services import roll_filter, stock_totals
+
+        roll = roll_filter(params, prefix="takas__")
+        if roll is not None:
+            qs = qs.filter(roll).distinct()
         qs = qs.order_by("-created_on", "-created_at")
 
         try:
@@ -6058,15 +6170,17 @@ class BatchListView(APIView):
             rows = [serialize_batch(b, include_cost=with_cost) for b in qs[(page - 1) * page_size: page * page_size]]
         body = envelope(rows, count=total, page=page, page_size=page_size)
         body["canSeeCost"] = _can_see_batch_cost(request.user)
+        body["summary"] = stock_totals(request.client_id, qs.values("id"), roll_filter(params))
         return Response(body)
 
     def post(self, request):
         """POST /inventory/batches/ -- add OSCAR's own fabric by hand.
-        { itemId, locationId, rolls: [{meters}], rate, reason, supplierId?, fabricQualityId?,
-          shadeId?, width?, gsm?, date?, sendToQc? }  The batch code is generated, never sent."""
+        { itemId, locationId, rolls: [{meters}], rate, reason, fabricType?: GREY|DYED, supplierId?,
+          fabricQualityId?, designId?, shadeId?, width?, gsm?, date?, reference?, sendToQc? }
+        The batch code is generated, never sent. QC is optional (sendToQc)."""
         from apps.core.permissions import require_permission
 
-        from .batch_services import create_manual_batch, serialize_batch
+        from .batch_services import create_manual_batch
 
         require_permission(request.user, "adjust_stock", "Adding stock by hand needs stock adjustment rights.")
         data = request.data
@@ -6084,13 +6198,12 @@ class BatchListView(APIView):
             total_meters=data.get("totalMeters"),
             rate=data.get("rate"), reason=data.get("reason"), supplier=pick(Party, "supplierId"),
             fabric_quality=pick(FabricQuality, "fabricQualityId"), shade=pick(Shade, "shadeId"),
+            design=pick(Design, "designId"), fabric_type=data.get("fabricType") or "GREY",
+            reference=(data.get("reference") or "").strip() or None, hsn_code=data.get("hsnCode"),
             width=data.get("width") or None, gsm=data.get("gsm") or None,
             received_on=data.get("date") or None, send_to_qc=bool(data.get("sendToQc")), user=request.user,
         )
-        include_cost = _can_see_batch_cost(request.user)
-        body = serialize_batch(batch, include_cost=include_cost, detail=True)
-        body["canSeeCost"] = include_cost
-        return Response(body, status=status.HTTP_201_CREATED)
+        return _batch_body(request, batch, status.HTTP_201_CREATED)
 
 
 class BatchEligibleStockView(APIView):
@@ -6178,10 +6291,7 @@ class BatchLossView(APIView):
             outcome=data.get("outcome") or "PENDING", reference=data.get("reference"),
             notes=data.get("notes"), loss_date=data.get("date") or None, user=request.user,
         )
-        include_cost = _can_see_batch_cost(request.user)
-        body = serialize_batch(batch, include_cost=include_cost, detail=True)
-        body["canSeeCost"] = include_cost
-        return Response(body, status=status.HTTP_201_CREATED)
+        return _batch_body(request, batch, status.HTTP_201_CREATED)
 
     def patch(self, request, loss_id):
         from apps.core.permissions import require_permission
@@ -6201,10 +6311,7 @@ class BatchLossView(APIView):
             recovered_amount=data.get("recoveredAmount"), reference=data.get("reference"),
             notes=data.get("notes"),
         )
-        include_cost = _can_see_batch_cost(request.user)
-        body = serialize_batch(loss.batch, include_cost=include_cost, detail=True)
-        body["canSeeCost"] = include_cost
-        return Response(body)
+        return _batch_body(request, loss.batch)
 
 
 class CustomerMaterialView(APIView):
@@ -6244,7 +6351,7 @@ class CustomerMaterialView(APIView):
                 client=request.user.client, customer=customer, item=item, location=location,
                 rolls=data.get("rolls"), total_meters=data.get("totalMeters"),
                 reference=data.get("reference"), user=request.user,
-                received_on=data.get("date") or None,
+                received_on=data.get("date") or None, fabric_type=data.get("fabricType") or "GREY",
             )
             body = serialize_batch(batch, detail=True)
             body["receiptNumber"] = number
@@ -6254,11 +6361,7 @@ class CustomerMaterialView(APIView):
             return Response({"message": f"No batch found for '{code}'.", "code": "NOT_FOUND"},
                             status=status.HTTP_404_NOT_FOUND)
         number = deliver_to_owner(batch, rolls=data.get("rolls"), reference=data.get("reference"), user=request.user)
-        include_cost = _can_see_batch_cost(request.user)
-        body = serialize_batch(batch, include_cost=include_cost, detail=True)
-        body["canSeeCost"] = include_cost
-        body["deliveryNumber"] = number
-        return Response(body)
+        return _batch_body(request, batch, deliveryNumber=number)
 
 
 class BatchTakaRegistrationView(APIView):
@@ -6280,10 +6383,7 @@ class BatchTakaRegistrationView(APIView):
             return Response({"message": f"No batch found for '{code}'.", "code": "NOT_FOUND"},
                             status=status.HTTP_404_NOT_FOUND)
         register_takas(batch, takas=request.data.get("takas"), user=request.user)
-        include_cost = _can_see_batch_cost(request.user)
-        body = serialize_batch(batch, include_cost=include_cost, detail=True)
-        body["canSeeCost"] = include_cost
-        return Response(body, status=status.HTTP_201_CREATED)
+        return _batch_body(request, batch, status.HTTP_201_CREATED)
 
 
 class StockPositionScreenView(APIView):
@@ -6365,10 +6465,7 @@ class BatchDetailView(APIView):
                 {"message": f"No batch found for '{code}'.", "code": "NOT_FOUND"},
                 status=status.HTTP_404_NOT_FOUND,
             )
-        include_cost = _can_see_batch_cost(request.user)
-        data = serialize_batch(batch, include_cost=include_cost, detail=True)
-        data["canSeeCost"] = include_cost
-        return Response(data)
+        return _batch_body(request, batch)
 
     def patch(self, request, code):
         """Set ownership: { ownership: OSCAR|CUSTOMER|THIRD_PARTY, ownerPartyId?, reason? }."""
@@ -6388,10 +6485,74 @@ class BatchDetailView(APIView):
             user=request.user,
             reason=request.data.get("reason"),
         )
-        include_cost = _can_see_batch_cost(request.user)
-        data = serialize_batch(batch, include_cost=include_cost, detail=True)
-        data["canSeeCost"] = include_cost
-        return Response(data)
+        return _batch_body(request, batch)
+
+
+class BatchActionView(APIView):
+    """
+    POST /inventory/batches/<code>/actions/<action>/  -- operations started from Batch 360:
+         send-to-qc   {lotTakaIds?, quantity?, remarks?}           QC is optional; this starts it
+         qc           {goodQty, secondQualityQty, reprocessQty, rejectedQty, holdQty, locationId,
+                       remarks?, loss?: {cause, responsiblePartyId?, outcome?, process?}}
+         rework-done  {lotTakaIds?, quantity?, cost?, remarks?}     reworked rolls back to QC
+         yarn         {yarnItemId | yarnName, yarnLot?, yarnCount?, supplierId?, uom?, issuedQty,
+                       consumedQty?, returnedQty?, wasteQty?, rate?, date?, remarks?}
+         yarn-delete  {yarnId}
+         fabric-type  {fabricType: GREY|DYED, reason?}
+    Returns the refreshed batch. Sale, dyeing, purchase return and scrap use
+    their own documents / endpoints.
+    """
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_inventory"]
+    ACTION_PERMISSION = {
+        "send-to-qc": "approve_qc",
+        "qc": "approve_qc",
+        "rework-done": "approve_qc",
+        "yarn": "enter_production",
+        "yarn-delete": "enter_production",
+        "fabric-type": "adjust_stock",
+    }
+
+    def post(self, request, code, action_name):
+        from apps.core.permissions import require_permission
+
+        from . import batch360_services as b360
+        from . import qc as qc_service
+        from .batch_services import find_batch
+
+        if action_name not in self.ACTION_PERMISSION:
+            return Response({"message": "Unknown action.", "code": "NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
+        require_permission(request.user, self.ACTION_PERMISSION[action_name])
+        batch = find_batch(request.client_id, code)
+        if batch is None:
+            return Response({"message": f"No batch found for '{code}'.", "code": "NOT_FOUND"},
+                            status=status.HTTP_404_NOT_FOUND)
+        data = request.data
+        extra = {}
+        if action_name == "send-to-qc":
+            extra["reference"] = b360.send_to_qc(batch, lot_taka_ids=data.get("lotTakaIds") or None,
+                                                 quantity=data.get("quantity"), remarks=data.get("remarks"),
+                                                 user=request.user)
+        elif action_name == "qc":
+            extra["reference"], extra["movements"] = b360.record_qc(
+                batch, quantities=qc_service.parse_quantities(data), good_location_id=data.get("locationId"),
+                remarks=data.get("remarks"), loss=data.get("loss") or None, user=request.user,
+            )
+        elif action_name == "rework-done":
+            cost = data.get("cost")
+            if cost not in (None, "", 0, "0"):
+                require_permission(request.user, "view_ledger", "Adding a rework cost needs ledger access.")
+            extra["reference"] = b360.rework_done(batch, lot_taka_ids=data.get("lotTakaIds") or None,
+                                                  quantity=data.get("quantity"), cost=cost,
+                                                  remarks=data.get("remarks"), user=request.user)
+        elif action_name == "yarn":
+            b360.add_yarn(batch, data, user=request.user)
+        elif action_name == "yarn-delete":
+            b360.delete_yarn(batch, data.get("yarnId"), user=request.user)
+        else:
+            b360.set_fabric_type(batch, data.get("fabricType"), reason=data.get("reason"), user=request.user)
+        batch.refresh_from_db()
+        return _batch_body(request, batch, **extra)
 
 
 class ProductionRunListView(APIView):
@@ -6455,9 +6616,14 @@ class ProductionRunListView(APIView):
             "responsible": request.user,
         }
         if data.get("runDate"):
-            fields["run_date"] = data["runDate"]
+            from datetime import date as _d
+
+            try:
+                fields["run_date"] = _d.fromisoformat(str(data["runDate"])[:10])
+            except ValueError:
+                raise ValidationFailed("Run date must be YYYY-MM-DD.", field_errors={"runDate": ["Invalid date."]})
         run = create_run(client=request.user.client, output_item=item, planned_qty=data.get("plannedQty"),
-                         user=request.user, **fields)
+                         user=request.user, open_batch=bool(data.get("openBatch")), **fields)
         return Response(serialize_run(run), status=status.HTTP_201_CREATED)
 
 
@@ -6465,8 +6631,9 @@ class ProductionRunDetailView(APIView):
     """
     GET  /inventory/production-runs/<id>/
     POST /inventory/production-runs/<id>/<action>/  action in
-         issue    {itemId, locationId, quantity, customerSupplied?}
-         output   {rolls: [{meters, weightKg?, width?}]}
+         issue    {itemId, locationId, quantity, customerSupplied?, yarnLot?}
+         return   {issueId, quantity}            unused material back to its store
+         output   {rolls: [{meters, weightKg?, width?}], date?}   date = production day
          expense  {costType, amount, remarks?}
          qc       {goodQty, secondQualityQty, reprocessQty, rejectedQty, holdQty, locationId, remarks?}
          complete {wastageQty?, wastageUom?}
@@ -6475,6 +6642,7 @@ class ProductionRunDetailView(APIView):
     required_permissions = ["view_production"]
     ACTION_PERMISSION = {
         "issue": "enter_production",
+        "return": "enter_production",
         "output": "enter_production",
         "expense": "enter_production",
         "qc": "approve_qc",
@@ -6517,9 +6685,12 @@ class ProductionRunDetailView(APIView):
                 raise ValidationFailed("Choose the material and the location it is issued from.",
                                        field_errors={"itemId": ["Required."], "locationId": ["Required."]})
             prod.issue_material(run, item=item, location=location, quantity=data.get("quantity"),
-                                customer_supplied=bool(data.get("customerSupplied")), user=request.user)
+                                customer_supplied=bool(data.get("customerSupplied")),
+                                yarn_lot=data.get("yarnLot"), user=request.user)
+        elif action_name == "return":
+            prod.return_material(run, issue=data.get("issueId"), quantity=data.get("quantity"), user=request.user)
         elif action_name == "output":
-            prod.record_output(run, rolls=data.get("rolls"), user=request.user)
+            prod.record_output(run, rolls=data.get("rolls"), on_date=data.get("date") or None, user=request.user)
         elif action_name == "expense":
             prod.add_expense(run, cost_type=data.get("costType"), amount=data.get("amount"),
                              remarks=data.get("remarks"), user=request.user)

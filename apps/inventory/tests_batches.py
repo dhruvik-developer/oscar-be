@@ -360,6 +360,33 @@ class PurchaseOrderBatchTests(BatchTestBase):
         self.assertEqual(first.batch.source_document_number, "PO-77")
         self.assertEqual(first.batch.supplier_id, self.vendor.id)
 
+    def test_each_hsn_of_a_po_gets_its_own_batch(self):
+        from apps.purchase.models import GoodsReceipt, PurchaseOrder
+
+        self.item.hsn_code = "52083190"
+        self.item.save(update_fields=["hsn_code"])
+        poly = Item.objects.create(
+            client=self.tenant, name="Grey Poly", sku=f"GP-{uuid.uuid4().hex[:5]}",
+            item_kind="Fabric", uom="Meter", hsn_code="54075290",
+        )
+        po = PurchaseOrder.objects.create(client=self.tenant, party=self.vendor, po_number="PO-79", doc_date=date(2026, 9, 1))
+        receipts = [
+            GoodsReceipt.objects.create(client=self.tenant, party=self.vendor, purchase_order=po, grn_number=n,
+                                        receipt_date=date(2026, 9, 5), location=self.godown)
+            for n in ("GRN-4", "GRN-5")
+        ]
+        cotton = self.grn_taka(receipts[0], "LOT-D")
+        polyester = LotTaka.objects.create(
+            client=self.tenant, item=poly, location=self.godown, lot_number="LOT-F", taka_number="1",
+            taka_id=f"TAK-{uuid.uuid4().hex[:6]}", received_quantity=Decimal("100"),
+            source_document_type="GRN", source_document_id=receipts[0].id, source_document_number="GRN-4",
+        )
+        more_cotton = self.grn_taka(receipts[1], "LOT-G")
+        self.assertNotEqual(cotton.batch_id, polyester.batch_id)
+        self.assertEqual(cotton.batch_id, more_cotton.batch_id)
+        self.assertEqual(batch_services.serialize_batch(cotton.batch)["hsnCodes"], ["52083190"])
+        self.assertEqual(batch_services.serialize_batch(polyester.batch)["hsnCodes"], ["54075290"])
+
 
 class BatchLossCostingTests(BatchTestBase):
     """Normal loss is absorbed by good fabric; a vendor-fault rejection is a claim."""
@@ -664,6 +691,14 @@ class ManualBatchTests(BatchTestBase):
                          {"stock": (Decimal("6000.00"), Decimal("0")), "stock_adjustment": (Decimal("0"), Decimal("6000.00"))})
         second = self.add().json()["batchCode"]
         self.assertNotEqual(second, body["batchCode"])
+
+    def test_hsn_typed_on_the_batch_fills_the_item_master_only_when_missing(self):
+        self.assertEqual(self.add(hsnCode=" 52083190 ").status_code, 201)
+        self.item.refresh_from_db()
+        self.assertEqual(self.item.hsn_code, "52083190")
+        self.assertEqual(self.add(hsnCode="99999999").status_code, 201)
+        self.item.refresh_from_db()
+        self.assertEqual(self.item.hsn_code, "52083190")
 
     def test_rate_and_reason_are_required(self):
         self.assertEqual(self.add(rate="0").status_code, 400)

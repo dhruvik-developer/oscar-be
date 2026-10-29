@@ -28,9 +28,10 @@ from apps.core.exceptions import BusinessRuleViolation, Conflict, ValidationFail
 from apps.core.numbering import allocate_number
 
 from . import services as stock
+from .models import RELEASED_QC_STATUSES
 
 SYSTEM_PREFIX = "SYS-"
-SELLABLE_QC = ("Passed", "Pass")
+SELLABLE_QC = RELEASED_QC_STATUSES
 #: Taka statuses that may be reserved for a transfer.
 FREE_STATUSES = ("Available", "Active")
 OPEN_STATUSES = ("Requested", "Approved", "In Transit", "Partially Received")
