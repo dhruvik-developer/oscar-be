@@ -360,6 +360,33 @@ class PurchaseOrderBatchTests(BatchTestBase):
         self.assertEqual(first.batch.source_document_number, "PO-77")
         self.assertEqual(first.batch.supplier_id, self.vendor.id)
 
+    def test_each_hsn_of_a_po_gets_its_own_batch(self):
+        from apps.purchase.models import GoodsReceipt, PurchaseOrder
+
+        self.item.hsn_code = "52083190"
+        self.item.save(update_fields=["hsn_code"])
+        poly = Item.objects.create(
+            client=self.tenant, name="Grey Poly", sku=f"GP-{uuid.uuid4().hex[:5]}",
+            item_kind="Fabric", uom="Meter", hsn_code="54075290",
+        )
+        po = PurchaseOrder.objects.create(client=self.tenant, party=self.vendor, po_number="PO-79", doc_date=date(2026, 9, 1))
+        receipts = [
+            GoodsReceipt.objects.create(client=self.tenant, party=self.vendor, purchase_order=po, grn_number=n,
+                                        receipt_date=date(2026, 9, 5), location=self.godown)
+            for n in ("GRN-4", "GRN-5")
+        ]
+        cotton = self.grn_taka(receipts[0], "LOT-D")
+        polyester = LotTaka.objects.create(
+            client=self.tenant, item=poly, location=self.godown, lot_number="LOT-F", taka_number="1",
+            taka_id=f"TAK-{uuid.uuid4().hex[:6]}", received_quantity=Decimal("100"),
+            source_document_type="GRN", source_document_id=receipts[0].id, source_document_number="GRN-4",
+        )
+        more_cotton = self.grn_taka(receipts[1], "LOT-G")
+        self.assertNotEqual(cotton.batch_id, polyester.batch_id)
+        self.assertEqual(cotton.batch_id, more_cotton.batch_id)
+        self.assertEqual(batch_services.serialize_batch(cotton.batch)["hsnCodes"], ["52083190"])
+        self.assertEqual(batch_services.serialize_batch(polyester.batch)["hsnCodes"], ["54075290"])
+
 
 class BatchLossCostingTests(BatchTestBase):
     """Normal loss is absorbed by good fabric; a vendor-fault rejection is a claim."""
@@ -665,6 +692,14 @@ class ManualBatchTests(BatchTestBase):
         second = self.add().json()["batchCode"]
         self.assertNotEqual(second, body["batchCode"])
 
+    def test_hsn_typed_on_the_batch_fills_the_item_master_only_when_missing(self):
+        self.assertEqual(self.add(hsnCode=" 52083190 ").status_code, 201)
+        self.item.refresh_from_db()
+        self.assertEqual(self.item.hsn_code, "52083190")
+        self.assertEqual(self.add(hsnCode="99999999").status_code, 201)
+        self.item.refresh_from_db()
+        self.assertEqual(self.item.hsn_code, "52083190")
+
     def test_rate_and_reason_are_required(self):
         self.assertEqual(self.add(rate="0").status_code, 400)
         self.assertEqual(self.add(reason="").status_code, 400)
@@ -836,3 +871,53 @@ class StockPositionScreenTests(BatchTestBase):
     def test_all_screens_respond(self):
         for screen in ("overview", "samples", "scrap", "usable", "reprocessing", "customer-returns"):
             self.assertEqual(self.api_get(screen).status_code, 200, screen)
+
+
+class DashboardBatchProfitTests(BatchTestBase):
+    """The business dashboard lists profit / loss per batch, losses first."""
+
+    def sell(self, taka, qty, rate):
+        from apps.sales.models import SalesInvoice, SalesInvoiceLine
+
+        invoice = SalesInvoice.objects.create(
+            client=self.tenant, party=self.customer, party_name=self.customer.name,
+            doc_date=timezone.localdate(), invoice_number=f"INV-{uuid.uuid4().hex[:5]}",
+            status="Unpaid", posted_at=timezone.now(),
+        )
+        SalesInvoiceLine.objects.create(
+            sales_invoice=invoice, client=self.tenant, item=self.item, qty=Decimal(qty),
+            rate=Decimal(rate), amount=Decimal(qty) * Decimal(rate),
+        )
+        stock.post_movement(
+            client_id=self.tenant.id, item=self.item, location=self.godown, type="SALE",
+            quantity=-Decimal(qty), reference_type="SalesInvoice", reference_id=invoice.id,
+            reference_number=invoice.invoice_number, lot_taka=taka,
+        )
+
+    def test_loss_making_batch_leads_and_cost_is_ledger_gated(self):
+        from apps.reports import dashboard
+
+        good = self.receive(lot="L-GOOD", meters="100")
+        bad = self.receive(lot="L-BAD", meters="100")
+        self.receive(lot="L-UNSOLD", meters="100")
+        for lot in ("L-GOOD", "L-BAD", "L-UNSOLD"):
+            LotCostEntry.objects.create(client=self.tenant, lot_number=lot, cost_type="Grey purchase", amount=Decimal("5000"))
+        self.sell(good, "100", "80")   # 8,000 - 5,000 = +3,000
+        self.sell(bad, "100", "40")    # 4,000 - 5,000 = -1,000
+
+        result = dashboard._batch_profit(self.tenant.id, timezone.localdate())
+        self.assertEqual(result["batches"], 2)               # the unsold batch is left out
+        self.assertEqual((result["profitable"], result["lossMaking"]), (1, 1))
+        self.assertEqual(result["totalLoss"], Decimal("-1000.00"))
+        self.assertEqual(result["net"], Decimal("2000.00"))
+        worst = result["worst"][0]
+        self.assertEqual(worst["batchCode"], bad.batch.batch_code)
+        self.assertEqual(worst["netResult"], "-1000.00")
+        self.assertEqual(worst["marginPct"], Decimal("-25.00"))
+        self.assertEqual([r["batchCode"] for r in result["best"]], [good.batch.batch_code])
+
+        body = self.api.get("/api/v1/reports/sales-dashboard/").json()
+        self.assertEqual(body["batchProfit"]["lossMaking"], 1)
+        self.assertNotIn("grossProfit", body["kpis"])
+
+        self.assertIsNone(dashboard.business_dashboard(self.tenant.id)["batchProfit"])

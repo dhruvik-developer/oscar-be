@@ -16,6 +16,11 @@ from .models import (
 )
 
 
+#: Where a new top-level account of each type starts numbering when its type
+#: has no numbered account yet (the usual 1xxx..5xxx chart layout).
+TYPE_BASE_CODE = {"Asset": 1000, "Liability": 2000, "Equity": 3000, "Income": 4000, "Expense": 5000}
+
+
 class AccountSerializer(BaseModelSerializer):
     #: opening + debit - credit; positive = Dr, negative = Cr. Only present
     #: when the queryset annotates the totals (AccountViewSet does).
@@ -28,6 +33,35 @@ class AccountSerializer(BaseModelSerializer):
             "system_key", "is_active", "opening_balance", "balance", "created_at", "updated_at",
         ]
         read_only_fields = ["is_system", "system_key", "created_at", "updated_at"]
+        # Blank on create: the next free number among its siblings (see validate).
+        extra_kwargs = {"code": {"required": False, "allow_blank": True}}
+
+    def validate(self, attrs):
+        """A new account without a code takes the next number after the
+        highest numeric code under the same parent (else of the same type):
+        5100, 5101 -> 5102. Never a code already in use."""
+        attrs = super().validate(attrs)
+        if self.instance is not None:
+            if "code" in attrs and not attrs["code"]:
+                attrs.pop("code")  # a blank code on edit keeps the current one
+            return attrs
+        if attrs.get("code"):
+            return attrs
+        live = Account.objects.filter(client_id=self.context.get("client_id"), deleted_at__isnull=True)
+        parent = attrs.get("parent")
+        siblings = live.filter(parent=parent) if parent else live.filter(type=attrs.get("type"))
+        numbers = [int(c) for c in siblings.values_list("code", flat=True) if c and c.isdigit()]
+        if numbers:
+            code = max(numbers) + 1
+        elif parent and (parent.code or "").isdigit():
+            code = int(parent.code) * 10 + 1
+        else:
+            code = TYPE_BASE_CODE.get(attrs.get("type"), 9000)
+        taken = set(live.values_list("code", flat=True))
+        while str(code) in taken:
+            code += 1
+        attrs["code"] = str(code)
+        return attrs
 
     def get_balance(self, account):
         debit = getattr(account, "total_debit", None)

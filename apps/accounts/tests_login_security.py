@@ -27,15 +27,18 @@ class LoginSecurityTests(TestCase):
         cache.clear()
         self.tenant = Client.objects.create(slug=uid("sec"), name="Oscar Textiles")
         self.email = f"{uid('u')}@example.com"
+        self.role = Role.objects.create(client=self.tenant, code="STAFF", name="Staff")
         self.user = User.objects.create_user(
-            email=self.email, password=PASSWORD, client=self.tenant, name="Sec User"
+            email=self.email, password=PASSWORD, client=self.tenant, name="Sec User", role=self.role
         )
 
     # -- helpers --------------------------------------------------------------
 
     def login(self, email=None, password=PASSWORD):
+        email = email or self.email
+        role = User.objects.get(email=email, client=self.tenant).role.code
         return APIClient().post(
-            "/api/v1/auth/login/", {"email": email or self.email, "password": password}, format="json"
+            "/api/v1/auth/login/", {"email": email, "password": password, "role": role}, format="json"
         )
 
     def signed_in(self, access):
@@ -194,7 +197,7 @@ class LoginSecurityTests(TestCase):
         self.login(password="Nope0000!")
         api = self.signed_in(self.login().data["access"])
         other = User.objects.create_user(
-            email=f"{uid('o')}@example.com", password=PASSWORD, client=self.tenant, name="Other"
+            email=f"{uid('o')}@example.com", password=PASSWORD, client=self.tenant, name="Other", role=self.role
         )
         self.login(email=other.email)
 

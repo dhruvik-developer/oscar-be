@@ -109,7 +109,12 @@ SELF_REVERSING_TYPES = (
 )
 
 #: Valid values of ``LotTaka.qc_status`` (kept as-is for Phase 1).
-LOT_QC_STATUSES = ("Passed", "Pending", "On Hold", "Reprocess", "Rejected")
+#: "Not Inspected" is fabric that skipped the optional QC: usable, but never
+#: shown as QC passed.
+LOT_QC_STATUSES = ("Passed", "Pending", "On Hold", "Reprocess", "Rejected", "Not Inspected")
+
+#: QC statuses whose fabric may be sold, issued or processed.
+RELEASED_QC_STATUSES = ("Passed", "Pass", "Not Inspected")
 
 
 class StockMovement(TenantModel, LegacyIdMixin):
@@ -611,9 +616,16 @@ class Batch(TenantModel):
         ("CUSTOMER", "Customer"),
         ("THIRD_PARTY", "Third party"),
     ]
+    FABRIC_TYPES = [
+        ("GREY", "Grey fabric"),
+        ("DYED", "Dyed fabric"),
+    ]
 
     batch_code = models.TextField()
     origin = models.TextField(choices=ORIGINS, default="MANUAL")
+    #: What the batch was when it came in. Grey rolls dyed later keep the
+    #: batch; the dyeing shows in its history.
+    fabric_type = models.TextField(choices=FABRIC_TYPES, default="GREY")
     ownership = models.TextField(choices=OWNERSHIPS, default="OSCAR")
     #: The customer (or third party) who owns the material when not OSCAR.
     owner_party = models.ForeignKey(
@@ -1318,6 +1330,13 @@ class ProductionMaterialIssue(TenantModel):
     unit_cost = models.DecimalField(max_digits=18, decimal_places=4, default=0)
     amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     customer_supplied = models.BooleanField(default=False)
+    #: The supplier's yarn lot / box reference, for yarn-to-fabric traceability.
+    yarn_lot = models.TextField(null=True, blank=True)
+    #: A negative-quantity row returns unused material to stock; it points at
+    #: the issue it returns.
+    returns_issue = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.PROTECT, related_name="returns"
+    )
     issued_on = models.DateField(default=timezone.localdate)
     movement = models.ForeignKey(StockMovement, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
 
@@ -1401,3 +1420,41 @@ class BatchLoss(TenantModel):
     def claimable(self):
         return self.cause != "NORMAL_LOSS"
 
+
+class BatchYarn(TenantModel):
+    """Yarn that went into a batch, entered by hand (traceability record).
+
+    For fabric woven / knitted outside a production run (or before runs were
+    used). It moves no stock and posts no cost: a production run's material
+    issues are the costed path, and a manual batch already carries its value.
+    """
+
+    batch = models.ForeignKey(Batch, on_delete=models.PROTECT, related_name="yarns")
+    yarn_item = models.ForeignKey(
+        "masters.Item", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    yarn_name = models.TextField(null=True, blank=True)  # when the yarn is not an item master
+    yarn_lot = models.TextField(null=True, blank=True)
+    yarn_count = models.TextField(null=True, blank=True)  # e.g. 30s, 2/40
+    supplier = models.ForeignKey(
+        "masters.Party", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    uom = models.TextField(default="Kg")
+    issued_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    consumed_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    returned_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    waste_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    #: Indicative rate per ``uom``; never posted as batch cost.
+    rate = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
+    entry_date = models.DateField(default=timezone.localdate)
+    remarks = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "batch_yarns"
+        ordering = ["entry_date", "created_at"]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(issued_qty__gte=0, consumed_qty__gte=0, returned_qty__gte=0, waste_qty__gte=0),
+                name="ck_batch_yarn_qty_nonneg",
+            ),
+        ]

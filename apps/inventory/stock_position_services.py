@@ -23,6 +23,7 @@ from django.utils import timezone
 from apps.core.money import ZERO, D, round2, round4
 
 from .batch_services import _bucket, is_bulk
+from .models import RELEASED_QC_STATUSES
 
 BUCKET_LABEL = {
     "available": "Available",
@@ -163,7 +164,7 @@ def usable_stock(client_id, params, include_cost=False):
 
     rolls = [
         t for t in _rolls(client_id, {**params, "ownership": "OSCAR"})
-        if _taka_bucket(t) in ("available", "reserved") and t.qc_status in ("Passed", "Pass")
+        if _taka_bucket(t) in ("available", "reserved") and t.qc_status in RELEASED_QC_STATUSES
     ]
     kpi = defaultdict(lambda: ZERO)
     per_item = defaultdict(lambda: ZERO)

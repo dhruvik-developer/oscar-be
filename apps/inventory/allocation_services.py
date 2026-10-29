@@ -20,13 +20,13 @@ from apps.core.audit import record_audit, snapshot
 from apps.core.exceptions import BusinessRuleViolation, Conflict, NotFound, ValidationFailed
 from apps.core.money import D, round4
 
-from .models import GreyStockAllocation, LotTaka
+from .models import RELEASED_QC_STATUSES, GreyStockAllocation, LotTaka
 from .services import BLOCKED_LOCATION_CODES
 
 ZERO = Decimal("0")
 
 #: A lot can be allocated only once QC has passed it into a godown.
-ALLOCATABLE_QC_STATUSES = ("Passed", "Pass")
+ALLOCATABLE_QC_STATUSES = RELEASED_QC_STATUSES
 NON_ALLOCATABLE_STATUSES = (
     LotTaka.STATUS_EXTERNAL_WIP, LotTaka.STATUS_QC_HOLD, LotTaka.STATUS_REPROCESS,
     LotTaka.STATUS_SECOND_QUALITY, LotTaka.STATUS_REJECT, LotTaka.STATUS_SAMPLE,

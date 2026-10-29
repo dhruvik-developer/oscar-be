@@ -365,6 +365,23 @@ def save_order_row(request, order, kind, serializer, instance=None):
         ]
         if new_rolls:
             validate_outward_stock(order, new_rolls)
+        if order.service_order_id and new_rolls:
+            # A service order's JWO sends only that order's rolls, so a
+            # customer's fabric never mixes with OSCAR's.
+            from .service_orders import assert_rolls_belong
+
+            assert_rolls_belong(order.service_order, [
+                getattr(r.get("lot_taka"), "id", None) or r.get("lot_taka_id") or r.get("lotTakaId")
+                for r in new_rolls
+            ])
+    if kind == "inwards" and takas_data and order.service_order_id:
+        if any(not t.get("source_taka") for t in takas_data):
+            # Without the roll it was sent as, a returned roll would open a
+            # new OSCAR batch and lose the customer's ownership.
+            raise ValidationFailed(
+                "Each returned roll on a service order must name the roll it was sent as.",
+                field_errors={"takas": ["sourceTakaId required."]},
+            )
 
     if instance is None:
         if series:

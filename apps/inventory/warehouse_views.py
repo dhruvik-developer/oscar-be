@@ -71,7 +71,13 @@ class WarehouseListView(APIView):
         data = request.data
         code = (data.get("code") or "").strip().upper()
         if not code:
-            raise ValidationFailed("Warehouse code is required.", field_errors={"code": ["Required."]})
+            # Blank: from the name (Surat Main -> WH-SURAT-MAIN), never clashing.
+            from apps.masters.serializers import slug_code, unique_code
+
+            if not (data.get("name") or "").strip():
+                raise ValidationFailed("Enter the warehouse name.", field_errors={"name": ["Required."]})
+            peers = Location.objects.filter(client_id=request.client_id, deleted_at__isnull=True)
+            code = unique_code(peers, "WH-" + slug_code(data.get("name"), "WAREHOUSE"))
         if code.startswith(wh.SYSTEM_PREFIX):
             raise ValidationFailed("Codes starting SYS- are reserved.", field_errors={"code": ["Reserved prefix."]})
         if Location.objects.filter(client_id=request.client_id, code__iexact=code, deleted_at__isnull=True).exists():

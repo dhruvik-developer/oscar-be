@@ -85,10 +85,18 @@ class DocumentHeader(TenantModel, LegacyIdMixin):
 
     @property
     def balance_due(self):
-        """``max(0, total - amount_paid)`` (api.md §5.7)."""
+        """``max(0, total - amount_paid - settlement_discount)`` (api.md §5.7).
+
+        Only sales invoices carry ``settlement_discount`` (approved early-payment
+        discounts); every other document settles by payments alone.
+        """
         from .money import ZERO
 
-        remaining = (self.total or ZERO) - (self.amount_paid or ZERO)
+        remaining = (
+            (self.total or ZERO)
+            - (self.amount_paid or ZERO)
+            - (getattr(self, "settlement_discount", None) or ZERO)
+        )
         return remaining if remaining > ZERO else ZERO
 
     @property

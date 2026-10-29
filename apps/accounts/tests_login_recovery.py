@@ -9,7 +9,7 @@ from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from apps.accounts.models import Client, PasswordResetToken, User
+from apps.accounts.models import Client, PasswordResetToken, Role, User
 from apps.accounts.serializers import UserSerializer
 from apps.accounts.views import MAX_FAILED_LOGINS
 
@@ -21,6 +21,11 @@ def uid(prefix):
 LOCMEM = "django.core.mail.backends.locmem.EmailBackend"
 
 
+def staff_role(tenant):
+    """Every sign-in names the user's role, so test users hold one."""
+    return Role.objects.get_or_create(client=tenant, code="STAFF", defaults={"name": "Staff"})[0]
+
+
 @override_settings(EMAIL_BACKEND=LOCMEM, FRONTEND_URL="https://erp.example.com")
 class LoginRecoveryTests(TestCase):
     def setUp(self):
@@ -30,18 +35,18 @@ class LoginRecoveryTests(TestCase):
         self.a = Client.objects.create(slug=uid("alpha"), name="Alpha Textiles")
         self.b = Client.objects.create(slug=uid("beta"), name="Beta Fabrics")
         self.user_a = User.objects.create_user(
-            email=self.email, password="Alpha1234!", client=self.a, name="Asha"
+            email=self.email, password="Alpha1234!", client=self.a, name="Asha", role=staff_role(self.a)
         )
 
     def login(self, password, tenant=None):
-        body = {"email": self.email, "password": password}
+        body = {"email": self.email, "password": password, "role": "STAFF"}
         if tenant:
             body["tenant"] = tenant
         return self.api.post("/api/v1/auth/login/", body, format="json")
 
     def add_second_account(self, password):
         return User.objects.create_user(
-            email=self.email, password=password, client=self.b, name="Asha B"
+            email=self.email, password=password, client=self.b, name="Asha B", role=staff_role(self.b)
         )
 
     # -- workspace choice ---------------------------------------------------
@@ -145,12 +150,13 @@ class LockoutAndStatusTests(TestCase):
         self.tenant = Client.objects.create(slug=uid("lock"), name="Lock Tenant")
         self.email = f"{uid('u')}@example.com"
         self.user = User.objects.create_user(
-            email=self.email, password="Right1234!", client=self.tenant, name="Lock User"
+            email=self.email, password="Right1234!", client=self.tenant, name="Lock User",
+            role=staff_role(self.tenant),
         )
 
     def login(self, password):
         return self.api.post(
-            "/api/v1/auth/login/", {"email": self.email, "password": password}, format="json"
+            "/api/v1/auth/login/", {"email": self.email, "password": password, "role": "STAFF"}, format="json"
         )
 
     def test_lock_is_announced_with_wait_time(self):
@@ -195,9 +201,10 @@ class MustChangePasswordTests(TestCase):
         )
         self.assertTrue(serializer.is_valid(), serializer.errors)
         serializer.save(client=self.tenant)
+        User.objects.filter(email=email).update(role=staff_role(self.tenant))
 
         resp = self.api.post(
-            "/api/v1/auth/login/", {"email": email, "password": "Temp1234!"}, format="json"
+            "/api/v1/auth/login/", {"email": email, "password": "Temp1234!", "role": "STAFF"}, format="json"
         )
         self.assertEqual(resp.status_code, 200, resp.content[:300])
         self.assertTrue(resp.data["user"]["mustChangePassword"])
@@ -214,9 +221,9 @@ class MustChangePasswordTests(TestCase):
 
     def test_self_service_users_are_not_flagged(self):
         email = f"{uid('u')}@example.com"
-        User.objects.create_user(email=email, password="Own1234!", client=self.tenant, name="Own")
+        User.objects.create_user(email=email, password="Own1234!", client=self.tenant, name="Own", role=staff_role(self.tenant))
         resp = self.api.post(
-            "/api/v1/auth/login/", {"email": email, "password": "Own1234!"}, format="json"
+            "/api/v1/auth/login/", {"email": email, "password": "Own1234!", "role": "STAFF"}, format="json"
         )
         self.assertFalse(resp.data["user"]["mustChangePassword"])
 
@@ -229,7 +236,8 @@ class ResetOtpTests(TestCase):
         self.tenant = Client.objects.create(slug=uid("otp"), name="Oscar Textiles")
         self.email = f"{uid('u')}@example.com"
         self.user = User.objects.create_user(
-            email=self.email, password="Old12345!", client=self.tenant, name="Otp User"
+            email=self.email, password="Old12345!", client=self.tenant, name="Otp User",
+            role=staff_role(self.tenant),
         )
 
     def forgot(self):
@@ -265,7 +273,7 @@ class ResetOtpTests(TestCase):
         self.assertEqual(resp.status_code, 200, resp.content[:300])
         self.assertEqual(self.reset(resp.data["token"]).status_code, 204)
         login = self.api.post(
-            "/api/v1/auth/login/", {"email": self.email, "password": "Fresh5678!"}, format="json"
+            "/api/v1/auth/login/", {"email": self.email, "password": "Fresh5678!", "role": "STAFF"}, format="json"
         )
         self.assertEqual(login.status_code, 200)
         # The code is single-use.

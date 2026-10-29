@@ -24,6 +24,7 @@ SERIES_DEFAULTS = {
     "INV": ("INV", "fy", 4, "-"),
     "DC": ("DC", "fy", 4, "-"),
     "PAY-IN": ("PAY-IN", "fy", 4, "-"),
+    "EPD": ("EPD", "fy", 4, "-"),
     "SR": ("SR", "fy", 4, "-"),
     "WC": ("WC", "fy", 5, "-"),
     # Purchase
@@ -47,6 +48,10 @@ SERIES_DEFAULTS = {
     "LOT": ("LOT", "fy", 5, "-"),
     # Permanent fabric batch ID, kept through every process: OSCAR-GRY-2026-0001
     "BAT": ("OSCAR-GRY", "yearly", 4, "-"),
+    # A batch that comes in already dyed: OSCAR-DYD-2026-0001
+    "BATD": ("OSCAR-DYD", "yearly", 4, "-"),
+    # QC started from a batch (send to QC, inspection result)
+    "BQC": ("BQC", "fy", 4, "-"),
     # QC reprocess orders (JWOReprocess)
     "RP": ("RP", "fy", 4, "-"),
     # Accounts
@@ -70,6 +75,7 @@ SERIES_DEFAULTS = {
     "PRUN": ("PRUN", "fy", 4, "-"),
     # Customer material receipts / deliveries back to the customer
     "CMR": ("CMR", "fy", 4, "-"),
+    "DSO": ("DSO", "fy", 4, "-"),
     "CMD": ("CMD", "fy", 4, "-"),
     # Taka registration out of a batch's bulk metres
     "TRG": ("TRG", "fy", 4, "-"),

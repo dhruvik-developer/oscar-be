@@ -22,6 +22,8 @@ from apps.core.numbering import allocate_number
 from apps.core.permissions import HasModulePermission, require_permission
 from apps.core.viewsets import TenantModelViewSet
 
+from apps.inventory.models import RELEASED_QC_STATUSES
+
 from .models import JobWorkOrder, PlanCharge, ProcessPlan
 from .serializers import (
     JobWorkOrderSerializer,
@@ -127,7 +129,7 @@ class ProcessPlanViewSet(TenantModelViewSet):
             usable_stock_qs = LotTaka.objects.filter(
                 deleted_at__isnull=True,
                 available_quantity__gt=0,
-                qc_status__in=("Passed", "Pass"),
+                qc_status__in=RELEASED_QC_STATUSES,
             ).exclude(status__in=("External WIP", "QC Hold", "Dispatched", "Reject", "Scrapped"))
             if client_id:
                 usable_stock_qs = usable_stock_qs.filter(client_id=client_id)

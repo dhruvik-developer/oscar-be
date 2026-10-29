@@ -20,5 +20,9 @@ router.register("returns", views.SalesReturnViewSet, basename="sales-returns")
 # [REMOVED] Customer Warranty endpoint removed from sales router
 router.register("broker-commissions", views.BrokerCommissionViewSet, basename="sales-broker-commissions")
 router.register("party-discounts", views.PartyDiscountViewSet, basename="sales-party-discounts")
+router.register("discount-requests", views.EarlyPaymentDiscountRequestViewSet, basename="sales-discount-requests")
 
-urlpatterns = [path("", include(router.urls))]
+urlpatterns = [
+    path("receivables/", views.ReceivablesView.as_view(), name="sales-receivables"),
+    path("", include(router.urls)),
+]

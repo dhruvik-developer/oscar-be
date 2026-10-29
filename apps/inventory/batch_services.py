@@ -52,6 +52,9 @@ def assign_batch(taka):
     2. Another roll of the same lot number that already has a batch shares it
        (a GRN line's rolls are one batch).
     3. Otherwise a new batch is opened with the next ``OSCAR-GRY`` number.
+
+    A purchase-order batch holds one HSN code: fabrics of a PO with different
+    HSNs go into separate batches.
     """
     from apps.core.numbering import allocate_number
 
@@ -61,14 +64,19 @@ def assign_batch(taka):
     if parent is not None and parent.batch_id:
         taka.batch_id = parent.batch_id
         return
-    # One purchase order is one batch: every receipt against the PO (partial
-    # or repeat deliveries) joins the batch its first receipt opened.
+    # One purchase order is one batch per HSN code: every receipt against the
+    # PO (partial or repeat deliveries) joins the batch its first receipt of
+    # that HSN opened.
     po = _purchase_order_for(taka)
     if po is not None:
-        existing = Batch.objects.filter(
-            client_id=taka.client_id, source_document_type="PurchaseOrder",
-            source_document_id=po.id, deleted_at__isnull=True,
-        ).first()
+        hsn = item_hsn(taka.item)
+        existing = next((
+            b for b in Batch.objects.filter(
+                client_id=taka.client_id, source_document_type="PurchaseOrder",
+                source_document_id=po.id, deleted_at__isnull=True,
+            ).select_related("item__category").order_by("created_at")
+            if item_hsn(b.item) == hsn
+        ), None)
         if existing is None:
             on_date = taka.received_date if hasattr(taka.received_date, "year") else None
             existing = Batch.objects.create(
@@ -100,10 +108,15 @@ def assign_batch(taka):
         taka.batch_id = sibling
         return
     on_date = taka.received_date if hasattr(taka.received_date, "year") else None
+    origin = ORIGIN_BY_SOURCE.get(taka.source_document_type or "", "MANUAL")
+    # Processed rolls with no source roll (a job-work inward of fabric that
+    # never had a batch here) come in dyed.
+    fabric_type = "DYED" if origin == "JOB_WORK" else "GREY"
     taka.batch = Batch.objects.create(
         client_id=taka.client_id,
-        batch_code=allocate_number(taka.client_id, "BAT", on_date),
-        origin=ORIGIN_BY_SOURCE.get(taka.source_document_type or "", "MANUAL"),
+        batch_code=allocate_number(taka.client_id, batch_series(fabric_type), on_date),
+        origin=origin,
+        fabric_type=fabric_type,
         item_id=taka.item_id,
         supplier_id=taka.supplier_id,
         source_document_type=taka.source_document_type,
@@ -614,6 +627,18 @@ def batch_timeline(batch, takas=None, include_cost=False):
             "notes": loss.notes,
         })
 
+    for y in batch.yarns.filter(deleted_at__isnull=True).select_related("yarn_item"):
+        events.append({
+            "date": _date(y.entry_date),
+            "at": _date(y.created_at),
+            "kind": "YARN",
+            "title": f"Yarn recorded: {y.yarn_item.name if y.yarn_item_id else y.yarn_name}"
+                     + (f" (lot {y.yarn_lot})" if y.yarn_lot else ""),
+            "quantity": str(y.consumed_qty),
+            "uom": y.uom,
+            "notes": y.remarks,
+        })
+
     events.sort(key=lambda ev: (str(ev.get("date") or ""), str(ev.get("at") or "")))
     return events
 
@@ -652,6 +677,10 @@ def serialize_batch(batch, *, takas=None, include_cost=False, detail=False):
         "id": str(batch.id),
         "batchCode": batch.batch_code,
         "origin": batch.origin,
+        "fabricType": batch.fabric_type,
+        "fabricTypeLabel": batch.get_fabric_type_display(),
+        # Grey rolls that came back from dyeing / processing keep the batch.
+        "processed": any(t.source_document_type == "JobWorkInward" for t in takas),
         "ownership": batch.ownership,
         "ownerPartyName": batch.owner_party.name if batch.owner_party_id else None,
         "item": (batch.item or getattr(first, "item", None)).name if (batch.item_id or first) else None,
@@ -687,11 +716,19 @@ def serialize_batch(batch, *, takas=None, include_cost=False, detail=False):
             "qcStatus": t.qc_status,
             "receivedQuantity": str(t.received_quantity),
             "availableQuantity": str(t.available_quantity),
+            "receivedDate": _date(t.received_date),
+            "bulk": is_bulk(t),
+            "design": t.design.name if t.design_id else None,
+            "shade": t.shade.name if t.shade_id else None,
             "parentTakaId": str(t.parent_taka_id) if t.parent_taka_id else None,
             "sourceDocumentType": t.source_document_type,
             "sourceDocumentNumber": t.source_document_number,
         } for t in takas]
         data["timeline"] = batch_timeline(batch, takas, include_cost=include_cost)
+        data["notes"] = batch.notes
+        from .batch360_services import batch_360
+
+        data.update(batch_360(batch, takas=takas, include_cost=include_cost))
     if include_cost:
         data["costing"] = batch_costing(batch, takas, qty)
     return data
@@ -924,7 +961,7 @@ def set_ownership(batch, *, ownership, owner_party_id=None, user=None, reason=No
 
 @transaction.atomic
 def receive_customer_material(*, client, customer, item, location, rolls, reference=None, user=None,
-                              received_on=None, total_meters=None):
+                              received_on=None, total_meters=None, fabric_type="GREY"):
     """Customer's own fabric arriving (for processing / job work on their behalf).
 
     Opens a CUSTOMER-owned batch; the rolls carry no cost and post no journal,
@@ -946,11 +983,13 @@ def receive_customer_material(*, client, customer, item, location, rolls, refere
     receipt_no = allocate_number(client, "CMR", received_on)
     receipt_id = uuid.uuid4()
     lot_number = allocate_number(client, "LOT", received_on)
+    fabric_type = _fabric_type(fabric_type)
     batch = Batch.objects.create(
         client_id=client_id,
-        batch_code=allocate_number(client, "BAT", received_on),
+        batch_code=allocate_number(client, batch_series(fabric_type), received_on),
         origin="MANUAL",
         ownership="CUSTOMER",
+        fabric_type=fabric_type,
         owner_party=customer,
         item=item,
         source_document_type="CustomerMaterialReceipt",
@@ -968,7 +1007,7 @@ def receive_customer_material(*, client, customer, item, location, rolls, refere
             client_id=client_id, batch=batch, item=item, location=location, lot_number=lot_number,
             taka_number="BULK" if bulk else str(index), taka_id=code, barcode=code, received_quantity=meters,
             tags=[BULK_TAG] if bulk else [],
-            available_quantity=ZERO, uom=item.uom, status="Available", qc_status="Passed",
+            available_quantity=ZERO, uom=item.uom, status="Available", qc_status="Not Inspected",
             source_document_type="CustomerMaterialReceipt", source_document_id=receipt_id,
             source_document_number=receipt_no, supplier=customer,
             **({"received_date": received_on} if received_on else {}),
@@ -1037,6 +1076,61 @@ def customer_owned_qty_by_item_location(client_id):
     return out
 
 
+#: ``?holding=`` of the batch list -> the rolls it means (by where they sit).
+#: Positive conditions only, so they work across the batch -> rolls join.
+HOLDING_FILTERS = {
+    "available": {"location__code__regex": r"^(?!SYS-)", "status__regex": r"^(?!Reserved$)"},
+    "reserved": {"status": "Reserved"},
+    "qcHold": {"location__code": "SYS-QC-HOLD"},
+    "rework": {"location__code": "SYS-REPROCESS"},
+    "secondQuality": {"location__code": "SYS-SECOND-QUALITY"},
+    "rejected": {"location__code": "SYS-REJECT"},
+    "withJobWorker": {"location__code__startswith": "SYS-WIP"},
+}
+
+
+def roll_filter(params, prefix=""):
+    """Rolls in hand matching ``designId`` / ``shadeId`` / ``locationId`` /
+    ``holding``, as one Q; ``prefix="takas__"`` to filter batches by them.
+    None when no roll filter is asked for."""
+    conditions = {}
+    for param, field in (("designId", "design_id"), ("shadeId", "shade_id"), ("locationId", "location_id")):
+        if params.get(param):
+            conditions[field] = params[param]
+    conditions.update(HOLDING_FILTERS.get(params.get("holding"), {}))
+    if not conditions:
+        return None
+    conditions.update({"available_quantity__gt": 0, "deleted_at__isnull": True})
+    return Q(**{prefix + k: v for k, v in conditions.items()})
+
+
+def stock_totals(client_id, batch_ids, roll_filter=None):
+    """The stock tiles of the batch list: metres in hand on the rolls of
+    ``batch_ids`` (matching ``roll_filter``, a LotTaka Q), by state. OSCAR's
+    stock and customer material are kept apart."""
+    from .models import LotTaka
+
+    totals = defaultdict(lambda: ZERO)
+    rolls = LotTaka.objects.filter(
+        client_id=client_id, batch_id__in=batch_ids, deleted_at__isnull=True, available_quantity__gt=0,
+    ).select_related("location", "batch")
+    if roll_filter is not None:
+        rolls = rolls.filter(roll_filter)
+    for t in rolls:
+        qty = D(t.available_quantity)
+        totals["totalPhysical"] += qty
+        if t.batch_id and t.batch.ownership != "OSCAR":
+            totals["customerMaterial"] += qty
+            continue
+        bucket = _bucket(t)
+        if bucket == "available" and t.status == "Reserved":
+            bucket = "reserved"
+        totals[bucket] += qty
+    keys = ("totalPhysical", "available", "reserved", "qcHold", "rework", "secondQuality", "rejected",
+            "withJobWorker", "customerMaterial")
+    return {k: str(round4(totals[k])) for k in keys}
+
+
 def physical_stock_summary(client_id):
     """Everything physically held, split OSCAR-owned vs each customer's
     material, by state; customers also show what was delivered back."""
@@ -1081,17 +1175,39 @@ def physical_stock_summary(client_id):
     return rows
 
 
+def batch_series(fabric_type):
+    """Numbering series of a new batch: OSCAR-GRY-… or OSCAR-DYD-…."""
+    return "BATD" if fabric_type == "DYED" else "BAT"
+
+
+def _fabric_type(value):
+    from apps.core.exceptions import ValidationFailed
+
+    from .models import Batch
+
+    value = (value or "GREY").upper()
+    if value not in dict(Batch.FABRIC_TYPES):
+        raise ValidationFailed("Fabric type must be Grey or Dyed.", field_errors={"fabricType": ["GREY or DYED."]})
+    return value
+
+
 @transaction.atomic
 def create_manual_batch(*, client, item, location, rolls, rate, reason, supplier=None, fabric_quality=None,
                         shade=None, width=None, gsm=None, received_on=None, send_to_qc=False, user=None,
-                        total_meters=None):
-    """Add OSCAR's own fabric by hand (opening stock, stock found on a count).
+                        total_meters=None, fabric_type="GREY", design=None, reference=None, hsn_code=None):
+    """Add OSCAR's own fabric by hand (opening stock, stock found on a count,
+    fabric bought or made without a document in the system).
 
-    The batch code is always generated (OSCAR-GRY-<year>-<n>); it is never
-    typed. Stock, batch cost and the ledger move together:
-    ADJUSTMENT in at ``rate`` (Dr Inventory | Cr Stock Adjustment, the
-    existing stock-adjustment policy) and a "Grey purchase" cost entry of the
-    same value. ``send_to_qc`` puts the rolls at QC Hold, pending inspection.
+    The batch code is always generated (OSCAR-GRY-<year>-<n>, or OSCAR-DYD-…
+    for dyed fabric); it is never typed. Stock, batch cost and the ledger move
+    together: ADJUSTMENT in at ``rate`` (Dr Inventory | Cr Stock Adjustment,
+    the existing stock-adjustment policy) and a purchase cost entry of the
+    same value. QC is optional: ``send_to_qc`` puts the rolls at QC Hold,
+    pending inspection; otherwise they are usable as "Not Inspected" (never
+    shown as QC passed).
+
+    ``hsn_code`` fills in the fabric's HSN on its item master when it has none
+    yet; a fabric that already has one keeps it (change it in the item master).
     """
     import uuid
 
@@ -1112,6 +1228,10 @@ def create_manual_batch(*, client, item, location, rolls, rate, reason, supplier
             received_on = date.fromisoformat(received_on[:10])
         except ValueError:
             raise ValidationFailed("Date must be YYYY-MM-DD.", field_errors={"date": ["Invalid date."]})
+    hsn_code = (hsn_code or "").strip()
+    if hsn_code and not item_hsn(item):
+        item.hsn_code = hsn_code
+        item.save(update_fields=["hsn_code"])
     rolls, bulk = _rolls_or_bulk(rolls, total_meters)
     if not rolls:
         raise ValidationFailed("Enter the batch's total metres, or the metres of each taka.",
@@ -1124,18 +1244,20 @@ def create_manual_batch(*, client, item, location, rolls, rate, reason, supplier
     if (location.code or "").startswith("SYS-"):
         raise ValidationFailed("Choose a real godown.", field_errors={"locationId": ["System locations are not allowed."]})
 
+    fabric_type = _fabric_type(fabric_type)
     target = stock.system_location(client_id, "QC_HOLD") if send_to_qc else location
     lot_number = allocate_number(client, "LOT", received_on)
     batch = Batch.objects.create(
         client_id=client_id,
-        batch_code=allocate_number(client, "BAT", received_on),
+        batch_code=allocate_number(client, batch_series(fabric_type), received_on),
         origin="MANUAL",
         ownership="OSCAR",
+        fabric_type=fabric_type,
         item=item,
         supplier=supplier,
         source_document_type="ManualBatch",
         uom=item.uom,
-        notes=reason,
+        notes=reason + (f" (ref: {reference})" if reference else ""),
         **({"created_on": received_on} if received_on else {}),
     )
     Batch.objects.filter(pk=batch.pk).update(source_document_id=batch.id, source_document_number=batch.batch_code)
@@ -1148,9 +1270,9 @@ def create_manual_batch(*, client, item, location, rolls, rate, reason, supplier
             taka_number="BULK" if bulk else str(index), taka_id=code, barcode=code, received_quantity=meters,
             available_quantity=ZERO, uom=item.uom, rate=rate, supplier=supplier,
             tags=[BULK_TAG] if bulk else [],
-            fabric_quality=fabric_quality, shade=shade, width=width, gsm=gsm,
+            fabric_quality=fabric_quality, shade=shade, design=design, width=width, gsm=gsm,
             status="QC Hold" if send_to_qc else "Available",
-            qc_status="Pending" if send_to_qc else "Passed",
+            qc_status="Pending" if send_to_qc else "Not Inspected",
             source_document_type="ManualBatch", source_document_id=batch.id,
             source_document_number=batch.batch_code,
             **({"received_date": received_on} if received_on else {}),

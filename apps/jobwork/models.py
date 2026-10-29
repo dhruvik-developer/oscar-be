@@ -99,6 +99,106 @@ class PlanCharge(TenantModel):
         ordering = ["created_at"]
 
 
+class ServiceOrder(TenantModel, LegacyIdMixin):
+    """A customer's dyeing (or other process) order, independent of OSCAR's
+    own grey production.
+
+    ``CUSTOMER_FABRIC``  the customer supplies the fabric (a CUSTOMER-owned
+                         batch); OSCAR bills only the service charge.
+    ``OSCAR_GREY``       OSCAR sells its own grey batch and dyes it; the
+                         invoice carries the fabric and the dyeing charge as
+                         separate lines.
+
+    Every rate, charge and price is entered by the user; nothing is derived
+    from a hardcoded percentage. The dyeing itself runs on ordinary job work
+    orders (``JobWorkOrder.service_order``) so outward, inward, QC and
+    re-dyeing reuse the job work flow.
+    """
+
+    TYPE_CUSTOMER_FABRIC = "CUSTOMER_FABRIC"
+    TYPE_OSCAR_GREY = "OSCAR_GREY"
+    TYPES = [
+        (TYPE_CUSTOMER_FABRIC, "Dyeing service on customer fabric"),
+        (TYPE_OSCAR_GREY, "OSCAR grey fabric + dyeing"),
+    ]
+    STATUSES = [
+        ("Draft", "Draft"),
+        ("Confirmed", "Confirmed"),
+        ("Fabric Received", "Fabric Received"),
+        ("At Vendor", "At Vendor"),
+        ("Dyeing QC", "Dyeing QC"),
+        ("Ready", "Ready"),
+        ("Delivered", "Delivered"),
+        ("Invoiced", "Invoiced"),
+        ("Closed", "Closed"),
+        ("Cancelled", "Cancelled"),
+    ]
+
+    order_number = models.TextField()
+    order_type = models.TextField(choices=TYPES, default=TYPE_CUSTOMER_FABRIC)
+    service_type = models.TextField(default="Dyeing")
+    order_date = models.DateField()
+    status = models.TextField(choices=STATUSES, default="Draft")
+    party = models.ForeignKey(
+        "masters.Party", null=True, blank=True, on_delete=models.PROTECT, related_name="service_orders"
+    )
+    crm_lead = models.ForeignKey(
+        "crm.Lead", null=True, blank=True, on_delete=models.SET_NULL, related_name="service_orders"
+    )
+    sales_order = models.ForeignKey(
+        "sales.SalesOrder", null=True, blank=True, on_delete=models.SET_NULL, related_name="service_orders"
+    )
+    item = models.ForeignKey(
+        "masters.Item", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    fabric_description = models.TextField(null=True, blank=True)
+    fabric_quality = models.TextField(null=True, blank=True)
+    shade = models.TextField(null=True, blank=True)
+    colour_reference = models.TextField(null=True, blank=True)
+    quantity = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    uom = models.TextField(default="Mtr")
+    #: Charged to the customer per unit for the dyeing service.
+    service_rate = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    #: Defaults to quantity x service_rate; may be entered directly.
+    service_value = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    #: OSCAR_GREY only: the grey fabric's selling price per unit.
+    fabric_rate = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    freight_charge = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    other_charges = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    other_charges_note = models.TextField(null=True, blank=True)
+    #: Agreed total price to the customer, when it differs from the sum of parts.
+    final_selling_price = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    vendor = models.ForeignKey(
+        "masters.Party", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    #: What the dyeing vendor charges OSCAR per unit (job work cost).
+    vendor_rate = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    expected_fabric_date = models.DateField(null=True, blank=True)
+    expected_vendor_return_date = models.DateField(null=True, blank=True)
+    expected_delivery_date = models.DateField(null=True, blank=True)
+    notes = models.TextField(null=True, blank=True)
+    batches = models.ManyToManyField("inventory.Batch", blank=True, related_name="service_orders")
+    sales_invoice = models.ForeignKey(
+        "sales.SalesInvoice", null=True, blank=True, on_delete=models.SET_NULL, related_name="service_orders"
+    )
+    cancelled_reason = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "service_orders"
+        ordering = ["-order_date", "-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "order_number"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_service_order_number",
+            ),
+            models.CheckConstraint(condition=models.Q(quantity__gte=0), name="ck_service_order_qty"),
+        ]
+
+    def __str__(self):
+        return self.order_number
+
+
 class JobWorkOrder(TenantModel, LegacyIdMixin):
     """A job work order issued to a vendor for outside processing."""
 
@@ -125,6 +225,10 @@ class JobWorkOrder(TenantModel, LegacyIdMixin):
         "pms.Project", null=True, blank=True, on_delete=models.SET_NULL, related_name="job_work_orders"
     )
     project_destination = models.TextField(default="Customer Project")
+    #: Set when the job work runs a customer's dyeing service order.
+    service_order = models.ForeignKey(
+        ServiceOrder, null=True, blank=True, on_delete=models.SET_NULL, related_name="job_work_orders"
+    )
     process_plan = models.ForeignKey(
         ProcessPlan, null=True, blank=True, on_delete=models.SET_NULL,
         related_name="job_work_orders",

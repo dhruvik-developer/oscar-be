@@ -414,6 +414,10 @@ class SalesInvoice(DocumentHeader):
     vehicle_number = models.TextField(null=True, blank=True)
     transporter = models.TextField(null=True, blank=True)
     allocated_freight_cost = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    #: DERIVED from approved early-payment discounts (each posted as a credit
+    #: note). It settles the invoice next to ``amount_paid`` but is never money
+    #: received, so it is kept apart: balance = total - amount_paid - this.
+    settlement_discount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
 
     class Meta:
         db_table = "sales_invoices"
@@ -478,6 +482,9 @@ class PaymentIn(TenantModel, LegacyIdMixin):
         "accounting.BankAccount", null=True, blank=True, on_delete=models.PROTECT, related_name="+"
     )
     reference_number = models.TextField(null=True, blank=True)
+    #: The bank's own id for the transfer (UTR / RRN / cheque no.); used to
+    #: refuse the same receipt being entered twice.
+    transaction_reference = models.TextField(null=True, blank=True)
     notes = models.TextField(null=True, blank=True)
     #: DERIVED from payment_allocations. The unallocated remainder *is* the
     #: customer advance -- there is no separate balance column (db.md §5.4).
@@ -556,6 +563,117 @@ class PaymentAllocation(TenantModel):
             models.Index(fields=["document_type", "document_id"], name="ix_payment_alloc_doc"),
             models.Index(fields=["payment_side", "payment_id"], name="ix_payment_alloc_payment"),
         ]
+
+
+# ---------------------------------------------------------------------------
+# Early payment discounts
+# ---------------------------------------------------------------------------
+#: Requests still waiting for a decision.
+DISCOUNT_OPEN_STATUSES = ["Draft", "Submitted", "Under Review"]
+DISCOUNT_STATUSES = DISCOUNT_OPEN_STATUSES + ["Approved", "Rejected", "Cancelled"]
+
+
+class EarlyPaymentDiscountRequest(TenantModel):
+    """A customer's request for a discount for paying an invoice early.
+
+    Nothing is granted automatically: the request records what the customer
+    asked for against one receipt's allocation to one invoice, and an
+    authorised user decides the amount. Only an approval posts anything -- a
+    credit note through the existing note workflow -- and the invoice's
+    ``settlement_discount`` is derived from approved requests.
+
+    Invoice and payment details are snapshotted at request time so the record
+    still reads correctly after terms are changed.
+    """
+
+    request_number = models.TextField()
+    party = models.ForeignKey(
+        "masters.Party", on_delete=models.PROTECT, related_name="early_payment_discounts"
+    )
+    invoice = models.ForeignKey(
+        SalesInvoice, on_delete=models.PROTECT, related_name="discount_requests"
+    )
+    payment = models.ForeignKey(
+        PaymentIn, on_delete=models.PROTECT, related_name="discount_requests"
+    )
+
+    invoice_number = models.TextField(null=True, blank=True)
+    invoice_date = models.DateField(null=True, blank=True)
+    invoice_total = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    payment_terms = models.TextField(null=True, blank=True)
+    credit_days = models.IntegerField(null=True, blank=True)
+    due_date = models.DateField(null=True, blank=True)
+    payment_date = models.DateField()
+    #: What this receipt put against this invoice.
+    eligible_amount = models.DecimalField(max_digits=18, decimal_places=2)
+    #: due_date - payment_date; zero or negative when the payment was not early.
+    days_paid_early = models.IntegerField(default=0)
+
+    requested_amount = models.DecimalField(max_digits=18, decimal_places=2)
+    proposed_amount = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    approved_amount = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    customer_request_date = models.DateField(null=True, blank=True)
+    reason = models.TextField()
+    notes = models.TextField(null=True, blank=True)
+    #: Ids of ``core.File`` rows uploaded through ``/files/``.
+    attachments = models.JSONField(default=list, blank=True)
+
+    status = models.TextField(choices=choices(DISCOUNT_STATUSES), default="Draft")
+    requested_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    reviewed_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    decided_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
+    decision_reason = models.TextField(null=True, blank=True)
+    #: The posted credit note an approval produced.
+    credit_note = models.ForeignKey(
+        "accounting.StandaloneNote", null=True, blank=True, on_delete=models.PROTECT, related_name="+"
+    )
+    cancelled_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+    cancellation_reason = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "early_payment_discount_requests"
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "request_number"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_epd_request_number",
+            ),
+            # One live request per receipt per invoice: a second one for the
+            # same money is a duplicate, not a new request.
+            models.UniqueConstraint(
+                fields=["invoice", "payment"],
+                condition=models.Q(deleted_at__isnull=True)
+                & ~models.Q(status__in=["Rejected", "Cancelled"]),
+                name="uq_epd_live_per_payment",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(requested_amount__gt=0), name="ck_epd_requested_amount"
+            ),
+            models.CheckConstraint(
+                condition=models.Q(approved_amount__isnull=True) | models.Q(approved_amount__gt=0),
+                name="ck_epd_approved_amount",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["client", "status"], name="ix_epd_status"),
+            models.Index(fields=["client", "invoice"], name="ix_epd_invoice"),
+        ]
+
+    def __str__(self):
+        return self.request_number
 
 
 # ---------------------------------------------------------------------------
