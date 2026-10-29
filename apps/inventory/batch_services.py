@@ -175,6 +175,27 @@ def _receipt_line_batch(taka, po):
     )
 
 
+def awaiting_qc_filter(client_id):
+    """Q for purchase batches not yet through QC: received against a PO, and
+    every roll still at QC Hold. Once QC moves any roll out (pass, second,
+    rework or reject) the batch is a registry batch."""
+    from django.db.models import Exists, OuterRef
+
+    from . import services as stock
+    from .models import LotTaka
+
+    qc_hold = stock.system_location(client_id, "QC_HOLD")
+    outside_qc = LotTaka.objects.filter(batch=OuterRef("pk"), deleted_at__isnull=True).exclude(location_id=qc_hold.id)
+    return Q(origin="PURCHASE") & ~Exists(outside_qc)
+
+
+def is_awaiting_qc(batch, takas):
+    """Same rule as ``awaiting_qc_filter`` for one loaded batch."""
+    if batch.origin != "PURCHASE" or not takas:
+        return False
+    return all(t.location_id and t.location.code == "SYS-QC-HOLD" for t in takas)
+
+
 def _purchase_order_for(taka):
     """The PO a purchase-receipt roll was received against, if any."""
     if taka.source_document_type != "GRN" or not taka.source_document_id:
@@ -749,6 +770,9 @@ def serialize_batch(batch, *, takas=None, include_cost=False, detail=False):
         "takaCount": len(takas),
         "quantities": {k: (str(v) if isinstance(v, Decimal) else v) for k, v in qty.items()},
         "status": batch_status(qty),
+        # Received against a PO and not yet through QC: kept out of the
+        # registry and not ready for a QR tag.
+        "awaitingQc": is_awaiting_qc(batch, takas),
         "parentBatches": [b.batch_code for b in batch.parent_batches.all()],
         "childBatches": [b.batch_code for b in batch.child_batches.all()],
     }

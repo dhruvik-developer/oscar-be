@@ -29,6 +29,7 @@ A purchase order is the order; a batch is fabric that actually arrived. So:
 All quantities and costs are computed on the server; the screen only shows them.
 """
 import json
+import re
 from collections import defaultdict
 from decimal import Decimal
 
@@ -232,10 +233,19 @@ def _yarn_fields(client_id, row, index):
     if amount is None:
         amount = round2(required_qty * rate)
     actual = _qty(_get(row, "actualQtyUsed"), field, required=False, allow_zero=True)
+    supplier = _party(client_id, _get(row, "supplierId"), field)
+    phone = _text(row, "supplierPhone")
+    if phone and not re.fullmatch(r"\+?[0-9][0-9 -]{5,18}[0-9]", phone):
+        raise ValidationFailed(
+            f"Yarn line {index + 1}: enter a valid contact number (digits, + - and spaces).",
+            field_errors={field: ["Invalid contact number."]},
+        )
     return {
         "item": item,
         "yarn_quality": quality or (item.name if item else None),
-        "supplier": _party(client_id, _get(row, "supplierId"), field),
+        "supplier": supplier,
+        "supplier_name": _text(row, "supplierName") or (supplier.name if supplier else None),
+        "supplier_phone": phone,
         "yarn_lot": _text(row, "yarnLot", "lot"),
         "required_qty": required_qty,
         "uom": _text(row, "uom") or (item.uom if item else None) or "Kg",
@@ -937,7 +947,8 @@ def serialize_yarn(y):
     return {
         "id": str(y.id), "itemId": _s(y.item_id), "item": y.item.name if y.item_id else None,
         "yarnQuality": y.yarn_quality, "supplierId": _s(y.supplier_id),
-        "supplierName": y.supplier.name if y.supplier_id else None, "yarnLot": y.yarn_lot,
+        "supplierName": y.supplier_name or (y.supplier.name if y.supplier_id else None),
+        "supplierPhone": y.supplier_phone, "yarnLot": y.yarn_lot,
         "requiredQty": str(y.required_qty), "uom": y.uom, "rate": str(y.rate), "amount": str(y.amount),
         "actualQtyUsed": _s(y.actual_qty_used), "remarks": y.remarks,
     }

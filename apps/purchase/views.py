@@ -2812,6 +2812,12 @@ class GoodsReceiptViewSet(TenantModelViewSet):
 
                 )
 
+                # A factory fabric order received here books the batch's cost
+                # (received qty x rate + its share of the PO's costs) exactly as
+                # a receipt from the PO screen does.
+                if receipt.purchase_order_id and receipt.purchase_order.fabric_flow:
+                    fabric_flow.allocate_costs(receipt.purchase_order, user=request.user)
+
                 self.write_audit("create", receipt, description=f"Standalone GRN created: {receipt.grn_number}")
 
         except Exception:

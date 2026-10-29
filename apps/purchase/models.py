@@ -669,6 +669,10 @@ class PurchaseOrderYarnLine(TenantModel):
     supplier = models.ForeignKey(
         "masters.Party", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
+    #: The yarn supplier as typed (yarn is often bought from someone who is
+    #: not in the party master); ``supplier`` links a known party when chosen.
+    supplier_name = models.TextField(null=True, blank=True)
+    supplier_phone = models.TextField(null=True, blank=True)
     yarn_lot = models.TextField(null=True, blank=True)
     required_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
     uom = models.TextField(default="Kg")

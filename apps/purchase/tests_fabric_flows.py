@@ -107,6 +107,22 @@ class FlowAFactoryToOscarTests(FabricFlowTestBase):
         # Planned yarn is not consumed stock.
         self.assertFalse(StockMovement.objects.filter(item=self.yarn).exists())
 
+    def test_yarn_supplier_is_typed_by_hand_with_a_contact_number(self):
+        po = self.create_po("FACTORY_TO_OSCAR")
+        res = self.api.put(self.url(po, "yarn-lines/"), {"yarnLines": [
+            {"yarnQuality": "30s carded cotton", "supplierName": "Shree Yarn Traders",
+             "supplierPhone": "+91 98250 12345", "yarnLot": "B-17", "requiredQty": 50, "uom": "Kg", "rate": 210},
+        ]}, format="json")
+        self.assertEqual(res.status_code, 200, res.content)
+        line = self.api.get(self.url(po)).json()["yarnLines"][0]
+        self.assertEqual((line["yarnQuality"], line["itemId"]), ("30s carded cotton", None))
+        self.assertEqual((line["supplierName"], line["supplierPhone"], line["supplierId"]),
+                         ("Shree Yarn Traders", "+91 98250 12345", None))
+        bad = self.api.put(self.url(po, "yarn-lines/"), {"yarnLines": [
+            {"yarnQuality": "30s", "supplierPhone": "call me"},
+        ]}, format="json")
+        self.assertEqual(bad.status_code, 400, bad.content)
+
     def test_three_partial_receipts_make_three_grey_batches(self):
         po = self.create_po("FACTORY_TO_OSCAR")
         self.post(po, "dispatches/", {"dispatchedQty": 1000, "dispatchDate": "2026-10-22", "challanNo": "F-1"})
@@ -331,3 +347,50 @@ class ExistingPurchaseTypesTests(FabricFlowTestBase):
         po = self.create_po("FACTORY_TO_OSCAR")
         res = self.api.patch(f"/api/v1/purchase/orders/{po.id}/", {"fabricFlow": "FACTORY_TO_MILL"}, format="json")
         self.assertEqual(res.status_code, 400)
+
+
+class StandaloneGrnOnFabricFlowTests(FabricFlowTestBase):
+    def test_grn_screen_opens_a_batch_per_receipt_and_books_its_cost(self):
+        po = self.create_po("FACTORY_TO_OSCAR", qty=1000, rate=40)
+        line = po.line_items.first()
+        for qty, rate, challan in ((450, 40, "CH-1"), (550, 42, "CH-2")):
+            r = self.api.post("/api/v1/purchase/receipts/", {
+                "vendorId": str(self.factory.id), "purchaseOrderId": str(po.id), "locationId": str(self.godown.id),
+                "receiptDate": "2026-10-25", "supplierChallanNo": challan,
+                "lines": [{"itemId": str(self.fabric.id), "poLineId": str(line.id), "receivedQty": qty, "unitCost": rate,
+                           "takas": [{"taka_number": "1", "qty": qty}]}],
+            }, format="json")
+            self.assertEqual(r.status_code, 201, r.content)
+        batches = self.batches(po)
+        self.assertEqual(len(batches), 2)
+        self.assertTrue(all(b.fabric_type == "GREY" for b in batches))
+        fabric = [PurchaseOrderCostAllocation.objects.get(batch=b, expense__isnull=True, deleted_at__isnull=True).amount
+                  for b in batches]
+        self.assertEqual(fabric, [Decimal("18000.00"), Decimal("23100.00")])
+
+
+class RegistryAfterQcTests(FabricFlowTestBase):
+    def test_receipt_joins_registry_and_stock_only_after_qc(self):
+        po = self.create_po("FACTORY_TO_OSCAR", qty=1000, rate=40)
+        summary = self.receive(po, 450, challan="Q-1")
+        grn = summary["receipts"][0]["grnNumber"]
+        batch = self.batches(po)[0]
+
+        listing = self.api.get("/api/v1/inventory/batches/").json()
+        self.assertEqual(listing["count"], 0)
+        self.assertEqual(listing["awaitingQcCount"], 1)
+        shown = self.api.get("/api/v1/inventory/batches/", {"awaitingQc": "include"}).json()
+        self.assertTrue(shown["results"][0]["awaitingQc"])
+        # Nothing in the godown before QC.
+        self.assertEqual(sum(t.available_quantity for t in LotTaka.objects.filter(batch=batch, location=self.godown)), 0)
+
+        receipt = GoodsReceipt.objects.get(grn_number=grn, client=self.tenant)
+        qc_service.dispose_receipt(receipt, quantities={"good": Decimal("440"), "reject": Decimal("10")},
+                                   user=self.user, require_job_work_order=False)
+        listing = self.api.get("/api/v1/inventory/batches/").json()
+        self.assertEqual(listing["count"], 1)
+        self.assertEqual(listing["awaitingQcCount"], 0)
+        row = listing["results"][0]
+        self.assertFalse(row["awaitingQc"])
+        self.assertEqual(row["batchCode"], batch.batch_code)
+        self.assertEqual(sum(t.available_quantity for t in LotTaka.objects.filter(batch=batch, location=self.godown)), Decimal("440"))

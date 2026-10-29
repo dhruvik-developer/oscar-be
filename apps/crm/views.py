@@ -160,6 +160,14 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
             unassigned=Count("id", filter=Q(owner__isnull=True)),
         )
 
+    def after_create(self, instance):
+        # Products picked on the lead form show as fabric requirements.
+        services.sync_form_products(instance, user=self.request.user)
+
+    def after_update(self, instance, before):
+        if (before or {}).get("custom_values") != instance.custom_values:
+            services.sync_form_products(instance, user=self.request.user)
+
     def perform_create(self, serializer):
         serializer.validated_data["lead_number"] = allocate_number(
             self.request.user.client, "LEAD"
@@ -1319,6 +1327,8 @@ class DealViewSet(TenantModelViewSet):
         """Priced deliverable lines (the deal workspace Products tab)."""
         deal = self.get_object()
         if request.method == "GET":
+            # Requirements captured on the lead show on its deal.
+            services.sync_lead_products(deal)
             rows = deal.lines.filter(deleted_at__isnull=True)
             return Response(envelope(DealLineSerializer(rows, many=True).data))
         serializer = DealLineSerializer(

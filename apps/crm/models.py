@@ -606,6 +606,12 @@ class DealLine(TenantModel):
     qty = models.DecimalField(max_digits=18, decimal_places=4, default=1)
     rate = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     unit = models.TextField(default="Qty")
+    #: The lead requirement this line was copied from (see
+    #: ``services.sync_lead_products``); a lead product is copied once, so a
+    #: line removed from the deal is not brought back.
+    lead_product = models.ForeignKey(
+        LeadProduct, null=True, blank=True, on_delete=models.SET_NULL, related_name="deal_lines"
+    )
 
     class Meta:
         db_table = "crm_deal_lines"

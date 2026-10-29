@@ -6150,6 +6150,19 @@ class BatchListView(APIView):
         roll = roll_filter(params, prefix="takas__")
         if roll is not None:
             qs = qs.filter(roll).distinct()
+        # Fabric received against a PO enters the registry only once QC has
+        # dealt with it: a purchase batch whose every roll still sits at QC
+        # Hold is listed under QC Work, not here (?awaitingQc=include shows
+        # them too, ?awaitingQc=only shows just them).
+        from .batch_services import awaiting_qc_filter
+
+        awaiting = awaiting_qc_filter(request.client_id)
+        awaiting_count = qs.filter(awaiting).count()
+        mode = params.get("awaitingQc")
+        if mode == "only":
+            qs = qs.filter(awaiting)
+        elif mode != "include":
+            qs = qs.exclude(awaiting)
         qs = qs.order_by("-created_on", "-created_at")
 
         try:
@@ -6170,6 +6183,7 @@ class BatchListView(APIView):
             rows = [serialize_batch(b, include_cost=with_cost) for b in qs[(page - 1) * page_size: page * page_size]]
         body = envelope(rows, count=total, page=page, page_size=page_size)
         body["canSeeCost"] = _can_see_batch_cost(request.user)
+        body["awaitingQcCount"] = awaiting_count
         body["summary"] = stock_totals(request.client_id, qs.values("id"), roll_filter(params))
         return Response(body)
 
