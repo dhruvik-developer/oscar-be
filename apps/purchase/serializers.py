@@ -115,6 +115,12 @@ class PurchaseOrderSerializer(DocumentSerializer):
     )
     projectCode = serializers.CharField(source="project.code", read_only=True, default=None)
     projectName = serializers.CharField(source="project.customer_name", read_only=True, default=None)
+    #: Factory fabric flow (Factory -> OSCAR, or Factory -> Dyeing Mill -> OSCAR).
+    fabricFlow = serializers.CharField(source="fabric_flow", required=False, allow_null=True, allow_blank=True)
+    dyeingMillId = TenantPrimaryKeyRelatedField(
+        source="dyeing_mill", model="masters.Party", required=False, allow_null=True
+    )
+    dyeingMillName = serializers.CharField(source="dyeing_mill.name", read_only=True, default=None)
 
     class Meta:
         model = PurchaseOrder
@@ -122,6 +128,7 @@ class PurchaseOrderSerializer(DocumentSerializer):
             "po_number", "status", "expected_date", "location",
             "reference_number", "auto_generated", "vendorId", "vendorName",
             "billedStatus", "purchaseType", "projectId", "projectCode", "projectName",
+            "fabricFlow", "dyeingMillId", "dyeingMillName",
         ]
         read_only_fields = READ_ONLY_HEADER_FIELDS + ["po_number", "auto_generated"]
 
@@ -142,9 +149,24 @@ class PurchaseOrderSerializer(DocumentSerializer):
             )
         return value
 
+    def validate_fabricFlow(self, value):
+        from .fabric_flow import validate_flow
+
+        return validate_flow(value)
+
     def validate(self, attrs):
+        from .fabric_flow import mark_purchase_type
+
         attrs = super().validate(attrs)
         instance = self.instance
+        if instance is not None and instance.status != "Draft" and "fabric_flow" in attrs \
+                and (attrs["fabric_flow"] or None) != instance.fabric_flow:
+            raise serializers.ValidationError(
+                {"fabricFlow": "The fabric flow cannot change once the PO has left Draft."}
+            )
+        attrs = mark_purchase_type(attrs)
+        if attrs.get("fabric_flow") is None and "fabric_flow" in attrs:
+            attrs["dyeing_mill"] = None
         purchase_type = attrs.get("purchase_type")
         if instance is None:
             # Final job work POs are only generated from a verified production

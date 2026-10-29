@@ -55,6 +55,10 @@ def assign_batch(taka):
 
     A purchase-order batch holds one HSN code: fabrics of a PO with different
     HSNs go into separate batches.
+
+    A factory fabric order (``PurchaseOrder.fabric_flow``) opens one batch per
+    received line instead: every actual receipt is its own batch, Grey Fabric
+    for factory -> OSCAR and Dyed Fabric for factory -> dyeing mill -> OSCAR.
     """
     from apps.core.numbering import allocate_number
 
@@ -68,6 +72,9 @@ def assign_batch(taka):
     # PO (partial or repeat deliveries) joins the batch its first receipt of
     # that HSN opened.
     po = _purchase_order_for(taka)
+    if po is not None and po.fabric_flow:
+        taka.batch = _receipt_line_batch(taka, po)
+        return
     if po is not None:
         hsn = item_hsn(taka.item)
         existing = next((
@@ -122,6 +129,47 @@ def assign_batch(taka):
         source_document_type=taka.source_document_type,
         source_document_number=taka.source_document_number,
         source_document_id=taka.source_document_id,
+        **({"created_on": on_date} if on_date else {}),
+        uom=taka.uom,
+    )
+
+
+def _receipt_line_batch(taka, po):
+    """The batch of one received line of a factory fabric order, opened by the
+    line's first roll. Keyed on the GRN line, so a replayed or repeated save
+    of the same receipt line can never open a second batch."""
+    from apps.core.numbering import allocate_number
+    from apps.purchase.models import FABRIC_FLOW_FACTORY_TO_MILL, GoodsReceiptLine
+
+    from .models import Batch
+
+    grn_line = (
+        GoodsReceiptLine.objects.filter(pk=taka.source_line_id).select_related("goods_receipt").first()
+        if taka.source_line_id else None
+    )
+    receipt_id = grn_line.goods_receipt_id if grn_line else taka.source_document_id
+    existing = Batch.objects.filter(
+        client_id=taka.client_id, goods_receipt_id=receipt_id,
+        goods_receipt_line_id=grn_line.id if grn_line else None, deleted_at__isnull=True,
+    ).first()
+    if existing is not None:
+        return existing
+    fabric_type = "DYED" if po.fabric_flow == FABRIC_FLOW_FACTORY_TO_MILL else "GREY"
+    on_date = taka.received_date if hasattr(taka.received_date, "year") else None
+    return Batch.objects.create(
+        client_id=taka.client_id,
+        batch_code=allocate_number(taka.client_id, batch_series(fabric_type), on_date),
+        origin="PURCHASE",
+        fabric_type=fabric_type,
+        item_id=taka.item_id,
+        supplier_id=po.party_id or taka.supplier_id,
+        source_document_type="GRN",
+        source_document_number=taka.source_document_number,
+        source_document_id=receipt_id,
+        purchase_order=po,
+        purchase_order_line_id=grn_line.purchase_order_line_id if grn_line else None,
+        goods_receipt_id=receipt_id,
+        goods_receipt_line=grn_line,
         **({"created_on": on_date} if on_date else {}),
         uom=taka.uom,
     )
@@ -726,6 +774,15 @@ def serialize_batch(batch, *, takas=None, include_cost=False, detail=False):
         } for t in takas]
         data["timeline"] = batch_timeline(batch, takas, include_cost=include_cost)
         data["notes"] = batch.notes
+        if batch.purchase_order_id:
+            from apps.purchase.fabric_flow import batch_trace
+
+            trace = batch_trace(batch)
+            if trace and not include_cost:
+                # Cost figures follow the same ledger gate as the batch's own costing.
+                for key in ("allocatedCosts", "allocatedTotal", "landedRate"):
+                    trace.pop(key, None)
+            data["purchaseTrace"] = trace
         from .batch360_services import batch_360
 
         data.update(batch_360(batch, takas=takas, include_cost=include_cost))

@@ -456,6 +456,8 @@ def record_receipt_verdict(receipt, quantities, *, user=None, remarks=None, meas
     """Add a QC result to the receipt's running totals and set its verdict,
     bill QC status and audit trail. Shared by the quantity disposition and
     the roll-by-roll QC entry. Returns the verdict."""
+    from apps.purchase.models import PurchaseBill
+
     meta = _load_meta(receipt)
     cumulative = {
         category: D(str(meta.get("cumulative", {}).get(category, 0)))

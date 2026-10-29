@@ -54,7 +54,7 @@ from apps.sales.views import PostedReturnGuardMixin, SalesDocumentViewSet, _clon
 
 
 
-from . import services
+from . import fabric_flow, services
 
 from .models import (
 
@@ -184,6 +184,7 @@ class PurchaseOrderViewSet(SalesDocumentViewSet):
 
 
 
+    @transaction.atomic
     def perform_create(self, serializer):
 
         serializer.validated_data["po_number"] = allocate_number(
@@ -198,10 +199,14 @@ class PurchaseOrderViewSet(SalesDocumentViewSet):
 
         check_po_rate_tolerance(instance, user=self.request.user)
 
+        # Yarn plan and opening costs of a factory fabric order, saved with it.
+        fabric_flow.apply_order_extras(instance, self.request.data, user=self.request.user, creating=True)
+
         return instance
 
 
 
+    @transaction.atomic
     def perform_update(self, serializer):
 
         instance = super().perform_update(serializer)
@@ -210,7 +215,104 @@ class PurchaseOrderViewSet(SalesDocumentViewSet):
 
         check_po_rate_tolerance(instance, user=self.request.user)
 
+        fabric_flow.apply_order_extras(instance, self.request.data, user=self.request.user)
+
         return instance
+
+    # -- factory fabric flows (Factory -> OSCAR, Factory -> Dyeing Mill -> OSCAR)
+
+    def _flow_order(self, pk):
+        return self.get_queryset().select_related("party", "dyeing_mill").get(pk=pk)
+
+    def _flow_write(self, request, pk, permission, work, *, status_code=status.HTTP_200_OK):
+        """Run one fabric-flow write under the idempotency key (a replayed
+        Save returns the first response instead of writing twice) and answer
+        with the PO's refreshed fabric-flow summary."""
+        from apps.core.permissions import require_permission
+
+        require_permission(request.user, permission)
+        po = self._flow_order(pk)
+        try:
+            record = idempotency.begin(request, request.client_id, request.path, request.data)
+        except idempotency.Replay as replay:
+            response = Response(replay.body, status=replay.status)
+            response["Idempotency-Replayed"] = "true"
+            return response
+        try:
+            with transaction.atomic():
+                work(po)
+                body = fabric_flow.summary(self._flow_order(pk))
+        except Exception:
+            idempotency.fail(record)
+            raise
+        return idempotency.finish(record, Response(body, status=status_code))
+
+    @action(detail=True, methods=["get"], url_path="fabric-flow")
+    def fabric_flow_summary(self, request, pk=None):
+        """Quantities, yarn, dispatches, mill, receipts & batches, costs and
+        discrepancies of a factory fabric order."""
+        return Response(fabric_flow.summary(self._flow_order(pk)))
+
+    @action(detail=True, methods=["put"], url_path="fabric-flow/yarn-lines")
+    def fabric_flow_yarn(self, request, pk=None):
+        return self._flow_write(request, pk, "create_purchase_order",
+                                lambda po: fabric_flow.replace_yarn_lines(po, request.data.get("yarnLines") or [], user=request.user))
+
+    @action(detail=True, methods=["post"], url_path="fabric-flow/dispatches")
+    def fabric_flow_dispatch(self, request, pk=None):
+        return self._flow_write(request, pk, "create_purchase_order",
+                                lambda po: fabric_flow.record_dispatch(po, request.data, user=request.user),
+                                status_code=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"], url_path="fabric-flow/mill-processes")
+    def fabric_flow_mill(self, request, pk=None):
+        return self._flow_write(request, pk, "create_purchase_order",
+                                lambda po: fabric_flow.record_mill_process(po, request.data, user=request.user),
+                                status_code=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["patch"], url_path=r"fabric-flow/mill-processes/(?P<record_id>[^/.]+)")
+    def fabric_flow_mill_update(self, request, pk=None, record_id=None):
+        return self._flow_write(request, pk, "create_purchase_order",
+                                lambda po: fabric_flow.update_mill_process(po, record_id, request.data, user=request.user))
+
+    @action(detail=True, methods=["post"], url_path="fabric-flow/receipts")
+    def fabric_flow_receive(self, request, pk=None):
+        def work(po):
+            receipt = fabric_flow.receive(po, request.data, user=request.user)
+            self.write_audit("create", receipt, description=f"Fabric receipt {receipt.grn_number} against {po.po_number}")
+
+        return self._flow_write(request, pk, "receive_goods", work, status_code=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"], url_path="fabric-flow/expenses")
+    def fabric_flow_expense_add(self, request, pk=None):
+        return self._flow_write(request, pk, "create_purchase_order",
+                                lambda po: fabric_flow.add_expense(po, request.data, user=request.user),
+                                status_code=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["patch", "delete"], url_path=r"fabric-flow/expenses/(?P<expense_id>[^/.]+)")
+    def fabric_flow_expense(self, request, pk=None, expense_id=None):
+        if request.method == "DELETE":
+            return self._flow_write(request, pk, "create_purchase_order",
+                                    lambda po: fabric_flow.delete_expense(po, expense_id, user=request.user))
+        return self._flow_write(request, pk, "create_purchase_order",
+                                lambda po: fabric_flow.update_expense(po, expense_id, request.data, user=request.user))
+
+    @action(detail=True, methods=["post"], url_path="fabric-flow/discrepancies")
+    def fabric_flow_classify(self, request, pk=None):
+        return self._flow_write(request, pk, "receive_goods",
+                                lambda po: fabric_flow.classify_discrepancy(po, request.data, user=request.user),
+                                status_code=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["delete"], url_path=r"fabric-flow/discrepancies/(?P<entry_id>[^/.]+)")
+    def fabric_flow_release(self, request, pk=None, entry_id=None):
+        return self._flow_write(request, pk, "receive_goods",
+                                lambda po: fabric_flow.release_discrepancy(
+                                    po, entry_id, user=request.user, reason=request.query_params.get("reason")))
+
+    @action(detail=True, methods=["post"], url_path="fabric-flow/allocate-costs")
+    def fabric_flow_allocate(self, request, pk=None):
+        return self._flow_write(request, pk, "create_purchase_order",
+                                lambda po: fabric_flow.allocate_costs(po, user=request.user))
 
 
 
