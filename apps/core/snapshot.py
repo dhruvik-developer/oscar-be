@@ -11,6 +11,7 @@ because a restore that silently clobbers live financial data is worse than one
 that refuses.
 """
 from django.apps import apps
+from django.contrib.auth.hashers import make_password
 from django.db import transaction
 
 from .audit import _jsonable, record_audit
@@ -117,6 +118,10 @@ SNAPSHOT_MODELS = [
 #: Never exported. Credentials, tokens and replay caches are not backup data.
 EXCLUDED_FIELDS = {"password", "token_hash", "refresh_token_hash", "request_hash"}
 
+#: Never imported either: a restore must not be a way to grant privilege.
+#: Restored users come back without a usable password and reset it by email.
+PRIVILEGED_FIELDS = {"is_superuser", "is_staff"}
+
 
 def export_snapshot(client_id):
     """A JSON document of this tenant's rows, newest schema first."""
@@ -153,31 +158,74 @@ def import_snapshot(client_id, snapshot, *, user=None):
 
     Additive only: existing primary keys are skipped rather than overwritten,
     and every row is re-stamped with the target tenant so a snapshot cannot be
-    used to write into someone else's data.
+    used to write into someone else's data. The file is untrusted input, so:
+
+    * only the tables in ``SNAPSHOT_MODELS`` are restored, in that order,
+      whatever ``tableOrder`` says;
+    * credential and privilege columns are dropped, and users get an
+      unusable password;
+    * a foreign key must point at a row of this tenant, existing or created by
+      this same snapshot. Rows that point anywhere else are rejected.
     """
     tables = snapshot.get("tables") or {}
-    order = snapshot.get("tableOrder") or SNAPSHOT_MODELS
+    labels = [label for label in SNAPSHOT_MODELS if tables.get(label)]
+    models = {label: apps.get_model(label) for label in labels}
+    labels = [label for label in labels if hasattr(models[label], "client_id")]
+
+    # Primary keys anywhere in the database (any tenant) are never re-created,
+    # so they cannot count as "created by this snapshot" either.
+    taken = {
+        label: {str(pk) for pk in models[label]._base_manager.values_list("pk", flat=True)}
+        for label in labels
+    }
+    incoming = {
+        label: {str(row.get("id")) for row in tables[label] if isinstance(row, dict) and row.get("id")}
+        - taken[label]
+        for label in labels
+    }
+    allowed_cache = {}
+
+    def allowed_ids(target):
+        """PKs of `target` a restored row may reference."""
+        key = target._meta.label
+        if key not in allowed_cache:
+            ids = {str(pk) for pk in target._base_manager.filter(client_id=client_id).values_list("pk", flat=True)}
+            allowed_cache[key] = ids | incoming.get(key, set())
+        return allowed_cache[key]
 
     created = {}
     skipped = {}
-    for label in order:
-        rows = tables.get(label)
-        if not rows:
-            continue
-        model = apps.get_model(label)
-        field_names = {field.attname for field in model._meta.concrete_fields}
+    rejected = {}
+    for label in labels:
+        model = models[label]
+        fields = [f for f in model._meta.concrete_fields if f.name not in EXCLUDED_FIELDS | PRIVILEGED_FIELDS]
+        field_names = {f.attname for f in fields}
+        # Tenant-scoped targets only; "client" itself is overwritten below.
+        tenant_fks = [
+            f for f in fields
+            if f.is_relation and f.attname != "client_id" and hasattr(f.related_model, "client_id")
+        ]
 
-        existing_ids = set(
-            str(value) for value in model.objects.values_list("pk", flat=True)
-        )
         to_create = []
-        for row in rows:
+        for row in tables[label]:
+            if not isinstance(row, dict):
+                rejected[label] = rejected.get(label, 0) + 1
+                continue
             payload = {key: value for key, value in row.items() if key in field_names}
             payload["client_id"] = client_id  # never trust the snapshot's tenant
             pk = str(payload.get("id") or "")
-            if pk and pk in existing_ids:
+            if pk and pk in taken[label]:
                 skipped[label] = skipped.get(label, 0) + 1
                 continue
+            if any(
+                payload.get(f.attname) not in (None, "")
+                and str(payload[f.attname]) not in allowed_ids(f.related_model)
+                for f in tenant_fks
+            ):
+                rejected[label] = rejected.get(label, 0) + 1
+                continue
+            if label == "accounts.User":
+                payload["password"] = make_password(None)
             to_create.append(model(**payload))
 
         if to_create:
@@ -191,6 +239,6 @@ def import_snapshot(client_id, snapshot, *, user=None):
         entity_type="Client",
         entity_id=None,
         description=f"Snapshot restored: {sum(created.values())} rows created",
-        after={"created": created, "skipped": skipped},
+        after={"created": created, "skipped": skipped, "rejected": rejected},
     )
-    return {"created": created, "skipped": skipped}
+    return {"created": created, "skipped": skipped, "rejected": rejected}

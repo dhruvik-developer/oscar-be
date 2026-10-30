@@ -56,6 +56,7 @@ REPORT_CATALOGUE = [
     ("hrms-attrition", "Attrition", "HRMS", ["date_from", "date_to"]),
     ("annual-commercial-leakage", "Annual Commercial Leakage", "Accounts", ["date_from", "date_to"]),
     ("party-profitability", "Party Profitability", "Sales", ["date_from", "date_to"]),
+    ("salesperson-profitability", "Salesperson Profitability", "Sales", ["date_from", "date_to"]),
     ("design-colour-analysis", "Design & Colour Fabric Analysis", "Inventory", ["date_from", "date_to"]),
     ("stock-ageing-mis", "Stock Ageing MIS", "Inventory", ["asOf"]),
 ]
@@ -80,6 +81,7 @@ REPORT_PERMISSIONS = {
     "sales-register": ["view_sales"],
     "sales-dashboard": ["view_sales"],
     "party-profitability": ["view_sales"],
+    "salesperson-profitability": ["view_sales"],
     "vendor-allocation": ["view_purchase"],
     "purchase-register": ["view_purchase"],
     "crm-pipeline": ["view_lead"],
@@ -207,11 +209,15 @@ class ReportView(APIView):
 
     def _report_sales_dashboard(self, request, client_id, date_from, date_to, as_of):
         """The business-position dashboard, every figure computed server-side."""
+        from apps.inventory.views import _can_see_batch_cost
+
         from .dashboard import business_dashboard
 
         day = request.query_params.get("date") or as_of
         try:
-            return Response(business_dashboard(client_id, day=day))
+            return Response(business_dashboard(
+                client_id, day=day, include_batch_profit=_can_see_batch_cost(request.user),
+            ))
         except ValueError:
             raise ValidationFailed(
                 "Date must be YYYY-MM-DD.", field_errors={"date": ["Expected YYYY-MM-DD."]}
@@ -224,6 +230,10 @@ class ReportView(APIView):
     def _report_party_profitability(self, request, client_id, date_from, date_to, as_of):
         from .mis_reports import party_profitability_report
         return Response(party_profitability_report(client_id, date_from=date_from, date_to=date_to))
+
+    def _report_salesperson_profitability(self, request, client_id, date_from, date_to, as_of):
+        from .mis_reports import salesperson_profitability_report
+        return Response(salesperson_profitability_report(client_id, date_from=date_from, date_to=date_to))
 
     def _report_design_colour_analysis(self, request, client_id, date_from, date_to, as_of):
         from .mis_reports import design_colour_analysis
@@ -257,6 +267,7 @@ class ReportView(APIView):
                 revenue=money_sum("taxable_value"),
                 invoiced=money_sum("total"),
                 received=money_sum("amount_paid"),
+                discounted=money_sum("settlement_discount"),
                 invoiceCount=Count("id"),
             )
             .order_by("-revenue")
@@ -272,7 +283,7 @@ class ReportView(APIView):
                         "revenue": round2(row["revenue"]),
                         "invoiced": round2(row["invoiced"]),
                         "received": round2(row["received"]),
-                        "outstanding": round2(row["invoiced"] - row["received"]),
+                        "outstanding": round2(row["invoiced"] - row["received"] - row["discounted"]),
                         "invoiceCount": row["invoiceCount"],
                         "sharePct": round(float(row["revenue"] / total * 100), 1),
                     }

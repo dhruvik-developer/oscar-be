@@ -257,7 +257,7 @@ class UnitProtectionTests(UomTestBase):
         self.assertEqual(response.status_code, 400, response.content[:400])
 
     def test_item_unit_must_exist_and_be_active(self):
-        base = {"name": "Thing", "item_kind": "Consumable"}
+        base = {"name": "Thing", "item_kind": "Fabric"}
         bad = self.api_post("/inventory/items/", {**base, "sku": "T-1", "uom": "Furlong"})
         self.assertEqual(bad.status_code, 400, bad.content[:400])
         good = self.api_post("/inventory/items/", {**base, "sku": "T-2", "uom": "Kg"})

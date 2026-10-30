@@ -24,6 +24,21 @@ class EnvelopePagination(PageNumberPagination):
     page_size_query_param = "page_size"
     max_page_size = 200  # api.md §1.3 -- capped by contract, enforced here too
     page_query_param = "page"
+    #: Many screens send ``?limit=`` (the name api.md's examples use). It means
+    #: the same as ``page_size``; ignoring it silently cut those lists at 25.
+    page_size_alias = "limit"
+
+    def get_page_size(self, request):
+        if self.page_size_query_param not in request.query_params:
+            raw = request.query_params.get(self.page_size_alias)
+            if raw:
+                try:
+                    size = int(raw)
+                except (TypeError, ValueError):
+                    size = 0
+                if size > 0:
+                    return min(size, self.max_page_size)
+        return super().get_page_size(request)
 
     def paginate_queryset(self, queryset, request, view=None):
         self._view = view

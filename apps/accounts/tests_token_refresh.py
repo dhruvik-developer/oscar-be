@@ -12,7 +12,7 @@ from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import AccessToken
 
-from apps.accounts.models import Client, User
+from apps.accounts.models import Client, Role, User
 
 
 def uid(prefix):
@@ -23,11 +23,12 @@ class TokenRefreshTests(TestCase):
     def setUp(self):
         self.tenant = Client.objects.create(slug=uid("refresh"), name="Refresh Tenant")
         self.email = f"{uid('u')}@example.com"
-        User.objects.create_user(email=self.email, password="Pass1234!", client=self.tenant, name="Refresh User")
+        role = Role.objects.create(client=self.tenant, code="STAFF", name="Staff")
+        User.objects.create_user(email=self.email, password="Pass1234!", client=self.tenant, name="Refresh User", role=role)
         self.api = APIClient()
 
     def login(self):
-        resp = self.api.post("/api/v1/auth/login/", {"email": self.email, "password": "Pass1234!"}, format="json")
+        resp = self.api.post("/api/v1/auth/login/", {"email": self.email, "password": "Pass1234!", "role": "STAFF"}, format="json")
         self.assertEqual(resp.status_code, 200, resp.content[:300])
         return resp.data["access"], resp.data["refresh"]
 

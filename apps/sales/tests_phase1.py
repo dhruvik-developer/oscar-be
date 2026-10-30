@@ -58,9 +58,6 @@ class Phase1Base(TestCase):
             client=self.tenant, sku="FAB-P1", name="Grey Fabric", item_kind="Standalone",
             uom="Mtr", cost_price=Decimal("999"),
         )
-        self.service = Item.objects.create(
-            client=self.tenant, sku="SRV-P1", name="Stitching", item_kind="Service", uom="Nos",
-        )
         self.customer = Party.objects.create(
             client=self.tenant, code="C-P1", name="Customer One", type="Customer"
         )
@@ -170,7 +167,9 @@ class PurchaseBillJournalTests(Phase1Base):
             qty=Decimal("20"), rate=Decimal("50"), amount=Decimal("1000"),
         )
         PurchaseBillLine.objects.create(
-            client=self.tenant, purchase_bill=bill, line_no=2, item=self.service,
+            # Every item kind holds stock now (masters 0025: ITEM_KINDS is Fabric
+            # only, STOCKLESS_ITEM_KINDS is empty); a free-text line is non-stock.
+            client=self.tenant, purchase_bill=bill, line_no=2, item=None, item_name="Stitching",
             qty=Decimal("1"), rate=Decimal("500"), amount=Decimal("500"),
         )
         entry = ledger.post_purchase_bill(bill)
@@ -206,13 +205,16 @@ class ConvertToInvoiceTests(Phase1Base):
 
     def test_non_stock_lines_need_no_dispatch(self):
         order = self.order(qty=10, extra_lines=[
-            {"itemId": str(self.service.id), "qty": 1, "rate": 300, "tax": 0},
+            # Free-text (item-less) line: the only non-stock line left since
+            # masters 0025 made every item kind stock-holding.
+            {"itemName": "Stitching", "description": "Stitching", "qty": 1, "rate": 300, "tax": 0},
         ])
         invoice = self.post(f"/sales/orders/{order['id']}/convert-to-invoice/")
         self.assertEqual(invoice.status_code, 201, invoice.content[:400])
         rows = invoice.json()["lineItems"]
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["itemId"], str(self.service.id))
+        self.assertIsNone(rows[0]["itemId"])
+        self.assertEqual(rows[0]["itemName"], "Stitching")
 
     def test_challan_must_be_dispatched_and_billed_once(self):
         order = self.order(qty=10)
@@ -423,6 +425,61 @@ class LotTrackedDispatchTests(Phase1Base):
         self.assertEqual(self.takas[0].available_quantity, Decimal("30"))
         self.assertEqual(self.takas[1].available_quantity, Decimal("30"))
 
+    def _reserved_order(self, qty, taka):
+        response = self.post("/sales/orders/", {
+            "partyId": str(self.customer.id),
+            "date": str(timezone.localdate()),
+            "lineItems": [{
+                "itemId": str(self.taka_item.id), "qty": qty, "rate": 100, "tax": 0,
+                "reservedTakas": [{"lotTakaId": str(taka.id), "qty": qty}],
+            }],
+        })
+        self.assertEqual(response.status_code, 201, response.content[:600])
+        return response.json()
+
+    def test_fifo_skips_takas_reserved_for_another_order(self):
+        # Order A reserves the oldest taka; a FIFO sale for order B must not take it.
+        self._reserved_order(30, self.takas[0])
+        self.takas[0].refresh_from_db()
+        self.assertEqual(self.takas[0].status, "Reserved")
+        order_b = self._taka_order(20)
+        self.dispatch(order_b["id"])
+        for taka in self.takas:
+            taka.refresh_from_db()
+        self.assertEqual(self.takas[0].available_quantity, Decimal("30"))
+        self.assertEqual(self.takas[1].available_quantity, Decimal("30"))
+
+    def test_own_reservation_is_drawn_first_and_released(self):
+        order = self._reserved_order(20, self.takas[1])
+        self.dispatch(order["id"])
+        for taka in self.takas:
+            taka.refresh_from_db()
+        self.assertEqual(self.takas[0].available_quantity, Decimal("30"))
+        self.assertEqual(self.takas[1].available_quantity, Decimal("30"))
+        self.assertEqual(self.takas[1].status, "Available")
+
+    def test_selecting_another_orders_reserved_taka_is_refused(self):
+        self._reserved_order(30, self.takas[0])
+        order_b = self._taka_order(10)
+        line_id = order_b["lineItems"][0]["id"]
+        challan = self.post(f"/sales/orders/{order_b['id']}/convert-to-challan/", {"lines": [{
+            "lineId": line_id, "qty": 10,
+            "takaAllocations": [{"lotTakaId": str(self.takas[0].id), "qty": 10}],
+        }]}).json()
+        self.api.patch(f"/api/v1/sales/challans/{challan['id']}/",
+                       {"locationId": str(self.location.id)}, format="json")
+        refused = self.post(f"/sales/challans/{challan['id']}/dispatch/")
+        self.assertEqual(refused.status_code, 422, refused.content[:400])
+
+    def test_eligible_stock_is_grouped_by_batch(self):
+        self._reserved_order(30, self.takas[0])
+        rows = self.api.get(
+            f"/api/v1/inventory/batches/eligible/?itemId={self.taka_item.id}"
+        ).json()["results"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["batchCode"], self.takas[1].batch.batch_code)
+        self.assertEqual([t["takaId"] for t in rows[0]["takas"]], ["TK-P1-2"])
+
     def test_insufficient_taka_stock_is_refused(self):
         order = self._taka_order(90)
         challan = self.post(f"/sales/orders/{order['id']}/convert-to-challan/").json()
@@ -430,3 +487,102 @@ class LotTrackedDispatchTests(Phase1Base):
                        {"locationId": str(self.location.id)}, format="json")
         refused = self.post(f"/sales/challans/{challan['id']}/dispatch/")
         self.assertEqual(refused.status_code, 422, refused.content[:400])
+
+
+class PartyProfitabilityTests(Phase1Base):
+    """The party report uses the ledger's actual COGS, never a fixed ratio."""
+
+    def invoice(self, qty, rate):
+        created = self.post("/sales/invoices/", {
+            "partyId": str(self.customer.id), "date": str(timezone.localdate()),
+            "locationId": str(self.location.id),
+            "lineItems": [{"itemId": str(self.fabric.id), "qty": qty, "rate": rate, "tax": 5}],
+        })
+        self.assertEqual(created.status_code, 201, created.content[:600])
+        self.assertEqual(self.post(f"/sales/invoices/{created.json()['id']}/finalize/").status_code, 200)
+        return created.json()["id"]
+
+    def test_cogs_is_actual_and_sales_are_net_of_gst(self):
+        from apps.reports.mis_reports import party_profitability_report
+
+        self.invoice(10, 100)     # 1,000 + 5% GST; cost 10 x WAC 50 = 500
+        self.invoice(20, 80)      # 1,600; cost 20 x 50 = 1,000
+        row = party_profitability_report(self.tenant.id)["rows"][0]
+        self.assertEqual(row["sales"], 2600.0)
+        self.assertEqual(row["salesInclTax"], 2730.0)
+        self.assertEqual(row["cogs"], 1500.0)                 # not 72% of sales
+        self.assertEqual(row["cogs"], float(self.balance("cogs")))
+        self.assertEqual(row["grossProfit"], 1100.0)
+        self.assertEqual(row["costStatus"], "actual")
+
+    def test_missing_cost_is_flagged_not_guessed(self):
+        from apps.reports.mis_reports import party_profitability_report
+
+        invoice_id = self.invoice(10, 100)
+        # Simulate an invoice whose COGS never reached the ledger.
+        JournalLine.objects.filter(journal_entry__source_document_id=invoice_id, account__system_key="cogs").delete()
+        row = party_profitability_report(self.tenant.id)["rows"][0]
+        self.assertEqual(row["cogs"], 0.0)
+        self.assertEqual(row["costStatus"], "incomplete")
+        self.assertEqual(len(row["invoicesWithoutActualCost"]), 1)
+
+    def test_salesperson_report_uses_actual_figures(self):
+        from apps.reports.mis_reports import salesperson_profitability_report
+
+        self.invoice(10, 100)
+        self.invoice(20, 80)
+        resp = self.api.get("/api/v1/reports/salesperson-profitability/")
+        self.assertEqual(resp.status_code, 200, resp.content[:300])
+        row = salesperson_profitability_report(self.tenant.id)["rows"][0]
+        self.assertEqual(row["netSales"], 2600.0)
+        self.assertEqual(row["cogs"], 1500.0)
+        self.assertEqual(row["collection"], 0.0)          # nothing received yet -- not 82% of sales
+        self.assertEqual(row["incentive"], 0.0)           # no incentive calculated -- not 1.5%
+        self.assertEqual(row["grossProfit"], 1100.0)
+        self.assertEqual(row["contribution"], 1100.0)
+
+
+class ReturnNeedsQcTests(Phase1Base):
+    """Returned goods land in QC Hold; only QC may accept them straight into stock."""
+
+    def _return(self, api, condition):
+        order = self.order(qty=10)
+        challan_id = self.dispatch(order["id"])
+        invoice_id = self.post(f"/sales/challans/{challan_id}/convert-to-invoice/").json()["id"]
+        self.post(f"/sales/invoices/{invoice_id}/finalize/")
+        line = SalesInvoice.objects.get(pk=invoice_id).line_items.get()
+        return api.post("/api/v1/sales/returns/", {
+            "salesInvoiceId": invoice_id, "partyId": str(self.customer.id), "date": str(timezone.localdate()),
+            "locationId": str(self.location.id),
+            "lineItems": [{"itemId": str(self.fabric.id), "qty": 4, "returnedQty": 4, "rate": 100, "tax": 0,
+                           "salesInvoiceLineId": str(line.id), "condition": condition}],
+        }, format="json")
+
+    def _clerk_api(self, permissions):
+        """A real role holding exactly ``permissions`` (no QC approval)."""
+        from apps.accounts.models import Role, RolePermission
+        from apps.accounts.permission_catalogue import sync_permissions
+
+        sync_permissions()
+        role = Role.objects.create(client=self.tenant, code="RET-CLERK", name="Returns clerk")
+        for pid in permissions:
+            RolePermission.objects.create(role=role, permission_id=pid)
+        clerk = User.objects.create_user(email="returns-clerk@example.com", password="pass",
+                                         client=self.tenant, name="Returns clerk", role=role)
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {build_tokens(clerk)['access']}")
+        return api
+
+    def test_clerk_without_qc_rights_cannot_accept_returns_as_good(self):
+        api = self._clerk_api({"view_sales", "process_returns", "create_sales_order"})
+        refused = self._return(api, "Good")
+        self.assertEqual(refused.status_code, 403, refused.content[:400])
+        self.assertEqual(refused.json()["code"], "approve_qc")
+
+    def test_clerk_return_to_hold_is_allowed(self):
+        api = self._clerk_api({"view_sales", "process_returns", "create_sales_order"})
+        ok = self._return(api, "Hold")
+        self.assertEqual(ok.status_code, 201, ok.content[:400])
+
+    def test_qc_can_accept_as_good(self):
+        self.assertEqual(self._return(self.api, "Good").status_code, 201)   # superuser

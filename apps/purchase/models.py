@@ -49,6 +49,20 @@ GREY_STOCK_PURCHASE_TYPES = {
     "Ready Grey",
     "Grey Fabric",
 }
+#: Factory fabric flows (``PurchaseOrder.fabric_flow``). Both are received
+#: through the ordinary grey stock GRN; what differs is where the factory
+#: sends the fabric and which batch the receipt opens.
+#:   FACTORY_TO_OSCAR  factory -> OSCAR warehouse; each receipt opens a Grey
+#:                     Fabric batch.
+#:   FACTORY_TO_MILL   factory -> dyeing mill -> OSCAR; the grey leg is only
+#:                     traced (no OSCAR stock), each dyed receipt opens a Dyed
+#:                     Fabric batch.
+FABRIC_FLOW_FACTORY_TO_OSCAR = "FACTORY_TO_OSCAR"
+FABRIC_FLOW_FACTORY_TO_MILL = "FACTORY_TO_MILL"
+FABRIC_FLOWS = [
+    (FABRIC_FLOW_FACTORY_TO_OSCAR, "Factory -> OSCAR Warehouse"),
+    (FABRIC_FLOW_FACTORY_TO_MILL, "Factory -> Dyeing Mill -> OSCAR"),
+]
 #: A GRN may only be posted against an issued, approved order.
 PO_RECEIVABLE_STATUSES = ("Approved", "Partially Received", "Fully Received", "Issued")
 BILL_STATUSES = ["Draft", "Unpaid", "Partially Paid", "Paid", "Cancelled"]
@@ -97,6 +111,13 @@ class PurchaseOrder(DocumentHeader):
     project = models.ForeignKey(
         "pms.Project", null=True, blank=True, on_delete=models.SET_NULL,
         related_name="linked_purchase_orders",
+    )
+    #: Set for factory fabric orders (see ``FABRIC_FLOWS``); null for the
+    #: older purchase types, which keep their own behaviour.
+    fabric_flow = models.TextField(choices=FABRIC_FLOWS, null=True, blank=True)
+    #: Flow B: the dyeing mill the factory sends the grey fabric to, if known.
+    dyeing_mill = models.ForeignKey(
+        "masters.Party", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
 
     class Meta:
@@ -209,6 +230,7 @@ class PurchaseBillLine(DocumentLine):
         ]
 
 
+DELIVERY_DESTINATIONS = [("OSCAR", "OSCAR warehouse"), ("MILL", "Dyeing mill")]
 DELIVERY_STATUSES = [
     "Pending Dispatch",
     "Dispatched",
@@ -235,6 +257,12 @@ class SupplierDelivery(TenantModel, LegacyIdMixin):
     dispatched_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
     status = models.TextField(choices=choices(DELIVERY_STATUSES), default="Dispatched")
     remarks = models.TextField(null=True, blank=True)
+    #: Where the factory sent the fabric. ``MILL`` dispatches are traced only:
+    #: they never post OSCAR stock or open a grey batch.
+    destination = models.TextField(choices=DELIVERY_DESTINATIONS, default="OSCAR")
+    mill = models.ForeignKey(
+        "masters.Party", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
 
     class Meta:
         db_table = "purchase_supplier_deliveries"
@@ -621,3 +649,204 @@ class VendorBillLine(TenantModel):
         self.sku = item.sku
         self.item_name = item.name
         self.uom = self.uom or item.uom
+
+
+# ---------------------------------------------------------------------------
+# Factory fabric flows -- yarn, mill processing, costs and discrepancies kept
+# on the purchase order they belong to.
+# ---------------------------------------------------------------------------
+class PurchaseOrderYarnLine(TenantModel):
+    """Planned yarn for a factory fabric order. Planning only: nothing here
+    moves yarn stock; ``actual_qty_used`` is what the factory reports."""
+
+    purchase_order = models.ForeignKey(
+        PurchaseOrder, on_delete=models.CASCADE, related_name="yarn_lines"
+    )
+    item = models.ForeignKey(
+        "masters.Item", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    yarn_quality = models.TextField(null=True, blank=True)
+    supplier = models.ForeignKey(
+        "masters.Party", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    #: The yarn supplier as typed (yarn is often bought from someone who is
+    #: not in the party master); ``supplier`` links a known party when chosen.
+    supplier_name = models.TextField(null=True, blank=True)
+    supplier_phone = models.TextField(null=True, blank=True)
+    yarn_lot = models.TextField(null=True, blank=True)
+    required_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    uom = models.TextField(default="Kg")
+    rate = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    actual_qty_used = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
+    remarks = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "purchase_order_yarn_lines"
+        ordering = ["created_at"]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(required_qty__gte=0), name="ck_po_yarn_required"),
+            models.CheckConstraint(condition=models.Q(rate__gte=0), name="ck_po_yarn_rate"),
+        ]
+
+
+class PurchaseOrderMillProcess(TenantModel):
+    """Flow B: what the dyeing mill received from the factory, processed and
+    sent on to OSCAR. A traceability record -- no stock moves here."""
+
+    purchase_order = models.ForeignKey(
+        PurchaseOrder, on_delete=models.CASCADE, related_name="mill_processes"
+    )
+    delivery = models.ForeignKey(
+        SupplierDelivery, null=True, blank=True, on_delete=models.SET_NULL, related_name="mill_processes"
+    )
+    mill = models.ForeignKey("masters.Party", on_delete=models.PROTECT, related_name="+")
+    mill_receipt_date = models.DateField()
+    qty_received = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    process_type = models.TextField(default="Dyeing")
+    shade = models.TextField(null=True, blank=True)
+    process_details = models.TextField(null=True, blank=True)
+    processed_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    mill_dispatch_date = models.DateField(null=True, blank=True)
+    mill_dispatched_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    mill_challan_no = models.TextField(null=True, blank=True)
+    reference = models.TextField(null=True, blank=True)
+    remarks = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "purchase_order_mill_processes"
+        ordering = ["mill_receipt_date", "created_at"]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(qty_received__gte=0), name="ck_po_mill_received"),
+            models.CheckConstraint(condition=models.Q(processed_qty__gte=0), name="ck_po_mill_processed"),
+            models.CheckConstraint(
+                condition=models.Q(mill_dispatched_qty__gte=0), name="ck_po_mill_dispatched"
+            ),
+        ]
+
+
+class PurchaseOrderExpense(TenantModel):
+    """One cost of a factory fabric order (yarn, manufacturing, dyeing,
+    freight, other). Entered at PO creation or later when the bill arrives;
+    spread over the PO's batches by ``fabric_flow.allocate_costs``."""
+
+    CATEGORY_MANUFACTURING = "MANUFACTURING"
+    CATEGORY_YARN = "YARN"
+    CATEGORY_DYEING = "DYEING"
+    CATEGORY_FREIGHT = "FREIGHT"
+    CATEGORY_OTHER = "OTHER"
+    CATEGORIES = [
+        (CATEGORY_MANUFACTURING, "Factory / manufacturing"),
+        (CATEGORY_YARN, "Yarn"),
+        (CATEGORY_DYEING, "Dyeing / processing"),
+        (CATEGORY_FREIGHT, "Freight / transportation"),
+        (CATEGORY_OTHER, "Other"),
+    ]
+    STATUSES = [("ESTIMATED", "Estimated"), ("ACTUAL", "Actual (billed)")]
+    BASES = [("QUANTITY", "By quantity received"), ("VALUE", "By fabric value received")]
+
+    purchase_order = models.ForeignKey(
+        PurchaseOrder, on_delete=models.CASCADE, related_name="fabric_expenses"
+    )
+    #: Charged to one fabric line only; empty spreads over the whole order.
+    purchase_order_line = models.ForeignKey(
+        PurchaseOrderLine, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    category = models.TextField(choices=CATEGORIES)
+    expense_type = models.TextField()
+    description = models.TextField(null=True, blank=True)
+    party = models.ForeignKey(
+        "masters.Party", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    quantity = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
+    rate = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
+    amount = models.DecimalField(max_digits=18, decimal_places=2)
+    expense_date = models.DateField()
+    bill_reference = models.TextField(null=True, blank=True)
+    status = models.TextField(choices=STATUSES, default="ESTIMATED")
+    allocation_basis = models.TextField(choices=BASES, default="QUANTITY")
+    remarks = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "purchase_order_expenses"
+        ordering = ["expense_date", "created_at"]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(amount__gt=0), name="ck_po_expense_amount"),
+        ]
+
+
+class PurchaseOrderCostAllocation(TenantModel):
+    """The share of one PO cost booked to one batch, and the lot cost entry
+    that carries it. ``expense`` is empty for the received fabric itself
+    (received qty x rate). Superseded rows are soft-deleted with their lot
+    cost entry, so the history stays auditable."""
+
+    purchase_order = models.ForeignKey(
+        PurchaseOrder, on_delete=models.CASCADE, related_name="cost_allocations"
+    )
+    expense = models.ForeignKey(
+        PurchaseOrderExpense, null=True, blank=True, on_delete=models.CASCADE, related_name="allocations"
+    )
+    batch = models.ForeignKey("inventory.Batch", on_delete=models.PROTECT, related_name="po_cost_allocations")
+    goods_receipt_line = models.ForeignKey(
+        GoodsReceiptLine, on_delete=models.PROTECT, related_name="cost_allocations"
+    )
+    lot_number = models.TextField()
+    basis_quantity = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    basis_total = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    amount = models.DecimalField(max_digits=18, decimal_places=2)
+    lot_cost_entry = models.ForeignKey(
+        "inventory.LotCostEntry", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+
+    class Meta:
+        db_table = "purchase_order_cost_allocations"
+        ordering = ["created_at"]
+        constraints = [
+            # One live share per cost per receipt line: re-running the
+            # allocation can never charge the same cost twice.
+            models.UniqueConstraint(
+                fields=["expense", "goods_receipt_line"],
+                condition=models.Q(deleted_at__isnull=True, expense__isnull=False),
+                name="uq_po_cost_alloc_expense_line",
+            ),
+            models.UniqueConstraint(
+                fields=["goods_receipt_line"],
+                condition=models.Q(deleted_at__isnull=True, expense__isnull=True),
+                name="uq_po_cost_alloc_fabric_line",
+            ),
+        ]
+
+
+class PurchaseOrderDiscrepancy(TenantModel):
+    """A user's classification of part of a quantity difference on a factory
+    fabric order. The system works out the difference; only a user decides
+    what it is. Nothing here moves stock."""
+
+    CATEGORIES = [
+        ("PENDING", "Pending"),
+        ("LOSS", "Loss"),
+        ("WASTE", "Waste"),
+        ("REPROCESS", "Reprocess"),
+        ("ADJUSTMENT", "Other / adjustment"),
+    ]
+    #: Classified quantities that will never reach OSCAR -- the PO's cost is
+    #: spread over the fabric that did arrive.
+    WRITTEN_OFF = ("LOSS", "WASTE", "ADJUSTMENT")
+
+    purchase_order = models.ForeignKey(
+        PurchaseOrder, on_delete=models.CASCADE, related_name="discrepancies"
+    )
+    category = models.TextField(choices=CATEGORIES)
+    quantity = models.DecimalField(max_digits=18, decimal_places=4)
+    reason = models.TextField()
+    entry_date = models.DateField()
+    reference = models.TextField(null=True, blank=True)
+    remarks = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "purchase_order_discrepancies"
+        ordering = ["entry_date", "created_at"]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(quantity__gt=0), name="ck_po_discrepancy_qty"),
+        ]

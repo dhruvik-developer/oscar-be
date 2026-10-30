@@ -2,7 +2,7 @@
 from decimal import Decimal
 from datetime import date, timedelta
 from django.core.management import call_command
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 
@@ -157,6 +157,7 @@ class Phase4ControlAndMISReportingTests(TestCase):
         self.assertEqual(badge_resp.status_code, 200)
         self.assertGreaterEqual(badge_resp.data.get("activeCount", 0), 1)
 
+    @override_settings(EINVOICE_ENABLED=True, EINVOICE_PROVIDER="sandbox-sim")
     def test_einvoice_and_eway_bill_generation(self):
         """Verify IRN & E-Way Bill generation on sales invoice and delivery challan."""
         invoice = SalesInvoice.objects.create(

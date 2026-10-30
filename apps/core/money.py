@@ -149,7 +149,8 @@ def compute_document_totals(
         subtotal      = sum(lineSub)
         discountTotal = document-level override, else sum(discAmt)
         taxableAmount = max(0, subtotal - discountTotal)
-        totalTax      = sum(lineTax)
+        totalTax      = sum(lineTax), scaled by taxableAmount / sum(lineTaxable)
+                        when an override changes the taxable value
         grandTotal    = round2(taxableAmount + totalTax + freight + other + roundOff)
         balanceDue    = max(0, grandTotal - amountPaid)
 
@@ -165,6 +166,13 @@ def compute_document_totals(
     )
     taxable_value = non_negative(subtotal - total_discount)
     total_tax = round2(sum((line.tax_amount for line in lines), ZERO))
+    # Line tax is charged on each line's own taxable value. A document-level
+    # discount changes the taxable value of the whole supply, so the tax moves
+    # with it in the same proportion; otherwise a quotation with an extra
+    # global discount charged GST on money the customer never pays.
+    summed_taxable = sum((line.taxable for line in lines), ZERO)
+    if discount_total_override is not None and summed_taxable > 0 and taxable_value != summed_taxable:
+        total_tax = round2(total_tax * taxable_value / summed_taxable)
 
     freight_charges = round2(freight_charges)
     other_charges = round2(other_charges)

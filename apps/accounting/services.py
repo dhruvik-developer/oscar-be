@@ -57,18 +57,36 @@ SYSTEM_ACCOUNTS = [
     # Processing / reprocess / other charges owed to job workers, accrued as
     # material comes back (apps/jobwork/costing.py).
     ("jobwork_payable", "2150", "Job Work Charges Payable", "Liability", "Payable"),
+    # In-house production (apps/inventory/production_services.py): material
+    # and absorbed labour / overhead sit in WIP until the run completes.
+    ("wip", "1250", "Work in Progress", "Asset", "Stock"),
+    # Contra to the wage / expense accounts payroll and expense vouchers
+    # already charged: what production absorbed into WIP is taken back out
+    # of P&L here, so it is not counted twice.
+    ("production_absorbed", "5610", "Manufacturing Overhead Absorbed", "Expense", None),
 ]
+
+
+def _free_account_code(client, code):
+    """``code``, or the next free one when an account the user made already
+    holds it (system accounts added later must not break old workspaces)."""
+    taken = set(Account.objects.filter(client=client, deleted_at__isnull=True).values_list("code", flat=True))
+    while code in taken:
+        code = str(int(code) + 1) if code.isdigit() else f"{code}-1"
+    return code
 
 
 def seed_chart_of_accounts(client):
     """Create the system accounts for a new tenant. Idempotent."""
     created = []
     for system_key, code, name, type_, subtype in SYSTEM_ACCOUNTS:
+        if Account.objects.filter(client=client, system_key=system_key).exists():
+            continue
         account, was_created = Account.objects.get_or_create(
             client=client,
             system_key=system_key,
             defaults={
-                "code": code,
+                "code": _free_account_code(client, code),
                 "name": name,
                 "type": type_,
                 "subtype": subtype,
@@ -152,11 +170,15 @@ def system_account(client_id, system_key):
             from apps.accounts.models import Client
             client = Client.objects.filter(id=getattr(client_id, "id", client_id)).first()
             if client:
+                # A system account added after a workspace was set up may find
+                # its default code already used by an account the user made;
+                # take the next free code rather than failing the posting.
+                code = _free_account_code(client, spec[1])
                 account, _ = Account.objects.get_or_create(
                     client=client,
                     system_key=system_key,
                     defaults={
-                        "code": spec[1],
+                        "code": code,
                         "name": spec[2],
                         "type": spec[3],
                         "subtype": spec[4],
@@ -640,16 +662,32 @@ def post_payment_out(payment, *, user=None):
 
 
 def post_purchase_return(purchase_return, *, user=None):
-    """Dr Creditors | Cr Purchase Return, Cr GST Input."""
+    """Dr Creditors | Cr Inventory (stock lines), Cr Purchase Return (the
+    rest), Cr GST Input.
+
+    Mirrors ``purchase_bill_postings``: the bill debited Inventory for
+    stock-holding lines, so returning them must credit Inventory -- crediting
+    Purchase Returns left the ledger's stock value above the physical stock.
+    """
     client_id = purchase_return.client_id
     tax = round2(purchase_return.total_tax)
     goods = round2(purchase_return.total - tax)
+    stock_net = non_stock_net = ZERO
+    for line in purchase_return.line_items.filter(deleted_at__isnull=True).select_related("item"):
+        net = D(line.amount or 0) - D(line.discount_amount or 0)
+        if line.item_id is not None and line.item.holds_stock:
+            stock_net += net
+        else:
+            non_stock_net += net
+    gross = stock_net + non_stock_net
+    stock_amt = round2(goods * stock_net / gross) if gross > ZERO else ZERO
     return post_entry(
         client=purchase_return.client,
         postings=[
             debit(system_account(client_id, "creditors"), purchase_return.total,
                   party=purchase_return.party),
-            credit(system_account(client_id, "purchase_return"), goods),
+            credit(system_account(client_id, "stock"), stock_amt),
+            credit(system_account(client_id, "purchase_return"), round2(goods - stock_amt)),
             credit(system_account(client_id, "gst_input"), tax),
         ],
         entry_date=purchase_return.doc_date,

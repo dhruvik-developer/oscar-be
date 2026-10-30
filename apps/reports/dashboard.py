@@ -6,6 +6,7 @@ database, so the browser only renders. Nothing is estimated: a figure with no
 source rows is zero (or ``None`` where a value cannot be determined, e.g. a
 WIP value when the job-work materials carry no rate).
 """
+from collections import defaultdict
 from datetime import date, timedelta
 from decimal import Decimal
 
@@ -150,16 +151,64 @@ def _other_expense_by_day(client_id, days):
     return {row["expense_date"]: round2(row["value"]) for row in rows}
 
 
-def _gross_profit_by_day(client_id, days):
-    """Sales revenue (net of returns) minus COGS, straight from the ledger."""
-    revenue = _journal_by_day(client_id, days, system_keys=["sales", "sales_return"])
-    cogs = _journal_by_day(client_id, days, system_keys=["cogs"])
-    result = {}
-    for day in days:
-        r_debit, r_credit = revenue.get(day, (ZERO, ZERO))
-        c_debit, c_credit = cogs.get(day, (ZERO, ZERO))
-        result[day] = round2((r_credit - r_debit) - (c_debit - c_credit))
-    return result
+BATCH_PROFIT_WINDOW_DAYS = 90
+BATCH_PROFIT_MAX_BATCHES = 300
+BATCH_PROFIT_ROWS = 10
+
+
+def _batch_profit(client_id, day):
+    """Profit / loss per batch (``batch_costing``) for OSCAR-owned batches
+    with a sale in the last 90 days. Each figure is the batch's whole life to
+    date, so a loss shows even when the sale that caused it was weeks ago.
+    Rows come worst first so loss-making batches lead."""
+    from apps.inventory.batch_services import batch_costing
+    from apps.inventory.models import Batch, StockMovement
+
+    since = day - timedelta(days=BATCH_PROFIT_WINDOW_DAYS)
+    recent = (
+        StockMovement.objects.filter(
+            client_id=client_id, type="SALE", deleted_at__isnull=True,
+            movement_date__gte=since, movement_date__lte=day,
+            lot_taka__batch__isnull=False,
+        )
+        .order_by("-movement_date", "-created_at")
+        .values_list("lot_taka__batch_id", flat=True)
+    )
+    batch_ids = list(dict.fromkeys(recent))[:BATCH_PROFIT_MAX_BATCHES]
+    batches = Batch.objects.filter(
+        client_id=client_id, id__in=batch_ids, ownership="OSCAR", deleted_at__isnull=True,
+    ).select_related("item")
+
+    rows = []
+    for batch in batches:
+        c = batch_costing(batch)
+        revenue = D(c["revenue"])
+        net = D(c["netResult"])
+        rows.append({
+            "id": str(batch.id),
+            "batchCode": batch.batch_code,
+            "item": batch.item.name if batch.item_id else None,
+            "soldQty": c["soldQty"],
+            "revenue": c["revenue"],
+            "cost": c["costOfSold"],
+            "writtenOffLoss": c["writtenOffLoss"],
+            "netResult": c["netResult"],
+            "marginPct": round2(net / revenue * Decimal("100")) if revenue > ZERO else None,
+        })
+    rows.sort(key=lambda r: D(r["netResult"]))
+
+    nets = [D(r["netResult"]) for r in rows]
+    return {
+        "windowDays": BATCH_PROFIT_WINDOW_DAYS,
+        "batches": len(rows),
+        "profitable": sum(1 for n in nets if n > ZERO),
+        "lossMaking": sum(1 for n in nets if n < ZERO),
+        "totalProfit": round2(sum((n for n in nets if n > ZERO), ZERO)),
+        "totalLoss": round2(sum((n for n in nets if n < ZERO), ZERO)),
+        "net": round2(sum(nets, ZERO)),
+        "worst": rows[:BATCH_PROFIT_ROWS],
+        "best": [r for r in reversed(rows) if D(r["netResult"]) > ZERO][:BATCH_PROFIT_ROWS],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +228,12 @@ def stock_valuation(client_id):
             if key:
                 stage_by_quality[str(key).strip().lower()] = stage
 
+    from apps.inventory.batch_services import customer_owned_qty_by_item_location
+
+    held_for_others = defaultdict(lambda: ZERO)
+    for (item_id, _location_id), qty in customer_owned_qty_by_item_location(client_id).items():
+        held_for_others[item_id] += qty
+
     per_item = {}
     for row in (
         StockBalance.objects.filter(client_id=client_id, item__deleted_at__isnull=True)
@@ -190,7 +245,8 @@ def stock_valuation(client_id):
             inward_value=_money("inward_value"),
         )
     ):
-        on_hand = D(row["total_on_hand"])
+        # Customer material in our godowns is not OSCAR's asset.
+        on_hand = D(row["total_on_hand"]) - held_for_others.get(row["item_id"], ZERO)
         if on_hand <= ZERO:
             continue
         if D(row["inward_qty"]) > ZERO:
@@ -435,9 +491,9 @@ def _attention(client_id, day, production, qc):
 
     overdue = 0
     for invoice in _posted_invoices(client_id).only(
-        "doc_date", "due_date", "credit_days", "total", "amount_paid"
+        "doc_date", "due_date", "credit_days", "total", "amount_paid", "settlement_discount"
     ):
-        if D(invoice.total) - D(invoice.amount_paid) <= ZERO:
+        if D(invoice.total) - D(invoice.amount_paid) - D(invoice.settlement_discount) <= ZERO:
             continue
         due = effective_due_date(invoice.doc_date, invoice.due_date, invoice.credit_days)
         if due and due < day:
@@ -495,7 +551,7 @@ def _attention(client_id, day, production, qc):
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-def business_dashboard(client_id, *, day=None):
+def business_dashboard(client_id, *, day=None, include_batch_profit=False):
     from apps.accounting.services import account_balances
 
     today = timezone.localdate()
@@ -510,7 +566,6 @@ def business_dashboard(client_id, *, day=None):
     jobwork = _jobwork_expense_by_day(client_id, days)
     transport = _transport_by_day(client_id, days)
     other = _other_expense_by_day(client_id, days)
-    gross = _gross_profit_by_day(client_id, [day, prev])
 
     def pair(source):
         return {"current": source.get(day, ZERO), "previous": source.get(prev, ZERO)}
@@ -540,8 +595,9 @@ def business_dashboard(client_id, *, day=None):
             "jobWorkExpense": pair(jobwork),
             "transport": pair(transport),
             "otherExpense": pair(other),
-            "grossProfit": pair(gross),
         },
+        # Batch cost is ledger data: None when the viewer lacks view_ledger.
+        "batchProfit": _batch_profit(client_id, day) if include_batch_profit else None,
         "funds": {"total": funds, "accounts": banks},
         "stockValue": stock_value,
         "workingCapital": _working_capital(client_id, funds, stock_value),

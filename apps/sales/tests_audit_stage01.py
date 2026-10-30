@@ -188,6 +188,7 @@ class ApprovalScopeTests(Phase1Base):
     def test_decision_fields_are_not_writable(self):
         created = self._as(self.clerk).post("/api/v1/approvals/requests/", {
             "document_type": "discount", "document_id": "doc-2", "status": "Approved",
+            "reason": "Discount above policy",
         }, format="json")
         self.assertEqual(created.status_code, 201, created.content[:300])
         self.assertEqual(created.json()["status"], "Pending")

@@ -68,7 +68,10 @@ def merge_lots(*, client_id, lot_taka_ids, lot_number=None, remarks=None, user=N
     rate = round4(total_value / total_qty) if total_qty > ZERO else ZERO
 
     taka_code = allocate_number(client_id, "TAK")
+    source_batch_ids = {s.batch_id for s in sources}
     merged = LotTaka.objects.create(
+        # Rolls of one batch stay in it; mixing batches starts a new one.
+        batch_id=source_batch_ids.pop() if len(source_batch_ids) == 1 else None,
         client_id=client_id,
         taka_id=taka_code,
         barcode=taka_code,
@@ -96,6 +99,8 @@ def merge_lots(*, client_id, lot_taka_ids, lot_number=None, remarks=None, user=N
         remarks=remarks or f"Merged from {', '.join(sorted({s.lot_number for s in sources}))}",
     )
     merged.parent_lots.add(*sources)
+    if merged.batch and merged.batch.origin == "MERGE":
+        merged.batch.parent_batches.add(*{s.batch for s in sources if s.batch_id})
 
     common = dict(
         client_id=client_id,

@@ -54,6 +54,19 @@ def slug_code(name, fallback):
     return cleaned[:24] or fallback
 
 
+def unique_code(peers, base, *, field="code"):
+    """``base``, or ``base-2``, ``base-3``... -- the first one no live peer
+    holds (case-insensitive). Codes are never typed by hand, so a clash is
+    settled here instead of asking the user for another code."""
+    taken = {str(v).upper() for v in peers.values_list(field, flat=True) if v}
+    if base.upper() not in taken:
+        return base
+    n = 2
+    while f"{base}-{n}".upper() in taken:
+        n += 1
+    return f"{base}-{n}"
+
+
 # ---------------------------------------------------------------------------
 # Parties (api.md §4.1)
 # ---------------------------------------------------------------------------
@@ -235,8 +248,11 @@ class ItemCategorySerializer(BaseModelSerializer):
     def validate(self, attrs):
         """Derive the short code from the name when the client omits it."""
         attrs = super().validate(attrs)
+        if self.instance is not None and "code" in attrs and not attrs["code"]:
+            attrs.pop("code")  # a blank code on edit keeps the current one
         if not attrs.get("code") and not self.instance:
-            attrs["code"] = slug_code(attrs.get("name"), "CAT")
+            peers = ItemCategory.objects.filter(client_id=self.context.get("client_id"), deleted_at__isnull=True)
+            attrs["code"] = unique_code(peers, slug_code(attrs.get("name"), "CAT"))
         return attrs
 
     def get_itemCount(self, category):
@@ -296,6 +312,8 @@ class UnitSerializer(BaseModelSerializer):
         ]
         extra_kwargs = {
             "image_url": {"write_only": True, "required": False, "allow_null": True, "allow_blank": True},
+            # Blank on create: made from the UOM name ("Bundle" -> BUNDLE).
+            "code": {"required": False, "allow_blank": True},
         }
 
     def _live_peers(self):
@@ -346,7 +364,9 @@ class UnitSerializer(BaseModelSerializer):
         # text, so an existing "Meter" must stay "Meter".
         cleaned = (value or "").strip()
         if not cleaned:
-            raise serializers.ValidationError("UOM Code is required.")
+            if self.instance is not None:
+                raise serializers.ValidationError("UOM Code is required.")
+            return ""  # filled from the UOM name in validate()
         if self.instance is not None and cleaned != self.instance.code:
             raise serializers.ValidationError(
                 "UOM Code can't be changed once created -- items store it by code."
@@ -376,6 +396,8 @@ class UnitSerializer(BaseModelSerializer):
     def validate(self, attrs):
         attrs = super().validate(attrs)
         current = self.instance
+        if current is None and not attrs.get("code"):
+            attrs["code"] = unique_code(self._live_peers(), slug_code(attrs.get("label"), "UOM"))
         is_base = attrs.get("is_base_unit", current.is_base_unit if current else False)
         uom_type = attrs.get("uom_type", current.uom_type if current else "Length")
         if current is not None and uom_type != current.uom_type and self.get_usageCount(current):
@@ -517,8 +539,11 @@ class LocationSerializer(BaseModelSerializer):
     def validate(self, attrs):
         attrs = super().validate(attrs)
         name = attrs.get("name")
+        if self.instance is not None and "code" in attrs and not attrs["code"]:
+            attrs.pop("code")  # a blank code on edit keeps the current one
         if not attrs.get("code") and not self.instance:
-            attrs["code"] = slug_code(name, "LOC")
+            peers = Location.objects.filter(client_id=self.context.get("client_id"), deleted_at__isnull=True)
+            attrs["code"] = unique_code(peers, slug_code(name, "LOC"))
 
         parent = attrs.get("parent")
         loc_type = attrs.get("type") or (self.instance.type if self.instance else "Warehouse")
@@ -626,12 +651,7 @@ class TextileMasterSerializer(BaseModelSerializer):
         if not attrs.get("code") and self.instance is not None:
             attrs.pop("code", None)  # a blank code on edit keeps the current one
         elif not attrs.get("code"):
-            code = slug_code(attrs.get("name"), self.code_fallback)
-            if self._live_peers().filter(code__iexact=code).exists():
-                raise serializers.ValidationError(
-                    {"code": f"Code {code} is already used. Enter a different code."}
-                )
-            attrs["code"] = code
+            attrs["code"] = unique_code(self._live_peers(), slug_code(attrs.get("name"), self.code_fallback))
         return attrs
 
 
@@ -976,12 +996,10 @@ class FabricVariantSerializer(TextileMasterSerializer):
         elif "name" in attrs and not attrs["name"]:
             attrs.pop("name")  # a blank name on edit keeps the current one
         if not attrs.get("code") and self.instance is None:
-            code = slug_code("-".join(p.code for p in parts), self.code_fallback)
-            if self._live_peers().filter(code__iexact=code).exists():
-                raise serializers.ValidationError(
-                    {"code": f"Code {code} is already used. Enter a different code."}
-                )
-            attrs["code"] = code
+            # COT-60S-D001-SH001: quality + design + shade codes.
+            attrs["code"] = unique_code(
+                self._live_peers(), slug_code("-".join(p.code for p in parts), self.code_fallback)
+            )
         return super().validate(attrs)
 
     def _sync_to_item(self, variant):

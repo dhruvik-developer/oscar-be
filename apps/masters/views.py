@@ -193,7 +193,8 @@ class PartyViewSet(TenantModelViewSet):
         ).exclude(status__in=["Cancelled", "Draft"])
 
         invoice_rows = invoices.aggregate(
-            lifetime=money_sum("total"), paid=money_sum("amount_paid"), count=Count("id")
+            lifetime=money_sum("total"), paid=money_sum("amount_paid"),
+            discounted=money_sum("settlement_discount"), count=Count("id"),
         )
         advance = PaymentIn.objects.filter(
             client_id=request.client_id, party=party, status="Active", deleted_at__isnull=True
@@ -212,7 +213,9 @@ class PartyViewSet(TenantModelViewSet):
                 "name": party.name,
                 "balance": round2(party.balance),
                 "creditLimit": round2(party.credit_limit) if party.credit_limit else None,
-                "outstanding": round2(invoice_rows["lifetime"] - invoice_rows["paid"]),
+                "outstanding": round2(
+                    invoice_rows["lifetime"] - invoice_rows["paid"] - invoice_rows["discounted"]
+                ),
                 "lifetimeValue": round2(invoice_rows["lifetime"]),
                 "openOrders": orders.exclude(stage__in=["Fully Dispatched", "Invoiced", "Closed"]).count(),
                 "openInvoices": invoices.exclude(status="Paid").count(),

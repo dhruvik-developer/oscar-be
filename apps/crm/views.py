@@ -11,7 +11,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.core.audit import notify
+from apps.core.audit import notify, snapshot
 from apps.core.exceptions import (
     Codes,
     Conflict,
@@ -160,11 +160,20 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
             unassigned=Count("id", filter=Q(owner__isnull=True)),
         )
 
+    def after_create(self, instance):
+        # Products picked on the lead form show as fabric requirements.
+        services.sync_form_products(instance, user=self.request.user)
+
+    def after_update(self, instance, before):
+        if (before or {}).get("custom_values") != instance.custom_values:
+            services.sync_form_products(instance, user=self.request.user)
+
     def perform_create(self, serializer):
         serializer.validated_data["lead_number"] = allocate_number(
             self.request.user.client, "LEAD"
         )
         if not serializer.validated_data.get("stage"):
+            services.ensure_crm_configuration(self.request.user.client)
             first = Stage.objects.filter(
                 client_id=self.get_client_id(), is_active=True, deleted_at__isnull=True
             ).order_by("sequence").first()
@@ -852,6 +861,12 @@ class StageViewSet(TenantModelViewSet):
             lead_count=Count("leads", filter=Q(leads__deleted_at__isnull=True))
         )
 
+    def list(self, request, *args, **kwargs):
+        # A workspace that never had stages gets the defaults on first read,
+        # so the Leads screen has somewhere to put a new lead.
+        services.ensure_crm_configuration(request.user.client)
+        return super().list(request, *args, **kwargs)
+
     @action(detail=False, methods=["post"])
     @transaction.atomic
     def reorder(self, request):
@@ -885,6 +900,18 @@ class DealStageViewSet(TenantModelViewSet):
     ordering = ["sequence"]
     permission_map = {"read": ["view_lead"], "write": ["manage_pipeline"]}
 
+    def get_queryset(self):
+        # The pipeline is fixed (services.DEFAULT_DEAL_STAGES): rows left from
+        # the removed Deal Stages screen, and the retired Revised / Declined,
+        # are not board columns.
+        return super().get_queryset().filter(
+            name__in=[name for name, *_ in services.DEFAULT_DEAL_STAGES]
+        )
+
+    def list(self, request, *args, **kwargs):
+        services.ensure_deal_stages(request.user.client)
+        return super().list(request, *args, **kwargs)
+
 
 class MasterTaskViewSet(TenantModelViewSet):
     queryset = MasterTask.objects.prefetch_related("stages")
@@ -907,6 +934,14 @@ class StageTaskViewSet(TenantModelViewSet):
     permission_map = {"read": ["view_task"], "write": ["manage_pipeline"]}
 
 
+def _task_body(task, lead_name):
+    """The line under a "New task" notification: who it is for and when."""
+    parts = [f"Lead: {lead_name}" if lead_name else "Lead task"]
+    if task.due_date:
+        parts.append(f"due {task.due_date.strftime('%d %b')}" + (f" {task.due_time}" if task.due_time else ""))
+    return " · ".join(parts)
+
+
 class TaskViewSet(TenantModelViewSet):
     queryset = Task.objects.select_related("lead", "deal", "assignee")
     serializer_class = TaskSerializer
@@ -917,8 +952,6 @@ class TaskViewSet(TenantModelViewSet):
     search_fields = ["title", "description", "lead__name"]
     ordering = ["due_date", "-created_at"]
     filter_map = {
-        "leadId": "lead_id",
-        "dealId": "deal_id",
         "assigneeId": "assignee_id",
         "priority": "priority",
         "source": "source",
@@ -930,9 +963,31 @@ class TaskViewSet(TenantModelViewSet):
         "update": ["edit_task"],
         "partial_update": ["edit_task"],
         "destroy": ["delete_task"],
+        "activity": ["view_task"],
     }
 
     def filter_queryset(self, queryset):
+        params = self.request.query_params
+        lead_id = params.get("leadId")
+        deal_id = params.get("dealId")
+
+        if lead_id and deal_id:
+            queryset = queryset.filter(Q(lead_id=lead_id) | Q(deal_id=deal_id))
+        elif lead_id:
+            from .models import Deal
+            linked_deal_ids = list(Deal.objects.filter(lead_id=lead_id).values_list("id", flat=True))
+            if linked_deal_ids:
+                queryset = queryset.filter(Q(lead_id=lead_id) | Q(deal_id__in=linked_deal_ids))
+            else:
+                queryset = queryset.filter(lead_id=lead_id)
+        elif deal_id:
+            from .models import Deal
+            deal_obj = Deal.objects.filter(id=deal_id).first()
+            if deal_obj and deal_obj.lead_id:
+                queryset = queryset.filter(Q(deal_id=deal_id) | Q(lead_id=deal_obj.lead_id))
+            else:
+                queryset = queryset.filter(deal_id=deal_id)
+
         queryset = super().filter_queryset(queryset)
         due = self.request.query_params.get("dueDate")
         if due:
@@ -940,6 +995,21 @@ class TaskViewSet(TenantModelViewSet):
         if self.request.query_params.get("mine") == "true":
             queryset = queryset.filter(assignee=self.request.user)
         return queryset
+
+    def create_defaults(self):
+        defaults = super().create_defaults()
+        lead = self.request.data.get("leadId") or self.request.data.get("lead")
+        deal = self.request.data.get("dealId") or self.request.data.get("deal")
+        from .models import Deal
+        if deal and not lead:
+            d = Deal.objects.filter(id=deal).first()
+            if d and d.lead_id:
+                defaults["lead_id"] = d.lead_id
+        elif lead and not deal:
+            d = Deal.objects.filter(lead_id=lead).first()
+            if d:
+                defaults["deal_id"] = d.id
+        return defaults
 
     def get_aggregates(self, queryset):
         return queryset.aggregate(
@@ -967,7 +1037,7 @@ class TaskViewSet(TenantModelViewSet):
                 type="crm.task_assigned",
                 category="crm",
                 title=f"New task: {task.title}",
-                body=f"{lead_name} task assigned to you." if lead_name else "A lead task was assigned to you.",
+                body=_task_body(task, lead_name),
                 entity_type="CrmTask",
                 entity_id=task.id,
                 actor=self.request.user,
@@ -985,7 +1055,7 @@ class TaskViewSet(TenantModelViewSet):
                 type="crm.task_assigned",
                 category="crm",
                 title=f"New task: {task.title}",
-                body=f"{lead_name} task assigned to you." if lead_name else "A lead task was assigned to you.",
+                body=_task_body(task, lead_name),
                 entity_type="CrmTask",
                 entity_id=task.id,
                 actor=self.request.user,
@@ -995,10 +1065,13 @@ class TaskViewSet(TenantModelViewSet):
     @action(detail=True, methods=["post"])
     def start(self, request, pk=None):
         task = self.get_object()
+        before = snapshot(task, fields=("status",))
         task.status = "In Progress"
         if not task.started_at:
             task.started_at = timezone.now()
         task.save(update_fields=["status", "started_at", "updated_at"])
+        # Shows in the task's activity like any other status change.
+        self.write_audit("update", task, before=before, after=snapshot(task, fields=("status",)))
         return Response(TaskSerializer(task).data)
 
     @action(detail=True, methods=["post"])
@@ -1034,6 +1107,80 @@ class TaskViewSet(TenantModelViewSet):
             }
         )
 
+
+
+    #: Fields whose change shows in the task's activity, with their label.
+    ACTIVITY_FIELDS = {
+        "status": "Status", "assignee": "Assignee", "priority": "Priority", "due_date": "Due date",
+        "title": "Title", "department": "Department", "outcome": "Outcome", "next_action": "Next action",
+        "completion_note": "Completion note", "description": "Description",
+    }
+
+    @action(detail=True, methods=["get"], url_path="activity")
+    def activity(self, request, pk=None):
+        """GET /crm/tasks/<id>/activity/ -- who changed what on this task, newest
+        first, in plain words (from the audit log, readable with view_task)."""
+        from apps.accounts.models import User
+        from apps.core.models import AuditLog
+
+        task = self.get_object()
+        rows = list(
+            AuditLog.objects.filter(
+                client_id=self.get_client_id(), entity_type=self.get_audit_entity_type(), entity_id=task.id,
+            ).order_by("-created_at")[:200]
+        )
+        user_ids = set()
+        for row in rows:
+            for snap in (row.before or {}, row.after or {}):
+                if snap.get("assignee"):
+                    user_ids.add(snap["assignee"])
+        names = {str(u.id): u.name or u.email for u in User.objects.filter(id__in=user_ids)}
+
+        def show(field, value):
+            if value in (None, ""):
+                return "—"
+            if field == "assignee":
+                return names.get(str(value), "another user")
+            return str(value)
+
+        entries = []
+        for row in rows:
+            actor = row.actor_name or "System"
+            if row.action not in ("create", "delete", "update"):
+                # Workflow events (e.g. ``task_completed`` from the Complete
+                # flow) carry their meaning in the description, not a diff.
+                if row.description:
+                    text = f"{actor}: {row.description}"
+                    if row.comments:
+                        text += f" — {row.comments}"
+                    entries.append({"at": row.created_at.isoformat(), "by": actor, "text": text})
+                continue
+            if row.action == "create":
+                entries.append({"at": row.created_at.isoformat(), "by": actor, "text": f"{actor} created this task"})
+                continue
+            if row.action == "delete":
+                entries.append({"at": row.created_at.isoformat(), "by": actor, "text": f"{actor} deleted this task"})
+                continue
+            before, after = row.before or {}, row.after or {}
+            changes = []
+            for field, label in self.ACTIVITY_FIELDS.items():
+                if field not in after or before.get(field) == after.get(field):
+                    continue
+                if field == "assignee":
+                    changes.append(f"reassigned it from {show(field, before.get(field))} to {show(field, after.get(field))}")
+                elif field in ("description", "completion_note"):
+                    changes.append(f"updated the {label.lower()}")
+                else:
+                    changes.append(f"changed {label.lower()} from {show(field, before.get(field))} to {show(field, after.get(field))}")
+            if changes:
+                entries.append({"at": row.created_at.isoformat(), "by": actor, "text": f"{actor} " + "; ".join(changes)})
+        if not any(row.action == "create" for row in rows):
+            # Tasks opened by lead stage automation or a follow-up are created
+            # in services, not through this API, so they have no create row.
+            creator = getattr(task.created_by, "name", None) or getattr(task.created_by, "email", None)
+            text = f"{creator} created this task" if creator else (task.source or "Task created")
+            entries.append({"at": task.created_at.isoformat(), "by": creator or "System", "text": text})
+        return Response({"results": entries})
 
 class TaskAllocationViewSet(TenantModelViewSet):
     queryset = TaskAllocation.objects.select_related("assignee", "assigned_by").prefetch_related(
@@ -1103,6 +1250,26 @@ class TeamRosterView(APIView):
 
     def get(self, request):
         return Response({"roster": services.team_roster(request.client_id)})
+
+
+class IncentiveSchemesView(APIView):
+    """``GET /crm/incentive-schemes/`` -- active salesperson incentive terms."""
+
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_lead"]
+
+    def get(self, request):
+        return Response({"schemes": services.incentive_schemes(request.client_id)})
+
+
+class AssignmentOptionsView(APIView):
+    """``GET /crm/assignment-options/`` -- roles and departments for task templates."""
+
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_task"]
+
+    def get(self, request):
+        return Response(services.assignment_options(request.client_id))
 
 
 # ---------------------------------------------------------------------------
@@ -1194,6 +1361,8 @@ class DealViewSet(TenantModelViewSet):
         """Priced deliverable lines (the deal workspace Products tab)."""
         deal = self.get_object()
         if request.method == "GET":
+            # Requirements captured on the lead show on its deal.
+            services.sync_lead_products(deal)
             rows = deal.lines.filter(deleted_at__isnull=True)
             return Response(envelope(DealLineSerializer(rows, many=True).data))
         serializer = DealLineSerializer(
@@ -1542,6 +1711,12 @@ class SourceViewSet(TenantModelViewSet):
     audit_label_field = "name"
     status_field = None
     ordering = ["name"]
+
+    def list(self, request, *args, **kwargs):
+        # A workspace that never had sources gets Broker / Sales Person, so
+        # the Lead Source dropdown and this list show the same real rows.
+        services.ensure_lead_sources(request.user.client)
+        return super().list(request, *args, **kwargs)
 
 
 class IndustryViewSet(TenantModelViewSet):

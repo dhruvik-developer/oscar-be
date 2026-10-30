@@ -161,7 +161,9 @@ class Phase2ProductionTests(TestCase):
         # 7. Generate Final Job Work PO
         updated_inst = production_services.generate_final_job_work_po(verified_inst, user=self.user)
         self.assertIsNotNone(updated_inst.final_po)
-        self.assertEqual(updated_inst.status, "PO Created")
+        # Final PO is generated pending approval, so the instruction stays PO Pending.
+        self.assertEqual(updated_inst.final_po.status, "Pending Approval")
+        self.assertEqual(updated_inst.status, "PO Pending")
         po = updated_inst.final_po
         self.assertEqual(po.line_items.count(), 1)
         po_line = po.line_items.first()

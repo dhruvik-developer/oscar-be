@@ -19,26 +19,27 @@ dashboard_urlpatterns = [
 
 public_urlpatterns = [
     # Quotation sharing (api.md §5.3)
-    path(
-        "quotations/<str:quotation_number>/<str:token>/",
-        public_views.PublicQuotationView.as_view(),
-        name="public-quotation",
-    ),
-    path(
-        "quotations/<str:quotation_number>/<str:token>/accept/",
-        public_views.PublicQuotationAcceptView.as_view(),
-        name="public-quotation-accept",
-    ),
-    path(
-        "quotations/<str:quotation_number>/<str:token>/reject/",
-        public_views.PublicQuotationRejectView.as_view(),
-        name="public-quotation-reject",
-    ),
-    path(
-        "quotations/<str:quotation_number>/<str:token>/comment/",
-        public_views.PublicQuotationCommentView.as_view(),
-        name="public-quotation-comment",
-    ),
+    # [Quotation & Proforma Invoice modules are commented out]
+    # path(
+        # "quotations/<str:quotation_number>/<str:token>/",
+        # public_views.PublicQuotationView.as_view(),
+        # name="public-quotation",
+    # ),
+    # path(
+        # "quotations/<str:quotation_number>/<str:token>/accept/",
+        # public_views.PublicQuotationAcceptView.as_view(),
+        # name="public-quotation-accept",
+    # ),
+    # path(
+        # "quotations/<str:quotation_number>/<str:token>/reject/",
+        # public_views.PublicQuotationRejectView.as_view(),
+        # name="public-quotation-reject",
+    # ),
+    # path(
+        # "quotations/<str:quotation_number>/<str:token>/comment/",
+        # public_views.PublicQuotationCommentView.as_view(),
+        # name="public-quotation-comment",
+    # ),
     # PMS client proof approval (api.md §10.6)
     path(
         "pms/approve/<str:token>/",

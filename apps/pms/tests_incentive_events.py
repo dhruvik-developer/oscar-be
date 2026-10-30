@@ -405,3 +405,83 @@ class HrmsIncentiveRouteTests(IncentiveEventTestBase):
         self.assertEqual(held["holdReason"], "Bad debt")
         released = self.call("release_payout", "post", "/", pk=row["id"]).data
         self.assertEqual(released["status"], "ACCRUED")
+
+
+class AgreedSalespersonRateTests(IncentiveEventTestBase):
+    """A rate agreed on the lead (source "Sales Person") replaces the scheme
+    for that lead's invoices, and those invoices leave the scheme base."""
+
+    def lead_invoice(self, employee, *, rate, basis="percent", attributed=None, total="1000"):
+        from apps.crm.models import Lead, Stage
+        from apps.sales.models import Quotation, SalesOrder
+
+        stage, _ = Stage.objects.get_or_create(client=self.client_obj, name="New", defaults={"sequence": 1})
+        lead = Lead.objects.create(
+            client=self.client_obj,
+            lead_number=unique("LD"),
+            name="Agreed lead",
+            stage=stage,
+            custom_values={
+                "salesperson_id": str((attributed or employee).id),
+                "salesperson_commission_basis": basis,
+                "salesperson_commission_rate": rate,
+            },
+        )
+        quotation = Quotation.objects.create(
+            client=self.client_obj, quotation_number=unique("QT"), doc_date=date(2026, 8, 1), crm_lead=lead,
+        )
+        order = SalesOrder.objects.create(
+            client=self.client_obj, order_number=unique("SO"), doc_date=date(2026, 8, 2), quotation=quotation, party=self.party,
+        )
+        invoice = self.make_invoice(employee, total=total)
+        invoice.sales_order = order
+        invoice.taxable_value = Decimal(total)
+        invoice.save(update_fields=["sales_order", "taxable_value"])
+        return invoice
+
+    def test_agreed_rate_replaces_scheme_for_that_invoice(self):
+        employee = self.make_employee()
+        self.lead_invoice(employee, rate="2")          # 2% of 1000 = 20
+        self.make_invoice(employee, total="1000")       # scheme 10% = 100
+        calc = self.calculate(self.scheme(), employee, auto_post=False)
+        self.assertEqual(calc.incentive_amount, Decimal("120.00"))
+        self.assertEqual(calc.detail["agreedAmount"], "20.00")
+        self.assertEqual(len(calc.detail["agreedInvoices"]), 1)
+
+    def test_lead_naming_another_salesperson_uses_scheme(self):
+        employee = self.make_employee()
+        other = self.make_employee()
+        self.lead_invoice(employee, rate="2", attributed=other)
+        calc = self.calculate(self.scheme(), employee, auto_post=False)
+        self.assertEqual(calc.incentive_amount, Decimal("100.00"))
+        self.assertEqual(calc.detail["agreedInvoices"], [])
+
+    def test_blank_rate_falls_back_to_scheme(self):
+        employee = self.make_employee()
+        self.lead_invoice(employee, rate="")
+        calc = self.calculate(self.scheme(), employee, auto_post=False)
+        self.assertEqual(calc.incentive_amount, Decimal("100.00"))
+
+    def test_agreed_rate_applies_when_the_order_links_the_lead_directly(self):
+        """No quotation any more: the order carries the lead itself."""
+        from apps.crm.models import Lead, Stage
+        from apps.sales.models import SalesOrder
+
+        employee = self.make_employee()
+        stage, _ = Stage.objects.get_or_create(client=self.client_obj, name="New", defaults={"sequence": 1})
+        lead = Lead.objects.create(
+            client=self.client_obj, lead_number=unique("LD"), name="Direct lead", stage=stage,
+            custom_values={"salesperson_id": str(employee.id), "salesperson_commission_basis": "percent",
+                           "salesperson_commission_rate": "3"},
+        )
+        order = SalesOrder.objects.create(
+            client=self.client_obj, order_number=unique("SO"), doc_date=date(2026, 8, 2),
+            party=self.party, crm_lead=lead,
+        )
+        invoice = self.make_invoice(employee, total="1000")
+        invoice.sales_order = order
+        invoice.taxable_value = Decimal("1000")
+        invoice.save(update_fields=["sales_order", "taxable_value"])
+        calc = self.calculate(self.scheme(), employee, auto_post=False)
+        self.assertEqual(calc.incentive_amount, Decimal("30.00"))
+

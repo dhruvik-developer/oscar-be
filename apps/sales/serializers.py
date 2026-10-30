@@ -1,6 +1,7 @@
 """Sales serializers (api.md §5)."""
 from rest_framework import serializers
 
+from apps.core.exceptions import ValidationFailed
 from apps.core.document_serializers import (
     HEADER_FIELDS,
     READ_ONLY_HEADER_FIELDS,
@@ -19,6 +20,7 @@ from .models import (
     BrokerCommission,
     DeliveryChallan,
     DeliveryChallanLine,
+    EarlyPaymentDiscountRequest,
     PaymentAllocation,
     PaymentIn,
     ProformaInvoice,
@@ -100,6 +102,25 @@ class QuotationSerializer(DocumentSerializer):
     crmLead = TenantPrimaryKeyRelatedField(
         source="crm_lead", model="crm.Lead", required=False, allow_null=True
     )
+    #: Writable here only: a quotation may be addressed by hand to anyone
+    #: (no customer or lead row). Contact details go in ``billing_address``.
+    #: With a party or lead the snapshot overwrites it, as for any document.
+    partyName = serializers.CharField(
+        source="party_name", required=False, allow_blank=True, allow_null=True
+    )
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        instance = self.instance
+        party = attrs.get("party", getattr(instance, "party", None))
+        lead = attrs.get("crm_lead", getattr(instance, "crm_lead", None))
+        name = attrs.get("party_name", getattr(instance, "party_name", None))
+        if party is None and lead is None and not (name or "").strip():
+            raise ValidationFailed(
+                "Choose a customer or lead, or enter the name for a manual quotation.",
+                field_errors={"partyName": ["Required when no customer or lead is chosen."]},
+            )
+        return attrs
 
     class Meta:
         model = Quotation
@@ -135,12 +156,15 @@ class SalesOrderSerializer(DocumentSerializer):
 
     vehicleNo = serializers.CharField(source="vehicle_number", required=False, allow_blank=True, allow_null=True)
     dispatchDate = serializers.DateField(source="dispatch_date", required=False, allow_null=True)
+    crmLead = TenantPrimaryKeyRelatedField(
+        source="crm_lead", model="crm.Lead", required=False, allow_null=True
+    )
 
     class Meta:
         model = SalesOrder
         fields = HEADER_FIELDS + [
             "order_number", "stage", "payment_status", "delivery_date",
-            "quotation", "pms_project", "reference_number",
+            "quotation", "pms_project", "reference_number", "crm_lead", "crmLead",
             "dispatch_date", "dispatchDate", "vehicle_number", "vehicleNo", "transporter",
         ]
         read_only_fields = READ_ONLY_HEADER_FIELDS + ["order_number", "payment_status"]
@@ -220,11 +244,15 @@ class SalesInvoiceSerializer(DocumentSerializer):
 
     #: ``Overdue`` is layered on at read time, never stored (db.md §12).
     displayStatus = serializers.SerializerMethodField()
+    #: Approved early-payment discounts; part of what settles the invoice, not money received.
+    settlementDiscount = serializers.DecimalField(
+        source="settlement_discount", max_digits=18, decimal_places=2, read_only=True
+    )
 
     class Meta:
         model = SalesInvoice
         fields = HEADER_FIELDS + [
-            "invoice_number", "status", "displayStatus", "due_date",
+            "invoice_number", "status", "displayStatus", "due_date", "settlementDiscount",
             "sales_order", "delivery_challan", "proforma_invoice", "location",
             "irn", "eway_bill_number", "ewayBillNumber",
             "ack_no", "ackNo", "ack_date", "ackDate", "signed_qrcode", "signedQrcode",
@@ -277,7 +305,7 @@ class PaymentInSerializer(BaseModelSerializer):
         model = PaymentIn
         fields = [
             "id", "payment_number", "customerId", "customerName", "date", "amount",
-            "mode", "bankAccountId", "reference_number", "notes",
+            "mode", "bankAccountId", "reference_number", "transaction_reference", "notes",
             "allocated_amount", "unallocatedAmount", "allocations", "status",
             "invoiceId", "allocationsInput", "created_at", "updated_at",
         ]
@@ -458,4 +486,61 @@ class BrokerCommissionSerializer(BaseModelSerializer):
             "notes", "created_at", "updated_at",
         ]
         read_only_fields = ["created_at", "updated_at"]
+
+
+class EarlyPaymentDiscountRequestSerializer(BaseModelSerializer):
+    """Read shape for discount requests; writes go through ``early_payment``."""
+
+    customerId = serializers.CharField(source="party_id", read_only=True)
+    customerName = serializers.CharField(source="party.name", read_only=True)
+    invoiceId = serializers.CharField(source="invoice_id", read_only=True)
+    paymentId = serializers.CharField(source="payment_id", read_only=True)
+    paymentNumber = serializers.CharField(source="payment.payment_number", read_only=True)
+    requestedById = serializers.CharField(source="requested_by_id", read_only=True)
+    requestedByName = serializers.SerializerMethodField()
+    reviewedByName = serializers.SerializerMethodField()
+    decidedByName = serializers.SerializerMethodField()
+    cancelledByName = serializers.SerializerMethodField()
+    creditNoteId = serializers.CharField(source="credit_note_id", read_only=True)
+    creditNoteNumber = serializers.SerializerMethodField()
+    invoiceOutstanding = serializers.SerializerMethodField()
+
+    class Meta:
+        model = EarlyPaymentDiscountRequest
+        fields = [
+            "id", "request_number", "status", "customerId", "customerName",
+            "invoiceId", "invoice_number", "invoice_date", "invoice_total",
+            "payment_terms", "credit_days", "due_date",
+            "paymentId", "paymentNumber", "payment_date", "eligible_amount", "days_paid_early",
+            "requested_amount", "proposed_amount", "approved_amount",
+            "customer_request_date", "reason", "notes", "attachments",
+            "requestedById", "requestedByName", "submitted_at",
+            "reviewedByName", "reviewed_at", "decidedByName", "decided_at", "decision_reason",
+            "creditNoteId", "creditNoteNumber",
+            "cancelledByName", "cancelled_at", "cancellation_reason",
+            "invoiceOutstanding", "created_at", "updated_at",
+        ]
+        read_only_fields = fields
+
+    @staticmethod
+    def _name(user):
+        return (getattr(user, "name", None) or getattr(user, "email", None)) if user else None
+
+    def get_requestedByName(self, obj):
+        return self._name(obj.requested_by)
+
+    def get_reviewedByName(self, obj):
+        return self._name(obj.reviewed_by)
+
+    def get_decidedByName(self, obj):
+        return self._name(obj.decided_by)
+
+    def get_cancelledByName(self, obj):
+        return self._name(obj.cancelled_by)
+
+    def get_creditNoteNumber(self, obj):
+        return obj.credit_note.note_number if obj.credit_note_id else None
+
+    def get_invoiceOutstanding(self, obj):
+        return services.invoice_balance(obj.invoice)
 

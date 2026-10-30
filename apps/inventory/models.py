@@ -52,6 +52,17 @@ MOVEMENT_TYPES = [
     # merge): out of each source taka, into the merged taka, same godown.
     ("LOT_MERGE_OUT", "LOT_MERGE_OUT"),
     ("LOT_MERGE_IN", "LOT_MERGE_IN"),
+    # In-house production: yarn / raw material out, fabric rolls in.
+    ("PRODUCTION_ISSUE", "PRODUCTION_ISSUE"),
+    ("PRODUCTION_OUTPUT", "PRODUCTION_OUTPUT"),
+    # Customer-owned material: received from / delivered back to its owner.
+    # Never costed -- it is not OSCAR's inventory.
+    ("CUSTOMER_IN", "CUSTOMER_IN"),
+    ("CUSTOMER_OUT", "CUSTOMER_OUT"),
+    # A batch received as bulk metres, later registered taka by taka: out of
+    # the bulk record, into the new taka, same godown.
+    ("TAKA_REGISTER_OUT", "TAKA_REGISTER_OUT"),
+    ("TAKA_REGISTER_IN", "TAKA_REGISTER_IN"),
 ]
 
 #: Movements that reverse an earlier one, keyed to what they reverse.
@@ -89,10 +100,21 @@ SELF_REVERSING_TYPES = (
     "SAMPLE_RETURN_SECOND_QUALITY",
     "SAMPLE_RETURN_REJECT",
     "ZONE_RETURN",
+    "PRODUCTION_ISSUE",
+    "PRODUCTION_OUTPUT",
+    "CUSTOMER_IN",
+    "CUSTOMER_OUT",
+    "TAKA_REGISTER_OUT",
+    "TAKA_REGISTER_IN",
 )
 
 #: Valid values of ``LotTaka.qc_status`` (kept as-is for Phase 1).
-LOT_QC_STATUSES = ("Passed", "Pending", "On Hold", "Reprocess", "Rejected")
+#: "Not Inspected" is fabric that skipped the optional QC: usable, but never
+#: shown as QC passed.
+LOT_QC_STATUSES = ("Passed", "Pending", "On Hold", "Reprocess", "Rejected", "Not Inspected")
+
+#: QC statuses whose fabric may be sold, issued or processed.
+RELEASED_QC_STATUSES = ("Passed", "Pass", "Not Inspected")
 
 
 class StockMovement(TenantModel, LegacyIdMixin):
@@ -179,11 +201,20 @@ class StockMovement(TenantModel, LegacyIdMixin):
 
 
 class StockTransfer(TenantModel, LegacyIdMixin):
-    """Posts a ``TRANSFER_OUT``/``TRANSFER_IN`` pair sharing a reference."""
+    """Inter-warehouse transfer.
+
+    Draft -> Requested (stock reserved at the source) -> Approved -> In Transit
+    (dispatch moves it into the in-transit store) -> Partially Received /
+    Received (receipt moves it into the destination) -> Completed. Every move is
+    a ``TRANSFER_OUT``/``TRANSFER_IN`` pair, so the company total never changes.
+    """
 
     STATUSES = [
+        ("Draft", "Draft"),
         ("Requested", "Requested"),
+        ("Approved", "Approved"),
         ("In Transit", "In Transit"),
+        ("Partially Received", "Partially Received"),
         ("Received", "Received"),
         ("Completed", "Completed"),
         ("Cancelled", "Cancelled"),
@@ -206,6 +237,18 @@ class StockTransfer(TenantModel, LegacyIdMixin):
     )
     shipped_by = models.TextField(null=True, blank=True)
     notes = models.TextField(null=True, blank=True)
+    approved_at = models.DateTimeField(null=True, blank=True)
+    dispatched_at = models.DateTimeField(null=True, blank=True)
+    received_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    received_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    #: The document the transfer was raised for, e.g. a sales order short at
+    #: its dispatch warehouse.
+    reference_type = models.TextField(null=True, blank=True)
+    reference_id = models.UUIDField(null=True, blank=True)
+    reference_number = models.TextField(null=True, blank=True)
 
     class Meta:
         db_table = "stock_transfers"
@@ -233,14 +276,46 @@ class StockTransferLine(TenantModel):
     item = models.ForeignKey("masters.Item", on_delete=models.PROTECT, related_name="+")
     qty = models.DecimalField(max_digits=18, decimal_places=4)
     received_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
-    #: The takas selected for this line: ``[{"lotTakaId": uuid, "qty": "12.5"}]``.
-    #: A taka may be moved partly; dispatch splits it.
+    #: The takas selected for this line: ``[{"lotTakaId": uuid, "qty": "12.5",
+    #: "dispatched": "0", "priorStatus": "Available"}]``. A taka may be moved
+    #: partly; dispatch splits it.
     takas = models.JSONField(default=list, blank=True)
+    dispatched_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    #: What sits in the in-transit store for this line:
+    #: ``[{"lotTakaId": holder uuid, "sourceTakaId": uuid, "qty": "15", "received": "0"}]``.
+    #: Loose (non-taka) quantity is tracked by ``dispatched_qty - received_qty``.
+    in_transit = models.JSONField(default=list, blank=True)
+    #: Dispatched but never received, settled at completion.
+    discrepancy_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    discrepancy_reason = models.TextField(null=True, blank=True)
+    #: How the discrepancy was settled: RETURNED (back to the source) or WRITTEN_OFF.
+    discrepancy_action = models.TextField(null=True, blank=True)
 
     class Meta:
         db_table = "stock_transfer_lines"
         constraints = [
             models.CheckConstraint(condition=models.Q(qty__gt=0), name="ck_stl_qty")
+        ]
+
+
+class WarehouseStockLevel(TenantModel):
+    """Minimum stock of one item at one warehouse, for the low-stock alert."""
+
+    location = models.ForeignKey(
+        "masters.Location", on_delete=models.CASCADE, related_name="stock_levels"
+    )
+    item = models.ForeignKey("masters.Item", on_delete=models.CASCADE, related_name="+")
+    min_qty = models.DecimalField(max_digits=18, decimal_places=4)
+
+    class Meta:
+        db_table = "warehouse_stock_levels"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "location", "item"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_warehouse_stock_level",
+            ),
+            models.CheckConstraint(condition=models.Q(min_qty__gte=0), name="ck_wsl_min_qty"),
         ]
 
 
@@ -515,8 +590,100 @@ class StockBalance(TenantModel):
         return None
 
 
+class Batch(TenantModel):
+    """A physical fabric batch: the permanent ID its QR tag carries.
+
+    Every taka/roll (``LotTaka``) belongs to one batch. The batch is created
+    where the fabric first enters (purchase receipt, production, manual
+    register) and is *kept* through split, dyeing, finishing and other job
+    work -- a processed roll inherits its parent roll's batch -- so the tag
+    printed on day one still opens the whole history. A merge of different
+    batches makes a new batch whose ``parent_batches`` are the sources.
+
+    Quantities, status and cost are not stored here: they are derived from
+    the takas, the stock movements and the lot cost ledger.
+    """
+
+    ORIGINS = [
+        ("PURCHASE", "Purchase"),
+        ("PRODUCTION", "Production"),
+        ("JOB_WORK", "Job work"),
+        ("MERGE", "Merge"),
+        ("MANUAL", "Manual"),
+    ]
+    OWNERSHIPS = [
+        ("OSCAR", "OSCAR"),
+        ("CUSTOMER", "Customer"),
+        ("THIRD_PARTY", "Third party"),
+    ]
+    FABRIC_TYPES = [
+        ("GREY", "Grey fabric"),
+        ("DYED", "Dyed fabric"),
+    ]
+
+    batch_code = models.TextField()
+    origin = models.TextField(choices=ORIGINS, default="MANUAL")
+    #: What the batch was when it came in. Grey rolls dyed later keep the
+    #: batch; the dyeing shows in its history.
+    fabric_type = models.TextField(choices=FABRIC_TYPES, default="GREY")
+    ownership = models.TextField(choices=OWNERSHIPS, default="OSCAR")
+    #: The customer (or third party) who owns the material when not OSCAR.
+    owner_party = models.ForeignKey(
+        "masters.Party", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    item = models.ForeignKey(
+        "masters.Item", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    supplier = models.ForeignKey(
+        "masters.Party", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    source_document_type = models.TextField(null=True, blank=True)
+    source_document_number = models.TextField(null=True, blank=True)
+    source_document_id = models.UUIDField(null=True, blank=True)
+    created_on = models.DateField(default=timezone.localdate)
+    uom = models.TextField(null=True, blank=True)
+    parent_batches = models.ManyToManyField(
+        "self", blank=True, symmetrical=False, related_name="child_batches"
+    )
+    notes = models.TextField(null=True, blank=True)
+    #: Factory fabric orders: the PO, its fabric line and the receipt that
+    #: opened this batch (one batch per received line).
+    purchase_order = models.ForeignKey(
+        "purchase.PurchaseOrder", null=True, blank=True, on_delete=models.SET_NULL, related_name="fabric_batches"
+    )
+    purchase_order_line = models.ForeignKey(
+        "purchase.PurchaseOrderLine", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    goods_receipt = models.ForeignKey(
+        "purchase.GoodsReceipt", null=True, blank=True, on_delete=models.SET_NULL, related_name="fabric_batches"
+    )
+    goods_receipt_line = models.ForeignKey(
+        "purchase.GoodsReceiptLine", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+
+    class Meta:
+        db_table = "fabric_batches"
+        ordering = ["-created_on", "-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "batch_code"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_client_batch_code",
+            ),
+        ]
+
+    def __str__(self):
+        return self.batch_code
+
+
 class LotTaka(TenantModel, LegacyIdMixin):
     """Fabric Lot and Taka/Roll register with movement history."""
+
+    #: The permanent batch this roll belongs to; set on first save (see
+    #: ``batch_services.assign_batch``) and never changed by processing.
+    batch = models.ForeignKey(
+        Batch, null=True, blank=True, on_delete=models.PROTECT, related_name="takas"
+    )
 
     taka_id = models.TextField(null=True, blank=True, db_index=True)
     lot_number = models.TextField(db_index=True)
@@ -631,6 +798,15 @@ class LotTaka(TenantModel, LegacyIdMixin):
 
     def __str__(self):
         return f"{self.taka_id or self.lot_number} - Taka {self.taka_number}"
+
+    def save(self, *args, **kwargs):
+        # Every creation path (GRN, production, job work inward, split, merge,
+        # manual register) goes through here, so no roll is left without a batch.
+        if self.batch_id is None and self.client_id:
+            from .batch_services import assign_batch
+
+            assign_batch(self)
+        super().save(*args, **kwargs)
 
 
 class TakaTagPrintLog(TenantModel):
@@ -814,6 +990,9 @@ class LotCostEntry(TenantModel, LegacyIdMixin):
         ("Reprocess", "Reprocess"),
         ("Other direct", "Other direct"),
         ("Scrap recovery", "Scrap recovery"),
+        ("Yarn / raw material", "Yarn / raw material"),
+        ("Production labour", "Production labour"),
+        ("Machine / production expense", "Machine / production expense"),
     ]
 
     lot_taka = models.ForeignKey(
@@ -1088,3 +1267,208 @@ class GreyStockAllocation(TenantModel):
 
     def __str__(self):
         return f"{self.lot_taka} -> {self.project} ({self.quantity})"
+
+
+class ProductionRun(TenantModel):
+    """In-house manufacturing: yarn / raw material in, a fabric batch out.
+
+    Separate from ``pms.ProductionInstruction`` (production at an external
+    agency, settled by a final job-work PO). Material issues and output rolls
+    are real stock movements; the output rolls form one batch (origin
+    PRODUCTION) and wait at QC Hold for a QC disposition. On completion the
+    issued material and the recorded expenses become that batch's cost.
+    A run for a customer marks the batch as that customer's material.
+    """
+
+    STATUSES = [
+        ("Draft", "Draft"),
+        ("In Progress", "In Progress"),
+        ("Completed", "Completed"),
+        ("Cancelled", "Cancelled"),
+    ]
+
+    run_number = models.TextField()
+    run_date = models.DateField(default=timezone.localdate)
+    output_item = models.ForeignKey("masters.Item", on_delete=models.PROTECT, related_name="+")
+    fabric_quality = models.ForeignKey(
+        "masters.FabricQuality", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    shade = models.ForeignKey("masters.Shade", null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    width = models.DecimalField(max_digits=9, decimal_places=2, null=True, blank=True)
+    gsm = models.DecimalField(max_digits=9, decimal_places=2, null=True, blank=True)
+    planned_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    uom = models.TextField(default="Meter")
+    #: Customer manufacturing: the output belongs to this party, not OSCAR.
+    customer = models.ForeignKey(
+        "masters.Party", null=True, blank=True, on_delete=models.PROTECT, related_name="+"
+    )
+    machine = models.TextField(null=True, blank=True)
+    responsible = models.ForeignKey(
+        django_settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    lot_number = models.TextField(null=True, blank=True)
+    batch = models.ForeignKey(Batch, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    wastage_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    wastage_uom = models.TextField(null=True, blank=True)
+    status = models.TextField(choices=STATUSES, default="Draft")
+    costs_posted = models.BooleanField(default=False)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    notes = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "production_runs"
+        ordering = ["-run_date", "-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "run_number"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_production_run_number",
+            ),
+        ]
+
+    def __str__(self):
+        return self.run_number
+
+
+class ProductionMaterialIssue(TenantModel):
+    """Yarn / raw material issued to a run (a PRODUCTION_ISSUE movement).
+
+    ``customer_supplied`` material (customer manufacturing) is not OSCAR's
+    cost, so it is issued at zero value.
+    """
+
+    run = models.ForeignKey(ProductionRun, on_delete=models.CASCADE, related_name="issues")
+    item = models.ForeignKey("masters.Item", on_delete=models.PROTECT, related_name="+")
+    location = models.ForeignKey("masters.Location", on_delete=models.PROTECT, related_name="+")
+    quantity = models.DecimalField(max_digits=18, decimal_places=4)
+    unit_cost = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    customer_supplied = models.BooleanField(default=False)
+    #: The supplier's yarn lot / box reference, for yarn-to-fabric traceability.
+    yarn_lot = models.TextField(null=True, blank=True)
+    #: A negative-quantity row returns unused material to stock; it points at
+    #: the issue it returns.
+    returns_issue = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.PROTECT, related_name="returns"
+    )
+    issued_on = models.DateField(default=timezone.localdate)
+    movement = models.ForeignKey(StockMovement, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+
+    class Meta:
+        db_table = "production_material_issues"
+        ordering = ["issued_on", "created_at"]
+
+
+class ProductionExpense(TenantModel):
+    """Labour, machine and other production costs of a run."""
+
+    run = models.ForeignKey(ProductionRun, on_delete=models.CASCADE, related_name="expenses")
+    cost_type = models.TextField(default="Production labour")
+    amount = models.DecimalField(max_digits=18, decimal_places=2)
+    remarks = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "production_expenses"
+        ordering = ["created_at"]
+
+
+class BatchLoss(TenantModel):
+    """Why some of a batch was rejected, and who bears it.
+
+    A NORMAL_LOSS (expected production / process loss) is absorbed: its cost
+    is spread over the batch's good output. A loss caused by the supplier, a
+    job worker or a specific process is *claimable*: the rejected metres keep
+    their share of the batch cost, which is shown as a claim to recover
+    instead of being loaded onto the good fabric. Money values are not stored
+    (except what was actually recovered) -- they are worked out from the
+    batch's cost ledger each time, so nothing is counted twice.
+    """
+
+    CAUSES = [
+        ("NORMAL_LOSS", "Normal production / process loss"),
+        ("SUPPLIER_QUALITY", "Supplier quality issue"),
+        ("JOB_WORKER_FAULT", "Dyeing / job worker fault"),
+        ("PROCESS_FAULT", "Specific process fault"),
+    ]
+    OUTCOMES = [
+        ("PENDING", "Pending decision"),
+        ("SCRAP", "Scrap"),
+        ("REWORK", "Rework"),
+        ("REPLACEMENT", "Replacement by vendor"),
+        ("VENDOR_RETURN", "Returned to vendor"),
+        ("DOWNGRADE", "Approved downgrade"),
+    ]
+    CLAIM_STATUSES = [
+        ("NOT_APPLICABLE", "Not applicable"),
+        ("OPEN", "Open"),
+        ("CLAIMED", "Claimed"),
+        ("PARTLY_RECOVERED", "Partly recovered"),
+        ("RECOVERED", "Recovered"),
+        ("WRITTEN_OFF", "Written off"),
+    ]
+
+    batch = models.ForeignKey(Batch, on_delete=models.PROTECT, related_name="losses")
+    quantity = models.DecimalField(max_digits=18, decimal_places=4)
+    cause = models.TextField(choices=CAUSES, default="NORMAL_LOSS")
+    #: The supplier / job worker the claim is against (claimable causes).
+    responsible_party = models.ForeignKey(
+        "masters.Party", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    process = models.TextField(null=True, blank=True)
+    outcome = models.TextField(choices=OUTCOMES, default="PENDING")
+    claim_status = models.TextField(choices=CLAIM_STATUSES, default="NOT_APPLICABLE")
+    recovered_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    reference = models.TextField(null=True, blank=True)  # QC inspection / debit note / claim no.
+    loss_date = models.DateField(default=timezone.localdate)
+    notes = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "batch_losses"
+        ordering = ["loss_date", "created_at"]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(quantity__gt=0), name="ck_batch_loss_qty_positive"),
+            models.CheckConstraint(condition=models.Q(recovered_amount__gte=0), name="ck_batch_loss_recovery_nonneg"),
+        ]
+
+    @property
+    def claimable(self):
+        return self.cause != "NORMAL_LOSS"
+
+
+class BatchYarn(TenantModel):
+    """Yarn that went into a batch, entered by hand (traceability record).
+
+    For fabric woven / knitted outside a production run (or before runs were
+    used). It moves no stock and posts no cost: a production run's material
+    issues are the costed path, and a manual batch already carries its value.
+    """
+
+    batch = models.ForeignKey(Batch, on_delete=models.PROTECT, related_name="yarns")
+    yarn_item = models.ForeignKey(
+        "masters.Item", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    yarn_name = models.TextField(null=True, blank=True)  # when the yarn is not an item master
+    yarn_lot = models.TextField(null=True, blank=True)
+    yarn_count = models.TextField(null=True, blank=True)  # e.g. 30s, 2/40
+    supplier = models.ForeignKey(
+        "masters.Party", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    uom = models.TextField(default="Kg")
+    issued_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    consumed_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    returned_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    waste_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    #: Indicative rate per ``uom``; never posted as batch cost.
+    rate = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
+    entry_date = models.DateField(default=timezone.localdate)
+    remarks = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "batch_yarns"
+        ordering = ["entry_date", "created_at"]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(issued_qty__gte=0, consumed_qty__gte=0, returned_qty__gte=0, waste_qty__gte=0),
+                name="ck_batch_yarn_qty_nonneg",
+            ),
+        ]

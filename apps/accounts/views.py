@@ -2,11 +2,11 @@
 Authentication and identity (api.md §2) and Administration (api.md §3).
 """
 import hashlib
-import secrets
 from datetime import timedelta
 
 from django.conf import settings
 from django.contrib.auth import authenticate
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.db.models import Count, Q
 from django.utils import timezone
@@ -27,12 +27,22 @@ from apps.core.exceptions import (
     ValidationFailed,
 )
 from apps.core.pagination import envelope
+from apps.core.printing import EmailDeliveryFailed
 from apps.core.permissions import AllowPublic, HasModulePermission
-from apps.core.throttling import LoginThrottle
+from apps.core.throttling import LoginThrottle, PasswordChangeThrottle, PublicEndpointThrottle
 from apps.core.viewsets import TenantModelViewSet
 from apps.core.tenancy import set_current_client_id
 
 from .authentication import build_tokens
+from .login_roles import login_role_options, role_matches
+from .login_otp import LOGIN_OTP_TTL, mask_email, resend_challenge, start_challenge, verify_challenge
+from .password_reset import (
+    OTP_EXCHANGE_TTL,
+    email_configured,
+    exchange_otp,
+    issue_reset,
+    otp_matches,
+)
 from .models import (
     Client,
     PasswordResetToken,
@@ -52,7 +62,9 @@ from .serializers import (
     MeUserSerializer,
     PermissionSerializer,
     RefreshSerializer,
+    LoginOtpSerializer,
     ResetPasswordSerializer,
+    VerifyResetOtpSerializer,
     RoleSerializer,
     TenantSerializer,
     UpdateMeSerializer,
@@ -67,6 +79,17 @@ LOCKOUT = timedelta(minutes=15)
 
 def _hash(token):
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _locked_error(user):
+    seconds = max(int((user.locked_until - timezone.now()).total_seconds()), 0)
+    minutes = max((seconds + 59) // 60, 1)
+    return NotAuthenticated(
+        f"Too many failed sign-in attempts. Try again in {minutes} minute"
+        f"{'' if minutes == 1 else 's'}, or reset your password.",
+        code="ACCOUNT_LOCKED",
+        payload={"retryAfterSeconds": seconds},
+    )
 
 
 def _me_payload(user, request=None):
@@ -108,16 +131,52 @@ class LoginView(APIView):
             "Incorrect email or password.", code="INVALID_CREDENTIALS"
         )
 
+        if len(candidates) > 1:
+            # The address exists in several tenants. Once the password proves
+            # who is asking, naming their workspaces leaks nothing, so the
+            # form can offer a picker instead of a dead end.
+            matched = [u for u in candidates if u.check_password(password)]
+            if not matched:
+                raise invalid
+            if len(matched) > 1:
+                raise NotAuthenticated(
+                    "This email belongs to more than one workspace. Choose one to continue.",
+                    code="TENANT_REQUIRED",
+                    payload={
+                        "workspaces": [
+                            {"slug": u.client.slug, "name": u.client.name} for u in matched
+                        ]
+                    },
+                )
+            candidates = matched
+
         if len(candidates) != 1:
             raise invalid
 
         user = candidates[0]
 
+        # The password is not checked while locked: the lock is what stops
+        # guessing, so a locked account must not say whether a guess was right.
         if user.is_locked():
-            raise NotAuthenticated(
-                "This account is temporarily locked. Try again shortly.",
-                code="ACCOUNT_LOCKED",
-            )
+            _audit_login(user, request, "login_blocked", "Sign-in refused: account locked")
+            raise _locked_error(user)
+
+        if not user.check_password(password):
+            if user.locked_until is not None:
+                # The previous lock ran out; start a fresh count.
+                user.failed_login_count = 0
+                user.locked_until = None
+            user.failed_login_count += 1
+            if user.failed_login_count >= MAX_FAILED_LOGINS:
+                user.locked_until = timezone.now() + LOCKOUT
+            user.save(update_fields=["failed_login_count", "locked_until"])
+            _audit_login(user, request, "login_failed", "Sign-in failed: wrong password")
+            if user.locked_until is not None:
+                raise _locked_error(user)
+            raise invalid
+
+        # Status is only revealed to someone who knows the password, so these
+        # messages cannot be used to find out which addresses have accounts.
         if user.status != "Active":
             raise NotAuthenticated(
                 "This account is not active. Contact your administrator.",
@@ -127,50 +186,138 @@ class LoginView(APIView):
             raise NotAuthenticated(
                 "This workspace is not active.", code="TENANT_INACTIVE"
             )
-
-        if not user.check_password(password):
-            user.failed_login_count += 1
-            fields = ["failed_login_count"]
-            if user.failed_login_count >= MAX_FAILED_LOGINS:
-                user.locked_until = timezone.now() + LOCKOUT
-                fields.append("locked_until")
-            user.save(update_fields=fields)
-            raise invalid
-
-        set_current_client_id(user.client_id)
-        with transaction.atomic():
-            user.failed_login_count = 0
-            user.locked_until = None
-            user.last_login_at = timezone.now()
-            user.save(update_fields=["failed_login_count", "locked_until", "last_login_at"])
-
-            refresh = RefreshToken.for_user(user)
-            session = UserSession.objects.create(
-                user=user,
-                client=user.client,
-                refresh_token_hash=_hash(str(refresh)),
-                user_agent=request.META.get("HTTP_USER_AGENT", "")[:500],
-                ip=request_ip(request),
-                device_label=_device_label(request),
-                expires_at=timezone.now() + settings.SIMPLE_JWT["REFRESH_TOKEN_LIFETIME"],
-            )
-            tokens = build_tokens(user, session=session)
-            # The stored hash must match the token actually handed out.
-            session.refresh_token_hash = _hash(tokens["refresh"])
-            session.save(update_fields=["refresh_token_hash"])
-
-            record_audit(
-                client=user.client_id,
-                actor=user,
-                action="login",
-                entity_type="User",
-                entity_id=user.id,
-                entity_label=user.email,
-                description="Signed in",
-                ip=request_ip(request),
+        # Checked only after the password, like the status messages above.
+        # The role is not a failed password guess, so it does not count
+        # towards the lockout.
+        if not role_matches(user, serializer.validated_data["role"]):
+            _audit_login(user, request, "login_failed", "Sign-in refused: selected role is not assigned")
+            raise NotAuthenticated(
+                "The selected role is not assigned to this account.", code="ROLE_MISMATCH"
             )
 
-        return Response({**tokens, **_me_payload(user, request)})
+        if user.requires_two_factor:
+            return _two_factor_response(user, request)
+        return Response(_start_session(user, request))
+
+
+def _audit_login(user, request, action, description):
+    """Sign-in events, for the user's login history (PDF §16 audit trail)."""
+    record_audit(
+        client=user.client_id,
+        actor=user if action == "login" else None,
+        action=action,
+        entity_type="User",
+        entity_id=user.id,
+        entity_label=user.email,
+        description=description,
+        ip=request_ip(request),
+    )
+
+
+def _two_factor_response(user, request):
+    """Password was right; email the code and hand back a challenge."""
+    challenge, sent = start_challenge(user, ip=request_ip(request))
+    # In development without a mail server the code is in the server log.
+    if not sent and not (settings.DEBUG and not email_configured()):
+        raise EmailDeliveryFailed(
+            "We could not email your sign-in code. Try again, or contact your administrator.",
+        )
+    _audit_login(user, request, "login_code_sent", "Password accepted; sign-in code emailed")
+    return Response({
+        "twoFactorRequired": True,
+        "challengeId": str(challenge.id),
+        "email": mask_email(user.email),
+        "expiresIn": int(LOGIN_OTP_TTL.total_seconds()),
+    })
+
+
+def _start_session(user, request):
+    """Open a session for a fully verified user: tokens plus the /me body."""
+    set_current_client_id(user.client_id)
+    with transaction.atomic():
+        user.failed_login_count = 0
+        user.locked_until = None
+        user.last_login_at = timezone.now()
+        user.save(update_fields=["failed_login_count", "locked_until", "last_login_at"])
+
+        refresh = RefreshToken.for_user(user)
+        session = UserSession.objects.create(
+            user=user,
+            client=user.client,
+            refresh_token_hash=_hash(str(refresh)),
+            user_agent=request.META.get("HTTP_USER_AGENT", "")[:500],
+            ip=request_ip(request),
+            device_label=_device_label(request),
+            expires_at=timezone.now() + settings.SIMPLE_JWT["REFRESH_TOKEN_LIFETIME"],
+        )
+        tokens = build_tokens(user, session=session)
+        # The stored hash must match the token actually handed out.
+        session.refresh_token_hash = _hash(tokens["refresh"])
+        session.save(update_fields=["refresh_token_hash"])
+
+        _audit_login(user, request, "login", f"Signed in ({_device_label(request)})")
+
+    return {**tokens, **_me_payload(user, request)}
+
+
+class LoginVerifyOtpView(APIView):
+    """``POST /auth/login/verify-otp/`` -- second step of a two-factor sign-in."""
+
+    authentication_classes = []
+    permission_classes = [AllowPublic]
+    throttle_classes = [LoginThrottle]
+
+    def post(self, request):
+        serializer = LoginOtpSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = verify_challenge(
+            serializer.validated_data["challengeId"], serializer.validated_data["otp"]
+        )
+        if user is None:
+            raise ValidationFailed(
+                "That code is wrong or has expired. Check the latest email, or send a new code.",
+                code="OTP_INVALID",
+                field_errors={"otp": ["Wrong or expired code."]},
+            )
+        # The account may have changed while the code was in the inbox.
+        if user.status != "Active" or user.client.status != "Active" or user.deleted_at:
+            raise NotAuthenticated(
+                "This account is not active. Contact your administrator.",
+                code="ACCOUNT_INACTIVE",
+            )
+        return Response(_start_session(user, request))
+
+
+class LoginResendOtpView(APIView):
+    """``POST /auth/login/resend-otp/`` -- a fresh code, at most every 30 s."""
+
+    authentication_classes = []
+    permission_classes = [AllowPublic]
+    throttle_classes = [LoginThrottle]
+
+    def post(self, request):
+        challenge_id = str(request.data.get("challengeId") or "")
+        result = None
+        try:
+            result = resend_challenge(challenge_id, ip=request_ip(request))
+        except (ValueError, DjangoValidationError):
+            result = None  # not a UUID
+        if result is None:
+            raise ValidationFailed(
+                "A new code cannot be sent yet. Wait a few seconds, or sign in again.",
+                code="OTP_RESEND_REFUSED",
+            )
+        challenge, sent = result
+        if not sent and not (settings.DEBUG and not email_configured()):
+            raise EmailDeliveryFailed(
+                "We could not email your sign-in code. Try again, or contact your administrator.",
+                code="EMAIL_DELIVERY_FAILED",
+            )
+        return Response({
+            "challengeId": str(challenge.id),
+            "email": mask_email(challenge.user.email),
+            "expiresIn": int(LOGIN_OTP_TTL.total_seconds()),
+        })
 
 
 def _device_label(request):
@@ -238,6 +385,16 @@ class LogoutView(APIView):
         elif session_id:
             sessions = sessions.filter(pk=session_id)
         sessions.update(revoked_at=timezone.now(), revoked_reason="logout")
+        record_audit(
+            client=request.client_id,
+            actor=request.user,
+            action="logout",
+            entity_type="User",
+            entity_id=request.user.id,
+            entity_label=request.user.email,
+            description="Signed out",
+            ip=request_ip(request),
+        )
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -253,7 +410,7 @@ class MeView(APIView):
 
 
 class ChangePasswordView(APIView):
-    throttle_classes = [LoginThrottle]
+    throttle_classes = [PasswordChangeThrottle]
 
     def post(self, request):
         serializer = ChangePasswordSerializer(data=request.data, context={"user": request.user})
@@ -264,7 +421,8 @@ class ChangePasswordView(APIView):
                 field_errors={"currentPassword": ["Incorrect password."]},
             )
         request.user.set_password(serializer.validated_data["newPassword"])
-        request.user.save(update_fields=["password"])
+        request.user.must_change_password = False
+        request.user.save(update_fields=["password", "must_change_password"])
         # Every other session is signed out; the current one keeps working.
         UserSession.objects.filter(user=request.user, revoked_at__isnull=True).exclude(
             pk=getattr(request.user, "session_id", None) or ""
@@ -294,24 +452,52 @@ class ForgotPasswordView(APIView):
         serializer.is_valid(raise_exception=True)
         email = serializer.validated_data["email"].lower()
 
-        user = User.objects.filter(
+        # One address can hold an account in several tenants; each gets its
+        # own link, so the reset lands on the account the user picks.
+        users = User.objects.filter(
             email=email, deleted_at__isnull=True, status="Active"
-        ).first()
-        if user is not None:
-            token = secrets.token_urlsafe(48)
-            PasswordResetToken.objects.create(
-                user=user,
-                token_hash=_hash(token),
-                expires_at=timezone.now() + timedelta(hours=2),
-            )
-            # Delivery is the notification service's job; in dev the token is
-            # logged rather than emailed.
+        ).select_related("client")
+        sent = 0
+        for user in users:
+            sent += issue_reset(user, ttl=timedelta(hours=2))
+        if settings.DEBUG:
+            # Developer aid only: the response never says whether the address
+            # exists, so the server console is the place to find out.
             import logging
 
-            logging.getLogger(__name__).info(
-                "Password reset token for %s: %s", email, token
+            logging.getLogger(__name__).warning(
+                "Forgot password for %s: %d active account(s), %d email(s) sent.",
+                email, len(users), sent,
             )
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class VerifyResetOtpView(APIView):
+    """``POST /auth/verify-reset-otp/`` -- the emailed code for a reset token.
+
+    The token goes to ``/auth/reset-password/`` exactly like the one in the
+    emailed link, so both paths share one place where passwords change.
+    """
+
+    authentication_classes = []
+    permission_classes = [AllowPublic]
+    throttle_classes = [LoginThrottle]
+
+    def post(self, request):
+        serializer = VerifyResetOtpSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        token = exchange_otp(
+            serializer.validated_data["email"], serializer.validated_data["otp"]
+        )
+        if token is None:
+            raise ValidationFailed(
+                "That code is wrong or has expired. Check the latest email, or send a new code.",
+                code="OTP_INVALID",
+                field_errors={"otp": ["Wrong or expired code."]},
+            )
+        return Response(
+            {"token": token, "expiresIn": int(OTP_EXCHANGE_TTL.total_seconds())}
+        )
 
 
 class ResetPasswordView(APIView):
@@ -322,29 +508,69 @@ class ResetPasswordView(APIView):
     def post(self, request):
         serializer = ResetPasswordSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        record = PasswordResetToken.objects.filter(
-            token_hash=_hash(serializer.validated_data["token"])
-        ).select_related("user").first()
 
-        if record is None or not record.is_usable:
+        # Outcomes are decided inside the transaction but raised after it, so
+        # a wrong code's attempt count is committed rather than rolled back.
+        outcome = "ok"
+        with transaction.atomic():
+            record = (
+                PasswordResetToken.objects.select_for_update()
+                .filter(token_hash=_hash(serializer.validated_data["token"]))
+                .select_related("user")
+                .first()
+            )
+            if record is None or not record.is_usable:
+                outcome = "expired"
+            elif record.otp_hash and not otp_matches(record, serializer.validated_data.get("otp")):
+                # A token from the email needs its code too: the link alone
+                # is not enough to change the password.
+                if record.otp_usable:
+                    record.otp_attempts += 1
+                    record.save(update_fields=["otp_attempts"])
+                outcome = "bad_otp"
+            else:
+                self._apply(record, serializer.validated_data["newPassword"])
+                record_audit(
+                    client=record.user.client_id,
+                    actor=record.user,
+                    action="password_reset",
+                    entity_type="User",
+                    entity_id=record.user.id,
+                    entity_label=record.user.email,
+                    description="Password reset by emailed code",
+                    ip=request_ip(request),
+                )
+
+        if outcome == "expired":
             raise ValidationFailed(
                 "That reset link is no longer valid. Request a new one.",
                 code=Codes.TOKEN_EXPIRED,
                 field_errors={"token": ["Expired or already used."]},
             )
-
-        with transaction.atomic():
-            user = record.user
-            user.set_password(serializer.validated_data["newPassword"])
-            user.failed_login_count = 0
-            user.locked_until = None
-            user.save(update_fields=["password", "failed_login_count", "locked_until"])
-            record.used_at = timezone.now()
-            record.save(update_fields=["used_at"])
-            UserSession.objects.filter(user=user, revoked_at__isnull=True).update(
-                revoked_at=timezone.now(), revoked_reason="password_reset"
+        if outcome == "bad_otp":
+            raise ValidationFailed(
+                "That code is wrong or has expired. Check the latest email, or request a new code.",
+                code="OTP_INVALID",
+                field_errors={"otp": ["Wrong or expired code."]},
             )
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @staticmethod
+    def _apply(record, new_password):
+        """Set the password, spend the token and sign out every session."""
+        user = record.user
+        user.set_password(new_password)
+        user.failed_login_count = 0
+        user.locked_until = None
+        user.must_change_password = False
+        user.save(update_fields=[
+            "password", "failed_login_count", "locked_until", "must_change_password"
+        ])
+        record.used_at = timezone.now()
+        record.save(update_fields=["used_at"])
+        UserSession.objects.filter(user=user, revoked_at__isnull=True).update(
+            revoked_at=timezone.now(), revoked_reason="password_reset"
+        )
 
 
 class SessionListView(APIView):
@@ -358,6 +584,95 @@ class SessionListView(APIView):
             context={"current_session_id": getattr(request.user, "session_id", None)},
         ).data
         return Response(envelope(data))
+
+
+class SessionRevokeOthersView(APIView):
+    """``POST /auth/sessions/revoke-others/`` -- sign out every other device."""
+
+    def post(self, request):
+        current = getattr(request.user, "session_id", None) or ""
+        count = (
+            UserSession.objects.filter(user=request.user, revoked_at__isnull=True)
+            .exclude(pk=current)
+            .update(revoked_at=timezone.now(), revoked_reason="revoked_by_user")
+        )
+        record_audit(
+            client=request.client_id,
+            actor=request.user,
+            action="sessions_revoked",
+            entity_type="User",
+            entity_id=request.user.id,
+            entity_label=request.user.email,
+            description=f"Signed out {count} other device(s)",
+            ip=request_ip(request),
+        )
+        return Response({"revoked": count})
+
+
+#: Audit actions shown as the user's sign-in history.
+LOGIN_HISTORY_ACTIONS = (
+    "login", "login_failed", "login_blocked", "login_code_sent", "logout",
+    "change_password", "password_reset", "sessions_revoked",
+)
+
+
+class LoginHistoryView(APIView):
+    """``GET /auth/login-history/`` -- the caller's own recent sign-in events."""
+
+    def get(self, request):
+        from apps.core.models import AuditLog
+
+        rows = AuditLog.objects.filter(
+            client_id=request.client_id,
+            entity_type="User",
+            entity_id=request.user.id,
+            action__in=LOGIN_HISTORY_ACTIONS,
+        ).order_by("-created_at", "-id")[:50]
+        return Response(envelope([
+            {
+                "id": row.id,
+                "action": row.action,
+                "description": row.description,
+                "ip": row.ip,
+                "at": row.created_at,
+            }
+            for row in rows
+        ]))
+
+
+class SupportInfoView(APIView):
+    """``GET /auth/support/`` -- the sign-in page's helpdesk box.
+
+    Public: it is shown before sign-in. Values come from SUPPORT_* settings;
+    empty ones are returned as empty and the page hides them.
+    """
+
+    authentication_classes = []
+    permission_classes = [AllowPublic]
+    throttle_classes = [LoginThrottle]
+
+    def get(self, request):
+        return Response({
+            "email": settings.SUPPORT_EMAIL,
+            "phone": settings.SUPPORT_PHONE,
+            "hours": settings.SUPPORT_HOURS,
+        })
+
+
+class LoginRoleOptionsView(APIView):
+    """``GET /auth/login-roles/?tenant=`` -- the sign-in page's role list.
+
+    Public: it is shown before sign-in. Returns role labels held by active
+    users only -- never who holds them.
+    """
+
+    authentication_classes = []
+    permission_classes = [AllowPublic]
+    throttle_classes = [PublicEndpointThrottle]
+
+    def get(self, request):
+        slug = (request.query_params.get("tenant") or "").strip() or None
+        return Response({"roles": login_role_options(slug)})
 
 
 class SessionDetailView(APIView):
@@ -512,15 +827,16 @@ class UserViewSet(TenantModelViewSet):
     @action(detail=True, methods=["post"], url_path="reset-password")
     def reset_password(self, request, pk=None):
         user = self.get_object()
-        token = secrets.token_urlsafe(48)
-        PasswordResetToken.objects.create(
-            user=user, token_hash=_hash(token), expires_at=timezone.now() + timedelta(hours=24)
-        )
+        emailed = issue_reset(user, ttl=timedelta(hours=24))
         self.write_audit("reset_password", user, description="Admin-triggered password reset")
-        import logging
-
-        logging.getLogger(__name__).info("Admin reset token for %s: %s", user.email, token)
-        return Response({"message": "A password reset email has been sent."})
+        if emailed:
+            message = f"A password reset email has been sent to {user.email}."
+        else:
+            message = (
+                "The reset link could not be emailed: outbound email is not "
+                "configured or delivery failed."
+            )
+        return Response({"message": message, "emailed": emailed})
 
     @action(detail=True, methods=["get", "post"], url_path="permissions")
     def permissions(self, request, pk=None):

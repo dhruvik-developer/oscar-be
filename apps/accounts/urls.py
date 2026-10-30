@@ -13,13 +13,20 @@ router.register("customer-clients", CustomerClientViewSet, basename="admin-custo
 
 auth_urlpatterns = [
     path("login/", views.LoginView.as_view(), name="auth-login"),
+    path("login/verify-otp/", views.LoginVerifyOtpView.as_view(), name="auth-login-verify-otp"),
+    path("login/resend-otp/", views.LoginResendOtpView.as_view(), name="auth-login-resend-otp"),
+    path("support/", views.SupportInfoView.as_view(), name="auth-support"),
+    path("login-roles/", views.LoginRoleOptionsView.as_view(), name="auth-login-roles"),
+    path("login-history/", views.LoginHistoryView.as_view(), name="auth-login-history"),
     path("refresh/", views.RefreshView.as_view(), name="auth-refresh"),
     path("logout/", views.LogoutView.as_view(), name="auth-logout"),
     path("me/", views.MeView.as_view(), name="auth-me"),
     path("change-password/", views.ChangePasswordView.as_view(), name="auth-change-password"),
     path("forgot-password/", views.ForgotPasswordView.as_view(), name="auth-forgot-password"),
+    path("verify-reset-otp/", views.VerifyResetOtpView.as_view(), name="auth-verify-reset-otp"),
     path("reset-password/", views.ResetPasswordView.as_view(), name="auth-reset-password"),
     path("sessions/", views.SessionListView.as_view(), name="auth-sessions"),
+    path("sessions/revoke-others/", views.SessionRevokeOthersView.as_view(), name="auth-sessions-revoke-others"),
     path("sessions/<uuid:pk>/", views.SessionDetailView.as_view(), name="auth-session-detail"),
 ]
 

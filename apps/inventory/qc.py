@@ -256,6 +256,7 @@ def dispose_receipt(
             "rework": "reprocess",
             "hold": "hold",
             "on hold": "hold",
+            "inspected": "good",
         }
         taka_lookup = {}
         seen_taka_keys = set()
@@ -272,31 +273,55 @@ def dispose_receipt(
                 seen_taka_keys.add(t_key)
             raw_disp = str(t_entry.get("disposition") or t_entry.get("qcStatus") or t_entry.get("status") or "Passed").strip().lower()
             cat = disposition_map.get(raw_disp, "good")
+            val = (cat, t_entry)
             if t_key:
-                taka_lookup[t_key] = cat
+                taka_lookup[t_key] = val
                 if t_entry.get("takaId"):
-                    taka_lookup[str(t_entry.get("takaId"))] = cat
+                    taka_lookup[str(t_entry.get("takaId"))] = val
                 if t_entry.get("id"):
-                    taka_lookup[str(t_entry.get("id"))] = cat
+                    taka_lookup[str(t_entry.get("id"))] = val
                 if t_entry.get("takaNumber") or t_entry.get("taka_number"):
-                    taka_lookup[str(t_entry.get("takaNumber") or t_entry.get("taka_number"))] = cat
+                    taka_lookup[str(t_entry.get("takaNumber") or t_entry.get("taka_number"))] = val
+                if t_entry.get("barcode"):
+                    taka_lookup[str(t_entry.get("barcode"))] = val
 
         plan = []
         totals = {category: ZERO for category in CATEGORIES}
         for unit in units:
             lot = unit.get("lot")
-            cat = "good"
+            info = None
             if lot:
-                matched_cat = (
+                info = (
                     taka_lookup.get(str(lot.id))
                     or taka_lookup.get(str(lot.taka_id))
                     or taka_lookup.get(str(lot.barcode))
                     or taka_lookup.get(str(lot.taka_number))
                 )
-                if matched_cat:
-                    cat = matched_cat
-            plan.append((unit, cat, round4(unit["qty"])))
-            totals[cat] += round4(unit["qty"])
+            cat = info[0] if (info and isinstance(info, tuple)) else (info or "good")
+            t_entry = info[1] if (info and isinstance(info, tuple)) else None
+
+            # Handle partial taka allocations (e.g. 50 Good, 50 Reprocess)
+            handled_sub = False
+            if t_entry and isinstance(t_entry, dict):
+                sub_quantities = {}
+                for category, keys in CATEGORY_KEYS.items():
+                    val = next((t_entry.get(k) for k in keys if t_entry.get(k) not in (None, "")), None)
+                    if val is not None:
+                        try:
+                            sub_quantities[category] = round4(D(val))
+                        except Exception:
+                            pass
+                sub_total = sum(sub_quantities.values(), ZERO)
+                if sub_total > ZERO and abs(sub_total - round4(unit["qty"])) <= TOLERANCE:
+                    for category, q in sub_quantities.items():
+                        if q > ZERO:
+                            plan.append((unit, category, q))
+                            totals[category] += q
+                    handled_sub = True
+
+            if not handled_sub:
+                plan.append((unit, cat, round4(unit["qty"])))
+                totals[cat] += round4(unit["qty"])
         quantities = totals
     elif line_quantities:
         plan = []
@@ -437,6 +462,27 @@ def dispose_receipt(
             receipt, job_work_order, quantities["reprocess"], remarks, user
         )
 
+    verdict = record_receipt_verdict(
+        receipt, quantities, user=user, remarks=remarks, measurements=measurements,
+        stock_posted=not record_only, reprocess_order=reprocess_order,
+    )
+    return {
+        "verdict": verdict,
+        "receipt": receipt,
+        "quantities": quantities,
+        "stockPosted": not record_only,
+        "movements": moved,
+        "reprocessOrder": reprocess_order,
+    }
+
+
+def record_receipt_verdict(receipt, quantities, *, user=None, remarks=None, measurements=None,
+                           stock_posted=True, reprocess_order=None):
+    """Add a QC result to the receipt's running totals and set its verdict,
+    bill QC status and audit trail. Shared by the quantity disposition and
+    the roll-by-roll QC entry. Returns the verdict."""
+    from apps.purchase.models import PurchaseBill
+
     meta = _load_meta(receipt)
     cumulative = {
         category: D(str(meta.get("cumulative", {}).get(category, 0)))
@@ -456,7 +502,7 @@ def dispose_receipt(
         "cumulative": {k: str(v) for k, v in cumulative.items()},
         "remarks": remarks or "",
         "measurements": measurements or meta.get("measurements") or [],
-        "stockPosted": not record_only,
+        "stockPosted": stock_posted,
         "reprocessNo": getattr(reprocess_order, "no", None) or meta.get("reprocessNo"),
         "updatedAt": timezone.now().isoformat(),
     }
@@ -488,15 +534,7 @@ def dispose_receipt(
         after={k: str(v) for k, v in quantities.items()},
         comments=remarks or None,
     )
-
-    return {
-        "verdict": verdict,
-        "receipt": receipt,
-        "quantities": quantities,
-        "stockPosted": not record_only,
-        "movements": moved,
-        "reprocessOrder": reprocess_order,
-    }
+    return verdict
 
 
 def _create_reprocess_order(receipt, job_work_order, quantity, remarks, user):
@@ -555,4 +593,117 @@ def dispose_all(receipt, verdict, *, user=None, note=None):
         user=user,
         remarks=note,
         require_job_work_order=False,
+    )
+
+
+def jobwork_inward_pool(inward):
+    """Processed rolls of a job-work inward still waiting at QC Hold."""
+    qc_location = stock.system_location(inward.client_id, "QC_HOLD")
+    lots = LotTaka.objects.filter(
+        client_id=inward.client_id,
+        source_document_type="JobWorkInward",
+        source_document_id=inward.job_work_order_id,
+        source_document_number=inward.no,
+        location_id=qc_location.id,
+        available_quantity__gt=0,
+        deleted_at__isnull=True,
+    ).order_by("created_at", "taka_number")
+    units = [
+        {"line": None, "item_id": lot.item_id, "lot": lot, "qty": round4(lot.available_quantity),
+         "from": qc_location.id}
+        for lot in lots
+    ]
+    return units, qc_location
+
+
+#: A roll's status once it has left QC Hold for ``category``.
+ROLL_STATUS_AFTER_QC = {
+    "good": "Available",
+    "second": "Second Quality",
+    "reprocess": "Reprocess",
+    "reject": "Reject",
+}
+
+
+def dispose_lot_units(units, *, client_id, quantities, good_location_id, reference_type,
+                      reference_id, reference_number, source_document_type, source_document_id,
+                      label, user=None, remarks=None):
+    """Route rolls waiting at QC Hold: good -> ``good_location_id``, second
+    quality / reprocess / reject -> their stock locations, hold stays put.
+    Shared by job-work inward and in-house production QC. Returns the number
+    of movements posted."""
+    if not units:
+        return 0
+    qc_location_id = units[0]["from"]
+    pool_total = round4(sum((u["qty"] for u in units), ZERO))
+    requested = round4(sum((D(quantities.get(c) or 0) for c in CATEGORIES), ZERO))
+    if abs(requested - pool_total) > TOLERANCE:
+        raise ValidationFailed(
+            f"Disposition total ({requested}) must equal the quantity awaiting QC on "
+            f"{label} ({pool_total}).",
+            field_errors={"goodQty": [f"Expected a total of {pool_total}."]},
+        )
+    if not good_location_id or str(good_location_id) == str(qc_location_id):
+        raise ValidationFailed(
+            "Choose the godown that passed fabric goes to.",
+            field_errors={"locationId": ["Required."]},
+        )
+    on_date = timezone.localdate()
+    note = f"QC {label}" + (f": {remarks}" if remarks else "")
+    moved = 0
+    for unit, category, qty in _allocate(units, {c: D(quantities.get(c) or 0) for c in CATEGORIES}):
+        condition = CATEGORY_CONDITION[category]
+        _, lot_qc_status = stock.CONDITION_ROUTING[condition]
+        if category == "hold":
+            LotTaka.objects.filter(pk=unit["lot"].pk).update(
+                qc_status="On Hold", qc_notes=remarks or None, updated_at=timezone.now()
+            )
+            continue
+        movement_type = CATEGORY_MOVEMENT[category]
+        holder, movements = stock.relocate_lot(
+            client_id=client_id,
+            lot=unit["lot"],
+            quantity=qty,
+            to_location_id=stock.condition_location_id(client_id, condition, good_location_id),
+            out_type=movement_type,
+            in_type=movement_type,
+            reference_type=reference_type,
+            reference_id=reference_id,
+            reference_number=reference_number,
+            source_document_type=source_document_type,
+            source_document_id=source_document_id,
+            movement_date=on_date,
+            notes=note,
+            user=user,
+            qc_status=lot_qc_status,
+            split_suffix="QC",
+        )
+        LotTaka.objects.filter(pk=holder.pk).update(
+            status=ROLL_STATUS_AFTER_QC[category], updated_at=timezone.now()
+        )
+        moved += len(movements)
+    return moved
+
+
+@transaction.atomic
+def dispose_jobwork_inward(inward, *, quantities, good_location_id, user=None, remarks=None):
+    """Move a job-work inward's processed rolls out of QC Hold (PDF §07, §08).
+
+    The rolls keep their batch, so the batch history shows the QC result.
+    Returns 0 when no rolls are waiting (an inward recorded without rolls).
+    """
+    units, _ = jobwork_inward_pool(inward)
+    return dispose_lot_units(
+        units,
+        client_id=inward.client_id,
+        quantities=quantities,
+        good_location_id=good_location_id,
+        reference_type="JobWorkOrder",
+        reference_id=inward.job_work_order_id,
+        reference_number=inward.no,
+        source_document_type="JobWorkInward",
+        source_document_id=inward.id,
+        label=inward.no,
+        user=user,
+        remarks=remarks,
     )

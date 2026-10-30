@@ -370,23 +370,31 @@ class TransferTests(StockBase):
         self.assertEqual(res.status_code, 201, res.data)
         transfer_id = res.data["id"]
         self.assertEqual(res.data["status"], "Requested")
+        res = self.call(
+            StockTransferViewSet, "post", f"/inventory/transfers/{transfer_id}/approve/",
+            actions={"post": "approve"}, pk=transfer_id,
+        )
+        self.assertEqual(res.status_code, 200, res.data)
 
         res = self.call(
             StockTransferViewSet, "post", f"/inventory/transfers/{transfer_id}/dispatch/",
             actions={"post": "dispatch_action"}, pk=transfer_id,
         )
         self.assertEqual(res.status_code, 200, res.data)
+        # Dispatch parks the stock in transit; the destination gets it on receipt.
+        transit = stock.system_location(self.client_obj.id, "IN_TRANSIT")
         lot_a.refresh_from_db()
         lot_b.refresh_from_db()
-        self.assertEqual(lot_a.location_id, self.godown2.id)  # whole taka moved
+        self.assertEqual(lot_a.location_id, transit.id)  # whole taka moved
         self.assertEqual(lot_a.available_quantity, D("60"))
         self.assertEqual(lot_b.location_id, self.godown.id)   # partial: split
         self.assertEqual(lot_b.available_quantity, D("25"))
         child = LotTaka.objects.get(source_document_id=transfer_id, deleted_at__isnull=True)
         self.assertEqual(child.available_quantity, D("15"))
-        self.assertEqual(child.location_id, self.godown2.id)
+        self.assertEqual(child.location_id, transit.id)
         self.assertEqual(self.on_hand(self.fabric, self.godown), D("25"))
-        self.assertEqual(self.on_hand(self.fabric, self.godown2), D("75"))
+        self.assertEqual(self.on_hand(self.fabric, transit), D("75"))
+        self.assertEqual(self.on_hand(self.fabric, self.godown2), D("0"))
 
         # An unrelated taka already at the destination must not move back.
         bystander = self.make_lot("5", location=self.godown2, taka="Z")

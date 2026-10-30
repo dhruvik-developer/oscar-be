@@ -10,8 +10,11 @@ from django.utils import timezone
 
 from apps.core.models import LegacyIdMixin, TenantModel
 
-# api.md §4.2 -- Textile ERP item kinds.
-# `Service` items hold no stock and are excluded from movements and valuation.
+# api.md §4.2 -- Textile ERP item kinds. New items are Fabric only (migration
+# 0025 narrowed the choices but did not convert existing rows): the
+# ``.exclude(item_kind="Service")`` filters across inventory, purchase and
+# reports stay so that legacy Service rows in older databases keep out of
+# stock lists and valuation. Free-text lines (no item) are the non-stock lines.
 ITEM_KINDS = [
     ("Fabric", "Fabric"),
 ]
@@ -331,6 +334,8 @@ class Location(TenantModel, LegacyIdMixin):
     capacity = models.DecimalField(max_digits=18, decimal_places=4, default=0, null=True, blank=True)
     capacity_uom = models.TextField(default="Meter (m)", null=True, blank=True)
     manager = models.TextField(null=True, blank=True)
+    #: Warehouse contact (phone / email). City, state and PIN live in ``address``.
+    contact = models.TextField(null=True, blank=True)
     is_active = models.BooleanField(default=True)
 
     class Meta:

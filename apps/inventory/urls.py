@@ -28,7 +28,7 @@ from apps.masters.views import (
     UnitViewSet,
 )
 
-from . import views
+from . import views, warehouse_views
 
 router = DefaultRouter(trailing_slash=True)
 router.register("items", ItemViewSet, basename="inventory-items")
@@ -63,10 +63,43 @@ router.register("trips", views.TripViewSet, basename="inventory-trips")
 urlpatterns = [
     path("dashboard/", views.InventoryDashboardView.as_view(), name="inventory-dashboard"),
     path("traceability/", views.LotTraceabilityView.as_view(), name="inventory-traceability"),
+    path("batches/groups/", views.BatchGroupsView.as_view(), name="inventory-batch-groups"),
+    path("batches/", views.BatchListView.as_view(), name="inventory-batches"),
+    path("warehouses/", warehouse_views.WarehouseListView.as_view(), name="inventory-warehouses"),
+    path("warehouses/dashboard/", warehouse_views.WarehouseDashboardView.as_view(), name="inventory-warehouse-dashboard"),
+    path("warehouses/stock/", warehouse_views.WarehouseStockView.as_view(), name="inventory-warehouse-stock"),
+    path("warehouses/availability/", warehouse_views.WarehouseAvailabilityView.as_view(), name="inventory-warehouse-availability"),
+    path("warehouses/shortage-transfer/", warehouse_views.WarehouseShortageTransferView.as_view(), name="inventory-warehouse-shortage-transfer"),
+    path("warehouses/stock-levels/", warehouse_views.WarehouseStockLevelView.as_view(), name="inventory-warehouse-stock-levels"),
+    path("warehouses/ledger/", warehouse_views.WarehouseLedgerView.as_view(), name="inventory-warehouse-ledger"),
+    path("warehouses/<uuid:pk>/", warehouse_views.WarehouseDetailView.as_view(), name="inventory-warehouse-detail"),
+    path("production-runs/", views.ProductionRunListView.as_view(), name="inventory-production-runs"),
+    path("production-runs/<uuid:pk>/", views.ProductionRunDetailView.as_view(), name="inventory-production-run"),
+    path("production-runs/<uuid:pk>/<str:action_name>/", views.ProductionRunDetailView.as_view(),
+         name="inventory-production-run-action"),
+    path("qc/purchase-return/", views.QCPurchaseReturnView.as_view(), name="inventory-qc-purchase-return"),
+    path("stock-position/<str:screen>/", views.StockPositionScreenView.as_view(), name="inventory-stock-position"),
+    path("stock-position/<str:screen>/<str:action_name>/", views.StockPositionScreenView.as_view(),
+         name="inventory-stock-position-action"),
+    path("batches/eligible/", views.BatchEligibleStockView.as_view(), name="inventory-batch-eligible"),
+    path("batches/customer-receipt/", views.CustomerMaterialView.as_view(), name="inventory-customer-receipt"),
+    path("batches/physical-stock/", views.CustomerMaterialView.as_view(), name="inventory-physical-stock"),
+    path("batches/<str:code>/deliver/", views.CustomerMaterialView.as_view(), name="inventory-batch-deliver"),
+    path("batches/<str:code>/register-takas/", views.BatchTakaRegistrationView.as_view(),
+         name="inventory-batch-register-takas"),
+    path("batches/allocate-charge/", views.BatchChargeView.as_view(), name="inventory-batch-allocate-charge"),
+    path("batches/<str:code>/losses/", views.BatchLossView.as_view(), name="inventory-batch-losses"),
+    path("batches/<str:code>/actions/<str:action_name>/", views.BatchActionView.as_view(),
+         name="inventory-batch-action"),
+    path("batch-losses/<uuid:loss_id>/", views.BatchLossView.as_view(), name="inventory-batch-loss"),
+    path("batches/<str:code>/", views.BatchDetailView.as_view(), name="inventory-batch-detail"),
     path("lots/<str:lot_id>/traceability/", views.LotTraceabilityView.as_view(), name="inventory-lot-traceability"),
     path("stock/ageing/", views.StockAgeingView.as_view(), name="inventory-stock-ageing"),
     path("stock/slow-moving/", views.SlowMovingStockView.as_view(), name="inventory-slow-moving"),
     path("qc/dashboard/", views.QCDashboardView.as_view(), name="inventory-qc-dashboard"),
+    path("qc/work/", views.QCWorkView.as_view(), name="inventory-qc-work"),
+    path("qc/entry/", views.QCEntryView.as_view(), name="inventory-qc-entry"),
+    path("qc/reprocess-stock/", views.QCReprocessStockView.as_view(), name="inventory-qc-reprocess-stock"),
     path("qc/pending/", views.QCPendingInspectionsView.as_view(), name="inventory-qc-pending"),
     path("qc/pending/bulk-assign/", views.QCBulkAssignView.as_view(), name="inventory-qc-bulk-assign"),
     path("qc/complete/", views.QCCompleteInspectionView.as_view(), name="inventory-qc-complete"),

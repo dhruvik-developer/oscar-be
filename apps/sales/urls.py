@@ -5,11 +5,13 @@ from rest_framework.routers import DefaultRouter
 from . import views
 
 router = DefaultRouter(trailing_slash=True)
-router.register("quotations", views.QuotationViewSet, basename="sales-quotations")
+# [Quotation & Proforma Invoice modules are commented out]
+# router.register("quotations", views.QuotationViewSet, basename="sales-quotations")
 router.register("orders", views.SalesOrderViewSet, basename="sales-orders")
-router.register(
-    "proforma-invoices", views.ProformaInvoiceViewSet, basename="sales-proformas"
-)
+# [Quotation & Proforma Invoice modules are commented out]
+# router.register(
+    # "proforma-invoices", views.ProformaInvoiceViewSet, basename="sales-proformas"
+# )
 router.register("challans", views.DeliveryChallanViewSet, basename="sales-challans")
 router.register("delivery-challans", views.DeliveryChallanViewSet, basename="sales-delivery-challans")
 router.register("invoices", views.SalesInvoiceViewSet, basename="sales-invoices")
@@ -18,5 +20,9 @@ router.register("returns", views.SalesReturnViewSet, basename="sales-returns")
 # [REMOVED] Customer Warranty endpoint removed from sales router
 router.register("broker-commissions", views.BrokerCommissionViewSet, basename="sales-broker-commissions")
 router.register("party-discounts", views.PartyDiscountViewSet, basename="sales-party-discounts")
+router.register("discount-requests", views.EarlyPaymentDiscountRequestViewSet, basename="sales-discount-requests")
 
-urlpatterns = [path("", include(router.urls))]
+urlpatterns = [
+    path("receivables/", views.ReceivablesView.as_view(), name="sales-receivables"),
+    path("", include(router.urls)),
+]

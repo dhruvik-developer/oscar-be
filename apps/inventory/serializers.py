@@ -135,20 +135,49 @@ class StockTransferSerializer(BaseModelSerializer):
     sourceLocation = serializers.CharField(source="from_location.name", read_only=True)
     destLocation = serializers.CharField(source="to_location.name", read_only=True)
     itemsCount = serializers.SerializerMethodField()
-    date = serializers.DateField(source="transfer_date")
+    date = serializers.DateField(source="transfer_date", required=False)
+    lines = serializers.SerializerMethodField()
+    requestedBy = serializers.SerializerMethodField()
+    approvedBy = serializers.SerializerMethodField()
+    receivedBy = serializers.SerializerMethodField()
 
     class Meta:
         model = StockTransfer
         fields = [
             "id", "transfer_number", "sourceLocationId", "destLocationId",
             "sourceLocation", "destLocation", "date", "itemsCount", "status",
-            "shipped_by", "notes", "items", "created_at", "updated_at",
+            "shipped_by", "notes", "items", "lines", "requestedBy", "approvedBy",
+            "receivedBy", "approved_at", "dispatched_at", "received_at", "completed_at",
+            "reference_type", "reference_id", "reference_number", "created_at", "updated_at",
         ]
-        # Status moves only through the dispatch / receive / cancel actions.
-        read_only_fields = ["transfer_number", "status", "created_at", "updated_at"]
+        # Status moves only through the request / approve / dispatch /
+        # receive / complete / cancel actions.
+        read_only_fields = [
+            "transfer_number", "status", "approved_at", "dispatched_at", "received_at",
+            "completed_at", "reference_type", "reference_id", "reference_number",
+            "created_at", "updated_at",
+        ]
 
     def get_itemsCount(self, transfer):
         return transfer.items.filter(deleted_at__isnull=True).count()
+
+    def get_lines(self, transfer):
+        from .warehouse_services import serialize_transfer_extra
+
+        return serialize_transfer_extra(transfer)
+
+    @staticmethod
+    def _user(user):
+        return (user.name or user.email) if user else None
+
+    def get_requestedBy(self, transfer):
+        return self._user(transfer.requested_by)
+
+    def get_approvedBy(self, transfer):
+        return self._user(transfer.approved_by)
+
+    def get_receivedBy(self, transfer):
+        return self._user(transfer.received_by)
 
     def validate(self, attrs):
         source = attrs.get("from_location") or getattr(self.instance, "from_location", None)

@@ -164,7 +164,7 @@ class TextileMasterTests(TestCase):
         )
         self.assertEqual(response.status_code, 201, response.content[:500])
         body = response.json()
-        self.assertEqual(body["name"], "Cotton 60s – Floral Print – Navy Blue")
+        self.assertEqual(body["name"], "Cotton 60s — Floral Print — Navy Blue")
         self.assertEqual(body["code"], "COT-60S-D-001-NAVY")
         self.assertEqual(body["uom"], "Meter")
         self.assertEqual(float(body["width"]), 58.0)

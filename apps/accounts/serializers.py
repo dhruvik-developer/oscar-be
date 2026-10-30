@@ -1,9 +1,12 @@
 """Serializers for auth and administration (api.md §2 and §3)."""
+import re
+
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework import serializers
 
 from apps.core.exceptions import ValidationFailed
+from apps.core.phone import clean_mobile
 from apps.core.serializers import BaseModelSerializer, BaseSerializer
 
 from .models import Client, Permission, Role, RolePermission, User, UserPermission, UserSession
@@ -40,6 +43,9 @@ class MeUserSerializer(BaseModelSerializer):
     def to_representation(self, instance):
         data = super().to_representation(instance)
         data["roleCode"] = instance.role.code if instance.role_id else None
+        data["mustChangePassword"] = bool(instance.must_change_password)
+        data["twoFactorEnabled"] = bool(instance.two_factor_enabled)
+        data["twoFactorRequired"] = instance.requires_two_factor
         data["isSuperuser"] = bool(instance.is_superuser)
         data["is_superuser"] = bool(instance.is_superuser)
         return data
@@ -63,6 +69,8 @@ class TenantSerializer(BaseModelSerializer):
 class LoginSerializer(BaseSerializer):
     email = serializers.EmailField()
     password = serializers.CharField(write_only=True, trim_whitespace=False)
+    #: Code picked in "Select Your Role" (see ``login_roles``).
+    role = serializers.CharField(trim_whitespace=True)
 
 
 class RefreshSerializer(BaseSerializer):
@@ -85,8 +93,21 @@ class ForgotPasswordSerializer(BaseSerializer):
     email = serializers.EmailField()
 
 
+class LoginOtpSerializer(BaseSerializer):
+    challengeId = serializers.UUIDField()
+    otp = serializers.RegexField(r"^\s*\d{6}\s*$", error_messages={"invalid": "Enter the 6-digit code."})
+
+
+class VerifyResetOtpSerializer(BaseSerializer):
+    email = serializers.EmailField()
+    otp = serializers.RegexField(r"^\s*\d{6}\s*$", error_messages={"invalid": "Enter the 6-digit code."})
+
+
 class ResetPasswordSerializer(BaseSerializer):
     token = serializers.CharField()
+    #: Required when the token came from the reset email: the link alone
+    #: cannot change a password, the emailed code has to go with it.
+    otp = serializers.CharField(required=False, allow_blank=True, trim_whitespace=True)
     newPassword = serializers.CharField(write_only=True, trim_whitespace=False)
 
     def validate_newPassword(self, value):
@@ -98,13 +119,18 @@ class ResetPasswordSerializer(BaseSerializer):
 
 
 class UpdateMeSerializer(BaseModelSerializer):
-    """``PATCH /auth/me/`` -- own profile only: name, phone, avatar."""
+    """``PATCH /auth/me/`` -- own profile only: name, phone, avatar, and opting
+    in to two-step sign-in. A role that requires it cannot be opted out of."""
 
     avatar = serializers.CharField(source="avatar_url", required=False, allow_null=True)
+    twoFactorEnabled = serializers.BooleanField(source="two_factor_enabled", required=False)
 
     class Meta:
         model = User
-        fields = ["name", "phone", "avatar"]
+        fields = ["name", "phone", "avatar", "twoFactorEnabled"]
+
+    def validate_phone(self, value):
+        return clean_mobile(value)
 
 
 class UserSessionSerializer(BaseModelSerializer):
@@ -156,6 +182,7 @@ class UserSerializer(BaseModelSerializer):
     lastLogin = serializers.DateTimeField(source="last_login_at", read_only=True)
     permissions = serializers.SerializerMethodField()
     password = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    twoFactorEnabled = serializers.BooleanField(source="two_factor_enabled", required=False)
 
     class Meta:
         model = User
@@ -164,6 +191,7 @@ class UserSerializer(BaseModelSerializer):
             "joinedDate", "lastLogin", "employeeId", "isFromHrms", "designation",
             "employeeStatus", "location", "reportingManager",
             "reportingManagerId", "avatar", "permissions", "crm_roles", "password",
+            "twoFactorEnabled",
             "created_at", "updated_at",
         ]
         read_only_fields = ["created_at", "updated_at"]
@@ -210,6 +238,9 @@ class UserSerializer(BaseModelSerializer):
         """Role-derived plus overrides (api.md §3.1: "permissions[]" on detail)."""
         return sorted(user.effective_permissions())
 
+    def validate_phone(self, value):
+        return clean_mobile(value)
+
     def validate_email(self, value):
         value = value.lower()
         client_id = self.context.get("client_id")
@@ -234,7 +265,9 @@ class UserSerializer(BaseModelSerializer):
                     validated_data["role"] = matched_role
         user = User(**validated_data)
         if password:
+            # An administrator chose it, so the user replaces it at first sign-in.
             user.set_password(password)
+            user.must_change_password = True
         else:
             # api.md §3.1 -- create "triggers the invite email"; until the
             # invite is accepted the account cannot be logged into.
@@ -256,8 +289,11 @@ class UserSerializer(BaseModelSerializer):
                     validated_data["role"] = matched_role
         user = super().update(instance, validated_data)
         if password:
+            request = self.context.get("request")
+            set_by_self = bool(request and getattr(request.user, "pk", None) == user.pk)
             user.set_password(password)
-            user.save(update_fields=["password"])
+            user.must_change_password = not set_by_self
+            user.save(update_fields=["password", "must_change_password"])
         return user
 
 
@@ -293,13 +329,17 @@ class RoleSerializer(BaseModelSerializer):
         child=serializers.CharField(), required=False, write_only=True
     )
     permissions = serializers.SerializerMethodField()
+    requiresTwoFactor = serializers.BooleanField(source="requires_two_factor", required=False)
 
     class Meta:
         model = Role
         fields = [
             "id", "code", "name", "description", "is_system", "userCount",
-            "permissions", "selectedPermissions", "created_at", "updated_at",
+            "permissions", "selectedPermissions", "requiresTwoFactor",
+            "created_at", "updated_at",
         ]
+        # Derived from the name when omitted (see create).
+        extra_kwargs = {"code": {"required": False, "allow_blank": True}}
         read_only_fields = ["is_system", "created_at", "updated_at"]
 
     def get_userCount(self, role):
@@ -313,7 +353,30 @@ class RoleSerializer(BaseModelSerializer):
             RolePermission.objects.filter(role=role).values_list("permission_id", flat=True)
         )
 
+    def to_internal_value(self, data):
+        # The admin screen sends the permission list as `permissions` (the
+        # name it reads back); `permissions` is read-only here, so without
+        # this alias every permission change was silently dropped.
+        if hasattr(data, "get") and "selectedPermissions" not in data and isinstance(data.get("permissions"), list):
+            data = {**data, "selectedPermissions": data["permissions"]}
+        return super().to_internal_value(data)
+
+    def _unique_code(self, name):
+        """``Sales Executive`` → ``SALES_EXECUTIVE`` (``_2``, ``_3`` … if taken)."""
+        base = re.sub(r"[^A-Z0-9]+", "_", (name or "").upper()).strip("_")[:40] or "ROLE"
+        client_id = self.context.get("client_id")
+        taken = set(
+            Role.objects.filter(client_id=client_id, code__startswith=base, deleted_at__isnull=True)
+            .values_list("code", flat=True)
+        )
+        code, n = base, 2
+        while code in taken:
+            code, n = f"{base}_{n}", n + 1
+        return code
+
     def validate_code(self, value):
+        if not value:
+            return value
         client_id = self.context.get("client_id")
         existing = Role.objects.filter(client_id=client_id, code=value, deleted_at__isnull=True)
         if self.instance is not None:
@@ -339,12 +402,16 @@ class RoleSerializer(BaseModelSerializer):
 
     def create(self, validated_data):
         permission_ids = validated_data.pop("selectedPermissions", [])
+        if not validated_data.get("code"):
+            validated_data["code"] = self._unique_code(validated_data.get("name"))
         role = super().create(validated_data)
         self._apply_permissions(role, permission_ids)
         return role
 
     def update(self, instance, validated_data):
         permission_ids = validated_data.pop("selectedPermissions", None)
+        if not validated_data.get("code", instance.code):
+            validated_data.pop("code", None)  # never blank out an existing code
         role = super().update(instance, validated_data)
         if permission_ids is not None:
             self._apply_permissions(role, permission_ids)

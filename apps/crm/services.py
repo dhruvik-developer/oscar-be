@@ -231,6 +231,64 @@ def team_roster(client_id):
     return roster
 
 
+def assignment_options(client_id):
+    """``GET /crm/assignment-options/`` -- the role and department masters.
+
+    Master and stage tasks pick their assignee role from Administration →
+    Roles and their department from HRMS → Departments, so the values stored
+    on a task are the same ones ``resolve_assignee`` matches users against.
+    """
+    from apps.accounts.models import Role
+    from apps.hrms.models import Department
+
+    roles = Role.objects.filter(client_id=client_id, deleted_at__isnull=True).order_by("name")
+    departments = Department.objects.filter(
+        client_id=client_id, deleted_at__isnull=True, status="Active"
+    ).order_by("name")
+    return {
+        "roles": [{"id": str(r.id), "code": r.code, "name": r.name} for r in roles],
+        "departments": [{"id": str(d.id), "name": d.name} for d in departments],
+    }
+
+
+def incentive_schemes(client_id):
+    """``GET /crm/incentive-schemes/`` -- the active salesperson incentive
+    schemes (PDF §12), so the lead form can show how an attributed
+    salesperson is paid. Read-only; schemes are managed under HRMS."""
+    from apps.pms.models import IncentiveScheme
+
+    today = timezone.localdate()
+    schemes = IncentiveScheme.objects.filter(
+        client_id=client_id, deleted_at__isnull=True, is_active=True
+    ).filter(
+        Q(applies_from__isnull=True) | Q(applies_from__lte=today),
+        Q(applies_to__isnull=True) | Q(applies_to__gte=today),
+    ).order_by("name")
+    return [
+        {
+            "id": str(s.id),
+            "name": s.name,
+            "periodType": s.period_type,
+            "basis": s.basis,
+            "slabType": s.slab_type,
+            "ratePct": str(s.rate_pct),
+            "slabs": s.slabs or [],
+            "payoutAfterDays": s.payout_after_days,
+        }
+        for s in schemes
+    ]
+
+
+def _role_filter(role):
+    """A user holds ``role`` through their system role (name or code) or, for
+    tasks saved before roles came from the master, through ``crm_roles``."""
+    return (
+        Q(role__name__iexact=role, role__deleted_at__isnull=True)
+        | Q(role__code__iexact=role, role__deleted_at__isnull=True)
+        | Q(crm_roles__contains=[role])
+    )
+
+
 def resolve_assignee(client_id, role=None, department=None):
     """Role + department, round-robin on open-task count (db.md §9.3).
 
@@ -239,26 +297,26 @@ def resolve_assignee(client_id, role=None, department=None):
     """
     from apps.accounts.models import User
 
-    queryset = User.objects.filter(
+    base = User.objects.filter(
         client_id=client_id, deleted_at__isnull=True, status="Active"
     )
     if role:
-        queryset = queryset.filter(crm_roles__contains=[role])
-    if department:
-        queryset = queryset.filter(department__iexact=department)
+        base = base.filter(_role_filter(role))
+    # An HR-sourced account carries its department on the employee row.
+    queryset = (
+        base.filter(
+            Q(department__iexact=department)
+            | Q(employee__department__name__iexact=department)
+        )
+        if department
+        else base
+    )
 
-    candidates = list(queryset.only("id"))
+    candidates = list(queryset.only("id").distinct())
     if not candidates and department:
         # Fall back to role alone before giving up -- a mis-typed department
         # should not silently leave the task unassigned.
-        candidates = list(
-            User.objects.filter(
-                client_id=client_id,
-                deleted_at__isnull=True,
-                status="Active",
-                crm_roles__contains=[role] if role else [],
-            ).only("id")
-        )
+        candidates = list(base.only("id").distinct())
     if not candidates:
         return None
 
@@ -614,15 +672,16 @@ def annotate_lead_counters(client_id, leads):
     sources = counts(LeadSource)
     files = counts(LeadFile)
     open_tasks = counts(Task, extra={"status__in": ["Open", "In Progress", "Waiting"]})
-    invoices = dict(
-        SalesInvoice.objects.filter(
-            client_id=client_id,
-            deleted_at__isnull=True,
-            sales_order__quotation__crm_lead_id__in=lead_ids,
-        )
-        .values_list("sales_order__quotation__crm_lead_id")
-        .annotate(count=Count("id"))
-    )
+    # An order reaches its lead directly (``crm_lead``) or, for older
+    # orders, through its quotation.
+    invoices = {}
+    for direct_lead, quote_lead in SalesInvoice.objects.filter(
+        Q(sales_order__crm_lead_id__in=lead_ids) | Q(sales_order__quotation__crm_lead_id__in=lead_ids),
+        client_id=client_id,
+        deleted_at__isnull=True,
+    ).values_list("sales_order__crm_lead_id", "sales_order__quotation__crm_lead_id"):
+        key = direct_lead or quote_lead
+        invoices[key] = invoices.get(key, 0) + 1
     challans = dict(
         DeliveryChallan.objects.filter(
             client_id=client_id,
@@ -659,16 +718,65 @@ DEFAULT_STAGES = [
     ("Future", 9, "#64748b", "CalendarClock", "#f8fafc", "#475569", False, False, False),
 ]
 
-#: api.md §9.3 -- the deal catalogue is separate and independent.
+#: api.md §9.3 -- the deal catalogue is separate and independent. This is
+#: the whole pipeline: Revised and Declined were dropped from the board
+#: (Deal.STAGES still accepts them so older deals keep their value).
 DEFAULT_DEAL_STAGES = [
     ("Draft", 1, False, False),
     ("Sent", 2, False, False),
     ("Open", 3, False, False),
-    ("Revised", 4, False, False),
-    ("Declined", 5, False, True),
-    ("Won", 6, True, False),
-    ("Lost", 7, False, True),
+    ("Won", 4, True, False),
+    ("Lost", 5, False, True),
 ]
+
+
+#: Lead sources a new workspace starts with: textile leads come through a
+#: broker or a company salesperson (PDF §11-12). More are added under
+#: CRM Setup → Lead Sources.
+DEFAULT_LEAD_SOURCES = ("Broker", "Sales Person")
+
+
+def ensure_lead_sources(client):
+    """Seed DEFAULT_LEAD_SOURCES for a workspace that has never had a source.
+
+    The lead form used to add these two in the browser only, so they showed
+    in the dropdown but not on the Lead Sources page, and a lead saved with
+    one lost its source (the server only takes a real source id).
+    """
+    from .models import Source
+
+    if Source._base_manager.filter(client=client).exists():
+        return []
+    return [Source.objects.create(client=client, name=name) for name in DEFAULT_LEAD_SOURCES]
+
+
+def ensure_deal_stages(client):
+    """Make sure the pipeline stages (DEFAULT_DEAL_STAGES) exist as live rows.
+
+    The board draws its columns from these rows and falls back to defaults
+    only when there are none, so one stray stage (added on the former Deal
+    Stages screen) replaced the whole Draft → Sent → Open flow.
+    """
+    from .models import DealStage
+
+    for name, sequence, is_won, is_lost in DEFAULT_DEAL_STAGES:
+        if not DealStage.objects.filter(client=client, name=name, deleted_at__isnull=True).exists():
+            DealStage.objects.create(
+                client=client, name=name, sequence=sequence, is_won=is_won, is_lost=is_lost
+            )
+
+
+def ensure_crm_configuration(client):
+    """Seed the shipped stages for a workspace that has never had any.
+
+    Workspaces are provisioned outside the API, so nothing seeded them and a
+    new one had no lead stages: every lead create failed, and the app kept
+    leads only in the browser. Soft-deleted rows count as "had stages", so
+    a workspace that deliberately removed them is left alone.
+    """
+    if Stage._base_manager.filter(client=client).exists():
+        return []
+    return seed_crm_configuration(client)
 
 
 def seed_crm_configuration(client):
@@ -701,7 +809,7 @@ def seed_crm_configuration(client):
             defaults={"sequence": sequence, "is_won": is_won, "is_lost": is_lost},
         )
 
-    for name in ("Website", "Referral", "Exhibition", "Walk-in", "Campaign"):
+    for name in (*DEFAULT_LEAD_SOURCES, "Website", "Referral", "Exhibition", "Walk-in", "Campaign"):
         Source.objects.get_or_create(client=client, name=name)
 
     return created
@@ -770,6 +878,36 @@ def find_matching_party(client_id, lead):
 
 
 @transaction.atomic
+def sync_lead_products(deal):
+    """Copy the deal's lead requirements (``LeadProduct``) onto the deal as
+    product lines -- each once. Lines keep their own qty / rate afterwards
+    (the deal is negotiated separately), and a copied line removed from the
+    deal is not re-added. Returns the number of lines added."""
+    from .models import DealLine, LeadProduct
+
+    if not deal.lead_id:
+        return 0
+    copied = set(
+        DealLine.objects.filter(deal=deal, lead_product__isnull=False).values_list("lead_product_id", flat=True)
+    )
+    added = 0
+    for p in LeadProduct.objects.filter(lead_id=deal.lead_id, deleted_at__isnull=True).select_related("item")             .order_by("created_at"):
+        if p.id in copied:
+            continue
+        width = f'{format(p.fabric_width.normalize(), "f")}"' if p.fabric_width is not None else None
+        gsm = f'{format(p.fabric_gsm.normalize(), "f")} GSM' if p.fabric_gsm is not None else None
+        details = [p.fabric_code, p.fabric_type, p.fabric_design, p.fabric_color, width, gsm, p.notes]
+        DealLine.objects.create(
+            client_id=deal.client_id, deal=deal, item=p.item, lead_product=p,
+            name=p.product_name or (p.item.name if p.item_id else None) or p.fabric_code or "Product",
+            description=" · ".join(str(d) for d in details if d) or None,
+            qty=p.qty or 1, rate=p.expected_rate or 0,
+            unit=p.uom or (p.item.uom if p.item_id else None) or "Meter",
+        )
+        added += 1
+    return added
+
+
 def convert_lead_to_customer(lead, *, user=None, source="Quotation Approval", reference=None):
     """Convert one lead into a Customer/Party, transactionally and idempotently.
 
@@ -925,3 +1063,56 @@ def convert_lead_to_customer(lead, *, user=None, source="Quotation Approval", re
         ),
     )
     return {"party": party, "created": created, "lead": lead, "matched_on": matched_on}
+
+
+def sync_form_products(lead, user=None):
+    """Products picked on the lead form (``custom_values["products"]``, item
+    names) become fabric requirement rows (``LeadProduct``), so the
+    Requirements tab shows exactly what was chosen.
+
+    Add-only and idempotent: a product already on the lead (same name, case
+    ignored) is left alone, and removing a name from the form never deletes a
+    requirement someone may have filled in since.
+    """
+    from apps.masters.models import Item
+
+    from .models import LeadProduct
+
+    names = (lead.custom_values or {}).get("products") or []
+    names = [str(n).strip() for n in names if str(n or "").strip()]
+    if not names:
+        return []
+    existing = {
+        (p.product_name or "").strip().lower()
+        for p in LeadProduct.objects.filter(lead=lead, deleted_at__isnull=True)
+    }
+    items = {
+        i.name.strip().lower(): i
+        for i in Item.objects.filter(client_id=lead.client_id, name__in=names, deleted_at__isnull=True)
+    }
+    created = []
+    actor = user if getattr(user, "is_authenticated", False) else None
+    for name in dict.fromkeys(names):
+        key = name.lower()
+        if key in existing:
+            continue
+        item = items.get(key)
+        created.append(LeadProduct.objects.create(
+            client_id=lead.client_id,
+            lead=lead,
+            item=item,
+            product_name=item.name if item else name,
+            fabric_code=item.sku if item else None,
+            fabric_type=item.fabric_quality if item else None,
+            fabric_design=item.fabric_design if item else None,
+            fabric_color=item.fabric_color if item else None,
+            fabric_width=item.fabric_width if item else None,
+            fabric_gsm=item.fabric_gsm if item else None,
+            qty=1,
+            uom=item.uom if item else "Meter",
+            status="Active",
+            notes="Added from the lead form",
+            created_by=actor,
+        ))
+        existing.add(key)
+    return created
