@@ -878,6 +878,36 @@ def find_matching_party(client_id, lead):
 
 
 @transaction.atomic
+def sync_lead_products(deal):
+    """Copy the deal's lead requirements (``LeadProduct``) onto the deal as
+    product lines -- each once. Lines keep their own qty / rate afterwards
+    (the deal is negotiated separately), and a copied line removed from the
+    deal is not re-added. Returns the number of lines added."""
+    from .models import DealLine, LeadProduct
+
+    if not deal.lead_id:
+        return 0
+    copied = set(
+        DealLine.objects.filter(deal=deal, lead_product__isnull=False).values_list("lead_product_id", flat=True)
+    )
+    added = 0
+    for p in LeadProduct.objects.filter(lead_id=deal.lead_id, deleted_at__isnull=True).select_related("item")             .order_by("created_at"):
+        if p.id in copied:
+            continue
+        width = f'{format(p.fabric_width.normalize(), "f")}"' if p.fabric_width is not None else None
+        gsm = f'{format(p.fabric_gsm.normalize(), "f")} GSM' if p.fabric_gsm is not None else None
+        details = [p.fabric_code, p.fabric_type, p.fabric_design, p.fabric_color, width, gsm, p.notes]
+        DealLine.objects.create(
+            client_id=deal.client_id, deal=deal, item=p.item, lead_product=p,
+            name=p.product_name or (p.item.name if p.item_id else None) or p.fabric_code or "Product",
+            description=" · ".join(str(d) for d in details if d) or None,
+            qty=p.qty or 1, rate=p.expected_rate or 0,
+            unit=p.uom or (p.item.uom if p.item_id else None) or "Meter",
+        )
+        added += 1
+    return added
+
+
 def convert_lead_to_customer(lead, *, user=None, source="Quotation Approval", reference=None):
     """Convert one lead into a Customer/Party, transactionally and idempotently.
 
@@ -1033,3 +1063,56 @@ def convert_lead_to_customer(lead, *, user=None, source="Quotation Approval", re
         ),
     )
     return {"party": party, "created": created, "lead": lead, "matched_on": matched_on}
+
+
+def sync_form_products(lead, user=None):
+    """Products picked on the lead form (``custom_values["products"]``, item
+    names) become fabric requirement rows (``LeadProduct``), so the
+    Requirements tab shows exactly what was chosen.
+
+    Add-only and idempotent: a product already on the lead (same name, case
+    ignored) is left alone, and removing a name from the form never deletes a
+    requirement someone may have filled in since.
+    """
+    from apps.masters.models import Item
+
+    from .models import LeadProduct
+
+    names = (lead.custom_values or {}).get("products") or []
+    names = [str(n).strip() for n in names if str(n or "").strip()]
+    if not names:
+        return []
+    existing = {
+        (p.product_name or "").strip().lower()
+        for p in LeadProduct.objects.filter(lead=lead, deleted_at__isnull=True)
+    }
+    items = {
+        i.name.strip().lower(): i
+        for i in Item.objects.filter(client_id=lead.client_id, name__in=names, deleted_at__isnull=True)
+    }
+    created = []
+    actor = user if getattr(user, "is_authenticated", False) else None
+    for name in dict.fromkeys(names):
+        key = name.lower()
+        if key in existing:
+            continue
+        item = items.get(key)
+        created.append(LeadProduct.objects.create(
+            client_id=lead.client_id,
+            lead=lead,
+            item=item,
+            product_name=item.name if item else name,
+            fabric_code=item.sku if item else None,
+            fabric_type=item.fabric_quality if item else None,
+            fabric_design=item.fabric_design if item else None,
+            fabric_color=item.fabric_color if item else None,
+            fabric_width=item.fabric_width if item else None,
+            fabric_gsm=item.fabric_gsm if item else None,
+            qty=1,
+            uom=item.uom if item else "Meter",
+            status="Active",
+            notes="Added from the lead form",
+            created_by=actor,
+        ))
+        existing.add(key)
+    return created

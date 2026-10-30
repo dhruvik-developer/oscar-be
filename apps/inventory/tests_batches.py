@@ -388,6 +388,141 @@ class PurchaseOrderBatchTests(BatchTestBase):
         self.assertEqual(batch_services.serialize_batch(polyester.batch)["hsnCodes"], ["54075290"])
 
 
+class BatchRegistryGroupingTests(BatchTestBase):
+    def test_po_groups_include_only_linked_batches_and_real_po_summaries(self):
+        from apps.purchase.models import GoodsReceipt, GoodsReceiptLine, PurchaseOrder, PurchaseOrderLine
+
+        po = PurchaseOrder.objects.create(
+            client=self.tenant, party=self.vendor, po_number="PO-GROUP-1",
+            doc_date=date(2026, 9, 1),
+        )
+        po_line = PurchaseOrderLine.objects.create(
+            client=self.tenant, purchase_order=po, line_no=1, item=self.item,
+            item_name=self.item.name, uom="Meter", qty=Decimal("1000"),
+        )
+        linked_batches = []
+        for index, (grn_number, received_qty) in enumerate((("GRN-GROUP-1", "200"), ("GRN-GROUP-2", "300")), 1):
+            receipt = GoodsReceipt.objects.create(
+                client=self.tenant, party=self.vendor, purchase_order=po,
+                grn_number=grn_number, receipt_date=date(2026, 9, index + 1),
+                location=self.godown,
+                qc_status="Approved" if index == 1 else "Pending",
+                qc_note='{"cumulative":{"good":"200","second":"0","reprocess":"0","reject":"0"}}' if index == 1 else "",
+            )
+            GoodsReceiptLine.objects.create(
+                client=self.tenant, goods_receipt=receipt, purchase_order_line=po_line,
+                item=self.item, uom="Meter", ordered_qty=Decimal("1000"),
+                received_qty=Decimal(received_qty),
+            )
+            taka = LotTaka.objects.create(
+                client=self.tenant, item=self.item, location=self.godown,
+                lot_number=f"PO-GROUP-{index}", taka_number="1",
+                taka_id=f"TAK-{uuid.uuid4().hex[:6]}",
+                received_quantity=Decimal(received_qty),
+                source_document_type="GRN", source_document_id=receipt.id,
+                source_document_number=receipt.grn_number,
+            )
+            batch = taka.batch
+            batch.purchase_order = po if index == 1 else None
+            batch.purchase_order_line = po_line if index == 1 else None
+            batch.goods_receipt = receipt if index == 1 else None
+            batch.source_document_type = "GRN"
+            batch.source_document_id = receipt.id
+            batch.source_document_number = receipt.grn_number
+            batch.save()
+            linked_batches.append(batch.batch_code)
+
+        other_po = PurchaseOrder.objects.create(
+            client=self.tenant, party=self.vendor, po_number="PO-GROUP-2",
+            doc_date=date(2026, 9, 1),
+        )
+        other_line = PurchaseOrderLine.objects.create(
+            client=self.tenant, purchase_order=other_po, line_no=1, item=self.item,
+            item_name=self.item.name, uom="Meter", qty=Decimal("100"),
+        )
+        other_receipt = GoodsReceipt.objects.create(
+            client=self.tenant, party=self.vendor, purchase_order=other_po,
+            grn_number="GRN-GROUP-OTHER", receipt_date=date(2026, 9, 4),
+            location=self.godown,
+        )
+        GoodsReceiptLine.objects.create(
+            client=self.tenant, goods_receipt=other_receipt, purchase_order_line=other_line,
+            item=self.item, uom="Meter", ordered_qty=Decimal("100"),
+            received_qty=Decimal("100"),
+        )
+        other_taka = LotTaka.objects.create(
+            client=self.tenant, item=self.item, location=self.godown,
+            lot_number="PO-GROUP-OTHER", taka_number="1",
+            taka_id=f"TAK-{uuid.uuid4().hex[:6]}", received_quantity=Decimal("100"),
+            source_document_type="GRN", source_document_id=other_receipt.id,
+            source_document_number=other_receipt.grn_number,
+        )
+        other_batch_code = other_taka.batch.batch_code
+        legacy = self.receive(lot="PO-GROUP-UNLINKED", meters="40").batch
+        response = self.api.get("/api/v1/inventory/batches/groups/", {"groupBy": "po"})
+        self.assertEqual(response.status_code, 200, response.content)
+        body = response.json()
+        po_group = next(group for group in body["groups"] if group.get("poId") == str(po.id))
+        other_po_group = next(group for group in body["groups"] if group.get("poId") == str(other_po.id))
+        unlinked_group = next(group for group in body["groups"] if group["type"] == "unlinked")
+        self.assertEqual({row["batchCode"] for row in po_group["batches"]}, set(linked_batches))
+        self.assertEqual([row["batchCode"] for row in other_po_group["batches"]], [other_batch_code])
+        self.assertEqual(po_group["batchCount"], 2)
+        self.assertEqual(po_group["poNumber"], "PO-GROUP-1")
+        self.assertEqual(po_group["vendorName"], self.vendor.name)
+        self.assertEqual(po_group["orderedQty"], "1000.0000")
+        self.assertEqual(po_group["receivedQty"], "500.0000")
+        self.assertEqual(po_group["remainingQty"], "500.0000")
+        self.assertEqual(po_group["qcPassedQty"], "200.0000")
+        self.assertEqual(po_group["qcPendingQty"], "300.0000")
+        self.assertEqual(
+            {grn for row in po_group["batches"] for grn in row["receiptNumbers"]},
+            {"GRN-GROUP-1", "GRN-GROUP-2"},
+        )
+        self.assertEqual([row["batchCode"] for row in unlinked_group["batches"]], [legacy.batch_code])
+
+        filtered = self.api.get(
+            "/api/v1/inventory/batches/groups/",
+            {"groupBy": "po", "poId": str(po.id)},
+        )
+        self.assertEqual(filtered.status_code, 200, filtered.content)
+        self.assertEqual(len(filtered.json()["groups"]), 1)
+        self.assertEqual(filtered.json()["groups"][0]["batchCount"], 2)
+        self.assertEqual(
+            {row["batchCode"] for row in filtered.json()["groups"][0]["batches"]},
+            set(linked_batches),
+        )
+
+        flat = self.api.get("/api/v1/inventory/batches/", {"poId": str(po.id)})
+        self.assertEqual(flat.status_code, 200, flat.content)
+        self.assertEqual({row["batchCode"] for row in flat.json()["results"]}, set(linked_batches))
+        searched = self.api.get("/api/v1/inventory/batches/", {"q": "PO-GROUP-1"})
+        self.assertEqual(searched.status_code, 200, searched.content)
+        self.assertEqual({row["batchCode"] for row in searched.json()["results"]}, set(linked_batches))
+
+    def test_selected_po_without_batches_returns_an_empty_group(self):
+        from apps.purchase.models import PurchaseOrder, PurchaseOrderLine
+
+        po = PurchaseOrder.objects.create(
+            client=self.tenant, party=self.vendor, po_number="PO-GROUP-EMPTY",
+            doc_date=date(2026, 9, 1),
+        )
+        PurchaseOrderLine.objects.create(
+            client=self.tenant, purchase_order=po, line_no=1, item=self.item,
+            item_name=self.item.name, uom="Meter", qty=Decimal("500"),
+        )
+        response = self.api.get(
+            "/api/v1/inventory/batches/groups/",
+            {"groupBy": "po", "poId": str(po.id)},
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        group = response.json()["groups"][0]
+        self.assertEqual(group["poId"], str(po.id))
+        self.assertEqual(group["poNumber"], "PO-GROUP-EMPTY")
+        self.assertEqual(group["batchCount"], 0)
+        self.assertEqual(group["batches"], [])
+
+
 class BatchLossCostingTests(BatchTestBase):
     """Normal loss is absorbed by good fabric; a vendor-fault rejection is a claim."""
 

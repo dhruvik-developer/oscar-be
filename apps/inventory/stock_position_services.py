@@ -397,14 +397,39 @@ def reprocessing(client_id, params, include_cost=False):
     vendor_held = LotTaka.objects.filter(
         client_id=client_id, location__code__startswith="SYS-WIP-", available_quantity__gt=0, deleted_at__isnull=True,
     ).aggregate(v=Sum("available_quantity"))["v"] or ZERO
-    in_store = LotTaka.objects.filter(
+    in_store_takas = LotTaka.objects.filter(
         client_id=client_id, location__code="SYS-REPROCESS", available_quantity__gt=0, deleted_at__isnull=True,
-    ).aggregate(v=Sum("available_quantity"))["v"] or ZERO
+    ).select_related("batch", "item", "location").order_by("-received_date", "-created_at")
+    in_store = in_store_takas.aggregate(v=Sum("available_quantity"))["v"] or ZERO
+    in_store_lots = [
+        {
+            "id": str(t.id),
+            "lotTakaId": str(t.id),
+            "takaNumber": t.taka_number or "1",
+            "lotNumber": t.lot_number or "",
+            "batchCode": t.batch.batch_code if t.batch else None,
+            "fabric": t.item.name if t.item else (t.fabric_quality or "Fabric"),
+            "quantity": str(round4(t.available_quantity)),
+            "uom": t.uom or "m",
+            "status": "In Reprocess Store",
+            "qcStatus": t.qc_status or "Reprocess",
+            "location": t.location.name if t.location else "Reprocess Store",
+            "receivedDate": t.received_date.isoformat() if t.received_date else "",
+        }
+        for t in in_store_takas
+    ]
     kpis = {k: (int(v) if k in ("lotsUnderProcessing", "overdueLots") else str(round4(v))) for k, v in kpi.items()}
     kpis["vendorHeld"] = str(round4(D(vendor_held)))
     kpis["awaitingReprocessInStore"] = str(round4(D(in_store)))
     page_rows, page, size = _page(rows, params)
-    return {"kpis": kpis, "results": page_rows, "count": len(rows), "page": page, "page_size": size}
+    return {
+        "kpis": kpis,
+        "results": page_rows,
+        "inStoreLots": in_store_lots,
+        "count": len(rows),
+        "page": page,
+        "page_size": size,
+    }
 
 
 # ---------------------------------------------------------------------------

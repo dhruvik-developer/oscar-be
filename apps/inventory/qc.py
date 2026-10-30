@@ -256,6 +256,7 @@ def dispose_receipt(
             "rework": "reprocess",
             "hold": "hold",
             "on hold": "hold",
+            "inspected": "good",
         }
         taka_lookup = {}
         seen_taka_keys = set()
@@ -272,31 +273,55 @@ def dispose_receipt(
                 seen_taka_keys.add(t_key)
             raw_disp = str(t_entry.get("disposition") or t_entry.get("qcStatus") or t_entry.get("status") or "Passed").strip().lower()
             cat = disposition_map.get(raw_disp, "good")
+            val = (cat, t_entry)
             if t_key:
-                taka_lookup[t_key] = cat
+                taka_lookup[t_key] = val
                 if t_entry.get("takaId"):
-                    taka_lookup[str(t_entry.get("takaId"))] = cat
+                    taka_lookup[str(t_entry.get("takaId"))] = val
                 if t_entry.get("id"):
-                    taka_lookup[str(t_entry.get("id"))] = cat
+                    taka_lookup[str(t_entry.get("id"))] = val
                 if t_entry.get("takaNumber") or t_entry.get("taka_number"):
-                    taka_lookup[str(t_entry.get("takaNumber") or t_entry.get("taka_number"))] = cat
+                    taka_lookup[str(t_entry.get("takaNumber") or t_entry.get("taka_number"))] = val
+                if t_entry.get("barcode"):
+                    taka_lookup[str(t_entry.get("barcode"))] = val
 
         plan = []
         totals = {category: ZERO for category in CATEGORIES}
         for unit in units:
             lot = unit.get("lot")
-            cat = "good"
+            info = None
             if lot:
-                matched_cat = (
+                info = (
                     taka_lookup.get(str(lot.id))
                     or taka_lookup.get(str(lot.taka_id))
                     or taka_lookup.get(str(lot.barcode))
                     or taka_lookup.get(str(lot.taka_number))
                 )
-                if matched_cat:
-                    cat = matched_cat
-            plan.append((unit, cat, round4(unit["qty"])))
-            totals[cat] += round4(unit["qty"])
+            cat = info[0] if (info and isinstance(info, tuple)) else (info or "good")
+            t_entry = info[1] if (info and isinstance(info, tuple)) else None
+
+            # Handle partial taka allocations (e.g. 50 Good, 50 Reprocess)
+            handled_sub = False
+            if t_entry and isinstance(t_entry, dict):
+                sub_quantities = {}
+                for category, keys in CATEGORY_KEYS.items():
+                    val = next((t_entry.get(k) for k in keys if t_entry.get(k) not in (None, "")), None)
+                    if val is not None:
+                        try:
+                            sub_quantities[category] = round4(D(val))
+                        except Exception:
+                            pass
+                sub_total = sum(sub_quantities.values(), ZERO)
+                if sub_total > ZERO and abs(sub_total - round4(unit["qty"])) <= TOLERANCE:
+                    for category, q in sub_quantities.items():
+                        if q > ZERO:
+                            plan.append((unit, category, q))
+                            totals[category] += q
+                    handled_sub = True
+
+            if not handled_sub:
+                plan.append((unit, cat, round4(unit["qty"])))
+                totals[cat] += round4(unit["qty"])
         quantities = totals
     elif line_quantities:
         plan = []
@@ -456,6 +481,8 @@ def record_receipt_verdict(receipt, quantities, *, user=None, remarks=None, meas
     """Add a QC result to the receipt's running totals and set its verdict,
     bill QC status and audit trail. Shared by the quantity disposition and
     the roll-by-roll QC entry. Returns the verdict."""
+    from apps.purchase.models import PurchaseBill
+
     meta = _load_meta(receipt)
     cumulative = {
         category: D(str(meta.get("cumulative", {}).get(category, 0)))

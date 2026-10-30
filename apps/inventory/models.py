@@ -646,6 +646,20 @@ class Batch(TenantModel):
         "self", blank=True, symmetrical=False, related_name="child_batches"
     )
     notes = models.TextField(null=True, blank=True)
+    #: Factory fabric orders: the PO, its fabric line and the receipt that
+    #: opened this batch (one batch per received line).
+    purchase_order = models.ForeignKey(
+        "purchase.PurchaseOrder", null=True, blank=True, on_delete=models.SET_NULL, related_name="fabric_batches"
+    )
+    purchase_order_line = models.ForeignKey(
+        "purchase.PurchaseOrderLine", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    goods_receipt = models.ForeignKey(
+        "purchase.GoodsReceipt", null=True, blank=True, on_delete=models.SET_NULL, related_name="fabric_batches"
+    )
+    goods_receipt_line = models.ForeignKey(
+        "purchase.GoodsReceiptLine", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
 
     class Meta:
         db_table = "fabric_batches"
