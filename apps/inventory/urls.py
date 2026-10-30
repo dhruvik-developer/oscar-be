@@ -63,6 +63,7 @@ router.register("trips", views.TripViewSet, basename="inventory-trips")
 urlpatterns = [
     path("dashboard/", views.InventoryDashboardView.as_view(), name="inventory-dashboard"),
     path("traceability/", views.LotTraceabilityView.as_view(), name="inventory-traceability"),
+    path("batches/groups/", views.BatchGroupsView.as_view(), name="inventory-batch-groups"),
     path("batches/", views.BatchListView.as_view(), name="inventory-batches"),
     path("warehouses/", warehouse_views.WarehouseListView.as_view(), name="inventory-warehouses"),
     path("warehouses/dashboard/", warehouse_views.WarehouseDashboardView.as_view(), name="inventory-warehouse-dashboard"),

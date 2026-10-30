@@ -910,12 +910,25 @@ def cost_summary(po):
     else:
         status, note = "COMPLETE", "All recorded costs are actual and allocated to the batches."
     order_value = round2(sum((D(l.qty) * D(l.rate) for l in _live(po.line_items)), ZERO))
+
+    # Yarn cost resolution: check planned yarn lines and actual booked expenses
+    yarn_lines = list(_live(po.yarn_lines))
+    yarn_planned = round2(
+        sum(((D(y.amount) if y.amount is not None else (D(y.required_qty or ZERO) * D(y.rate or ZERO))) for y in yarn_lines), ZERO)
+    )
+    yarn_expense = round2(by_category[PurchaseOrderExpense.CATEGORY_YARN])
+    yarn_cost = yarn_expense if yarn_expense > ZERO else yarn_planned
+    has_yarn_details = bool(yarn_lines or yarn_expense > ZERO)
+
     return {
         "orderValue": str(order_value),
         "fabricReceivedValue": str(fabric_value),
         "manufacturing": str(round2(fabric_value + by_category[PurchaseOrderExpense.CATEGORY_MANUFACTURING])),
         "manufacturingCharges": str(round2(by_category[PurchaseOrderExpense.CATEGORY_MANUFACTURING])),
-        "yarn": str(round2(by_category[PurchaseOrderExpense.CATEGORY_YARN])),
+        "yarn": str(round2(yarn_cost)),
+        "yarnPlanned": str(yarn_planned),
+        "yarnExpense": str(yarn_expense),
+        "hasYarnDetails": has_yarn_details,
         "dyeing": str(round2(by_category[PurchaseOrderExpense.CATEGORY_DYEING])),
         "freight": str(round2(by_category[PurchaseOrderExpense.CATEGORY_FREIGHT])),
         "other": str(round2(by_category[PurchaseOrderExpense.CATEGORY_OTHER])),

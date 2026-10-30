@@ -1,6 +1,7 @@
 """Inventory endpoints (api.md §7)."""
 from decimal import Decimal
 import json
+import uuid
 
 from django.db import transaction
 from django.db.models import Count, DecimalField, F, Q, Sum, Value
@@ -23,7 +24,7 @@ from apps.core.viewsets import ReadOnlyTenantViewSet, TenantModelViewSet
 from apps.accounts.models import User
 from apps.masters import uom
 from apps.masters.models import Design, Fabric, FabricQuality, Item, ItemCategory, ItemPart, Location, Party, Shade
-from apps.purchase.models import GoodsReceipt, GoodsReceiptLine, PurchaseBill, PurchaseBillLine
+from apps.purchase.models import GoodsReceipt, GoodsReceiptLine, PurchaseBill, PurchaseBillLine, PurchaseOrder
 from apps.sales.models import SalesReturn, SalesReturnLine
 from apps.jobwork.models import JWOInward, JWOOutward, JWOReprocess, JobWorkOrder
 
@@ -3210,6 +3211,7 @@ class QCCompleteInspectionView(APIView):
                     user=request.user,
                     remarks=request.data.get("remarks") or None,
                     job_work_order=jwo,
+                    require_job_work_order=bool(jwo_id),
                 )
 
                 return Response({
@@ -6128,18 +6130,80 @@ class BatchListView(APIView):
         )
         q = (params.get("q") or "").strip()
         if q:
+            matching_po_ids = PurchaseOrder.objects.filter(
+                client_id=request.client_id,
+                deleted_at__isnull=True,
+                po_number__icontains=q,
+            ).values_list("id", flat=True)
+            matching_receipt_ids = GoodsReceipt.objects.filter(
+                client_id=request.client_id,
+                deleted_at__isnull=True,
+            ).filter(
+                Q(purchase_order_id__in=matching_po_ids)
+                | Q(purchase_bill__purchase_order_id__in=matching_po_ids)
+            ).values_list("id", flat=True)
+            matching_bill_ids = PurchaseBill.objects.filter(
+                client_id=request.client_id,
+                deleted_at__isnull=True,
+                purchase_order_id__in=matching_po_ids,
+            ).values_list("id", flat=True)
             qs = qs.filter(
                 Q(batch_code__icontains=q)
                 | Q(source_document_number__icontains=q)
                 | Q(item__name__icontains=q)
                 | Q(supplier__name__icontains=q)
+                | Q(purchase_order__po_number__icontains=q)
+                | Q(purchase_order_line__purchase_order__po_number__icontains=q)
+                | Q(goods_receipt__grn_number__icontains=q)
                 | Q(takas__lot_number__icontains=q)
                 | Q(takas__taka_id__icontains=q)
+                | Q(takas__source_document_number__icontains=q)
+                | Q(source_document_type__iexact="PurchaseOrder", source_document_id__in=matching_po_ids)
+                | Q(purchase_order_line__purchase_order_id__in=matching_po_ids)
+                | Q(goods_receipt_id__in=matching_receipt_ids)
+                | Q(source_document_type__iexact="GRN", source_document_id__in=matching_receipt_ids)
+                | Q(source_document_type__iexact="GoodsReceipt", source_document_id__in=matching_receipt_ids)
+                | Q(source_document_type__iexact="PurchaseBill", source_document_id__in=matching_bill_ids)
             ).distinct()
         for param, field in (("origin", "origin"), ("ownership", "ownership"), ("fabricType", "fabric_type"),
                              ("supplierId", "supplier_id"), ("itemId", "item_id")):
             if params.get(param):
                 qs = qs.filter(**{field: params[param]})
+        po_filter = params.get("poId") or params.get("purchaseOrderId")
+        if po_filter:
+            po_qs = PurchaseOrder.objects.filter(client_id=request.client_id, deleted_at__isnull=True)
+            po = po_qs.filter(po_number__iexact=po_filter).first()
+            if po is None:
+                try:
+                    po = po_qs.filter(pk=uuid.UUID(str(po_filter))).first()
+                except (TypeError, ValueError, AttributeError):
+                    po = None
+            if po is None:
+                qs = qs.none()
+            else:
+                receipt_ids = GoodsReceipt.objects.filter(
+                    client_id=request.client_id,
+                    deleted_at__isnull=True,
+                ).filter(
+                    Q(purchase_order_id=po.id) | Q(purchase_bill__purchase_order_id=po.id)
+                ).values_list("id", flat=True)
+                bill_ids = PurchaseBill.objects.filter(
+                    client_id=request.client_id,
+                    deleted_at__isnull=True,
+                    purchase_order_id=po.id,
+                ).values_list("id", flat=True)
+                qs = qs.filter(
+                    Q(purchase_order_id=po.id)
+                    | Q(purchase_order_line__purchase_order_id=po.id)
+                    | Q(source_document_type__iexact="PurchaseOrder", source_document_id=po.id)
+                    | Q(goods_receipt__purchase_order_id=po.id)
+                    | Q(goods_receipt_id__in=receipt_ids)
+                    | Q(source_document_type__iexact="GRN", source_document_id__in=receipt_ids)
+                    | Q(source_document_type__iexact="GoodsReceipt", source_document_id__in=receipt_ids)
+                    | Q(source_document_type__iexact="PurchaseBill", source_document_id__in=bill_ids)
+                ).distinct()
+        if params.get("qcStatus"):
+            qs = qs.filter(takas__qc_status=params["qcStatus"]).distinct()
         if params.get("from"):
             qs = qs.filter(created_on__gte=params["from"])
         if params.get("to"):
@@ -6218,6 +6282,36 @@ class BatchListView(APIView):
             received_on=data.get("date") or None, send_to_qc=bool(data.get("sendToQc")), user=request.user,
         )
         return _batch_body(request, batch, status.HTTP_201_CREATED)
+
+
+class BatchGroupsView(APIView):
+    """GET /inventory/batches/groups/?groupBy=po|fabric."""
+
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_inventory"]
+
+    def get(self, request):
+        from .batch_registry import grouped_batch_registry
+
+        with_cost = request.query_params.get("withCost") in ("1", "true") and _can_see_batch_cost(request.user)
+        try:
+            result = grouped_batch_registry(request.client_id, request.query_params, with_cost=with_cost)
+            page = max(1, int(request.query_params.get("page") or 1))
+            page_size = min(200, max(1, int(request.query_params.get("page_size") or 25)))
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        groups = result["groups"]
+        group_count = len(groups)
+        page_groups = groups[(page - 1) * page_size: page * page_size]
+        body = envelope(page_groups, count=group_count, page=page, page_size=page_size)
+        body["groups"] = page_groups
+        body["groupCount"] = group_count
+        body["batchCount"] = result["batchCount"]
+        body["purchaseOrders"] = result["purchaseOrders"]
+        body["summary"] = result["summary"]
+        body["canSeeCost"] = _can_see_batch_cost(request.user)
+        return Response(body)
 
 
 class BatchEligibleStockView(APIView):
@@ -7149,9 +7243,3 @@ class TripViewSet(TenantModelViewSet):
             user=request.user,
         )
         return Response(self.get_serializer(trip).data)
-
-
-
-
-
-

@@ -952,8 +952,6 @@ class TaskViewSet(TenantModelViewSet):
     search_fields = ["title", "description", "lead__name"]
     ordering = ["due_date", "-created_at"]
     filter_map = {
-        "leadId": "lead_id",
-        "dealId": "deal_id",
         "assigneeId": "assignee_id",
         "priority": "priority",
         "source": "source",
@@ -969,6 +967,27 @@ class TaskViewSet(TenantModelViewSet):
     }
 
     def filter_queryset(self, queryset):
+        params = self.request.query_params
+        lead_id = params.get("leadId")
+        deal_id = params.get("dealId")
+
+        if lead_id and deal_id:
+            queryset = queryset.filter(Q(lead_id=lead_id) | Q(deal_id=deal_id))
+        elif lead_id:
+            from .models import Deal
+            linked_deal_ids = list(Deal.objects.filter(lead_id=lead_id).values_list("id", flat=True))
+            if linked_deal_ids:
+                queryset = queryset.filter(Q(lead_id=lead_id) | Q(deal_id__in=linked_deal_ids))
+            else:
+                queryset = queryset.filter(lead_id=lead_id)
+        elif deal_id:
+            from .models import Deal
+            deal_obj = Deal.objects.filter(id=deal_id).first()
+            if deal_obj and deal_obj.lead_id:
+                queryset = queryset.filter(Q(deal_id=deal_id) | Q(lead_id=deal_obj.lead_id))
+            else:
+                queryset = queryset.filter(deal_id=deal_id)
+
         queryset = super().filter_queryset(queryset)
         due = self.request.query_params.get("dueDate")
         if due:
@@ -976,6 +995,21 @@ class TaskViewSet(TenantModelViewSet):
         if self.request.query_params.get("mine") == "true":
             queryset = queryset.filter(assignee=self.request.user)
         return queryset
+
+    def create_defaults(self):
+        defaults = super().create_defaults()
+        lead = self.request.data.get("leadId") or self.request.data.get("lead")
+        deal = self.request.data.get("dealId") or self.request.data.get("deal")
+        from .models import Deal
+        if deal and not lead:
+            d = Deal.objects.filter(id=deal).first()
+            if d and d.lead_id:
+                defaults["lead_id"] = d.lead_id
+        elif lead and not deal:
+            d = Deal.objects.filter(lead_id=lead).first()
+            if d:
+                defaults["deal_id"] = d.id
+        return defaults
 
     def get_aggregates(self, queryset):
         return queryset.aggregate(
