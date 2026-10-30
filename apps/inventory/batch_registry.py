@@ -176,6 +176,9 @@ def grouped_batch_registry(client_id, params, *, with_cost=False):
         })
         row["batchQty"] = row["quantities"]["received"]
         row["availableQty"] = row["quantities"]["available"]
+        row["reworkQty"] = row["quantities"].get("rework", "0.0000")
+        row["rejectedQty"] = row["quantities"].get("rejected", "0.0000")
+        row["qcHoldQty"] = row["quantities"].get("qcHold", "0.0000")
         row["uom"] = row["quantities"]["uom"] or "m"
 
         batch_ids.append(batch.id)
@@ -249,6 +252,8 @@ def grouped_batch_registry(client_id, params, *, with_cost=False):
                 "batchCount": len(group["batches"]),
                 "qcPendingQty": str(quantities.get("awaitingQc", 0)),
                 "qcPassedQty": str(quantities.get("accepted", 0)),
+                "qcReprocessQty": str(quantities.get("reprocessAtQc", 0)),
+                "qcRejectedQty": str(quantities.get("rejectedAtQc", 0)),
             })
             po_groups.append(group)
         groups = sorted(po_groups, key=lambda group: group["poNumber"])

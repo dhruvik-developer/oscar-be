@@ -1,4 +1,5 @@
 """Inventory endpoints (api.md §7)."""
+from collections import defaultdict
 from decimal import Decimal
 import json
 import uuid
@@ -1303,8 +1304,11 @@ class InventoryDashboardView(APIView):
             item = item_map.get(item_id)
             return D(item.cost_price or 0) if item else ZERO
 
-        role_qty = {role: ZERO for role in ("GOOD", "EXTERNAL_WIP", "QC_HOLD", "REPROCESS", "SECOND_QUALITY", "REJECT")}
-        role_val = {role: ZERO for role in role_qty}
+        role_qty = defaultdict(lambda: ZERO)
+        role_val = defaultdict(lambda: ZERO)
+        for r in ("GOOD", "EXTERNAL_WIP", "QC_HOLD", "REPROCESS", "SECOND_QUALITY", "REJECT", "IN_TRANSIT"):
+            role_qty[r] = ZERO
+            role_val[r] = ZERO
 
         wip_by_party_dict = {}
         parties = {p.code: p for p in Party.objects.filter(client_id=client_id, deleted_at__isnull=True) if p.code}
@@ -1359,6 +1363,7 @@ class InventoryDashboardView(APIView):
         reprocess_qty, reprocess_val = role_qty["REPROCESS"], role_val["REPROCESS"]
         second_qty, second_val = role_qty["SECOND_QUALITY"], role_val["SECOND_QUALITY"]
         rejected_qty, rejected_val = role_qty["REJECT"], role_val["REJECT"]
+        in_transit_qty, in_transit_val = role_qty["IN_TRANSIT"], role_val["IN_TRANSIT"]
 
         # Taka-level analysis of GOOD stock for real Grey / Finished / Reserved partitioning (Phase 2.3)
         good_takas = LotTaka.objects.filter(
@@ -1508,6 +1513,8 @@ class InventoryDashboardView(APIView):
             dist("Second Quality", second_qty, second_val, "#06b6d4"),
             dist("Rejected", rejected_qty, rejected_val, "#f43f5e"),
         ]
+        if in_transit_qty > ZERO:
+            dist_items.append(dist("In Transit", in_transit_qty, in_transit_val, "#0ea5e9"))
 
         # Stock Trend: last 6 months, the ledger position at each month end
         # split by location role.
@@ -1528,7 +1535,9 @@ class InventoryDashboardView(APIView):
             ).exclude(type="FAULTY")
             if godown_id:
                 m_mov = m_mov.filter(location_id=godown_id)
-            by_role = {"GOOD": ZERO, "EXTERNAL_WIP": ZERO, "QC_HOLD": ZERO, "REPROCESS": ZERO, "SECOND_QUALITY": ZERO, "REJECT": ZERO}
+            by_role = defaultdict(lambda: ZERO)
+            for r in ("GOOD", "EXTERNAL_WIP", "QC_HOLD", "REPROCESS", "SECOND_QUALITY", "REJECT", "IN_TRANSIT"):
+                by_role[r] = ZERO
             for row in m_mov.values("location__code").annotate(
                 qty=Coalesce(Sum(Coalesce("weighed_qty", "quantity")), Value(Decimal("0.0000")), output_field=QTY)
             ):
@@ -1594,6 +1603,7 @@ class InventoryDashboardView(APIView):
                 "REPROCESS": "reprocess",
                 "SECOND_QUALITY": "second",
                 "REJECT": "rejected",
+                "IN_TRANSIT": "inTransit",
             }.get(role, "good")
             lb[key] = lb.get(key, ZERO) + on_hand
 
@@ -1760,6 +1770,7 @@ class InventoryDashboardView(APIView):
             "customerReturnStock": card(customer_return_qty, customer_return_val, of_total=False),
             "qcHoldStock": card(qc_hold_qty, qc_hold_val),
             "rejectedStock": card(rejected_qty, rejected_val),
+            "inTransitStock": card(in_transit_qty, in_transit_val),
         }
 
         # 10 Real Location/Status-based Stock Buckets (Phase 2.3)
@@ -1775,6 +1786,7 @@ class InventoryDashboardView(APIView):
             "reserved": card(reserved_qty, reserved_val),
             "secondQuality": card(second_qty, second_val),
             "reject": card(rejected_qty, rejected_val),
+            "inTransit": card(in_transit_qty, in_transit_val),
             "sample": card(sample_qty, sample_val, of_total=False),
             "customerReturn": card(customer_return_qty, customer_return_val, of_total=False),
         }
@@ -1799,7 +1811,7 @@ class InventoryDashboardView(APIView):
             quality_groups.setdefault(item.fabric_quality or item.name, []).append(item)
         for q_name, group in sorted(quality_groups.items(), key=lambda kv: kv[0] or ""):
             ids = {i.id for i in group}
-            by_role = {role: ZERO for role in role_qty}
+            by_role = defaultdict(lambda: ZERO, {role: ZERO for role in role_qty})
             damaged = ZERO
             for b in balance_rows:
                 if b.item_id in ids:
@@ -1820,6 +1832,7 @@ class InventoryDashboardView(APIView):
                 "return": float(round4(sum((return_by_item.get(i, ZERO) for i in ids), ZERO))),
                 "qcHold": float(round4(by_role["QC_HOLD"])),
                 "rejected": float(round4(by_role["REJECT"])),
+                "inTransit": float(round4(by_role["IN_TRANSIT"])),
                 "total": float(round4(total)),
             })
 
