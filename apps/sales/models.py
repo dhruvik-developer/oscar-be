@@ -54,7 +54,7 @@ INVOICE_STATUSES = ["Draft", "Unpaid", "Partially Paid", "Paid", "Cancelled"]
 # PurchaseBillsPage and SalesInvoicesView between them offer all of these.
 PAYMENT_MODES = [
     "Cash", "Bank", "UPI", "Cheque", "Card",
-    "Bank Transfer", "Bank Wire", "ACH", "Corporate Card",
+    "Bank Transfer", "Bank Wire", "Bank Wire Direct", "ACH", "Corporate Card",
 ]
 
 

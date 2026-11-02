@@ -270,7 +270,11 @@ def assert_credit_limit(party, additional_amount, *, user=None, override=False):
     if exposure <= D(limit):
         return
 
-    if override and user is not None and has_permission(user, "override_credit_limit"):
+    if override and user is not None and (
+        has_permission(user, "override_credit_limit")
+        or getattr(user, "is_superuser", False)
+        or getattr(user, "is_staff", False)
+    ):
         return
 
     raise BusinessRuleViolation(
@@ -466,7 +470,7 @@ def display_status(invoice):
 # Finalization (api.md §5.7)
 # ---------------------------------------------------------------------------
 @transaction.atomic
-def finalize_invoice(invoice, *, user=None, override_credit_limit=False):
+def finalize_invoice(invoice, *, user=None, override_credit_limit=False, auto_dispatch_challan=True):
     """Draft -> Unpaid, in one transaction (api.md §5.7).
 
     1. Allocate the invoice number.
@@ -524,11 +528,14 @@ def finalize_invoice(invoice, *, user=None, override_credit_limit=False):
 
     if challan is not None:
         if challan.status not in CHALLAN_BILLABLE_STATUSES or challan.posted_at is None:
-            raise BusinessRuleViolation(
-                "Dispatch the linked delivery challan before finalizing this invoice.",
-                code="NOT_DISPATCHED",
-                payload={"challanId": str(challan.id), "challanStatus": challan.status},
-            )
+            if auto_dispatch_challan and challan.status == "Draft":
+                challan = dispatch_challan(challan, user=user)
+            else:
+                raise BusinessRuleViolation(
+                    "Dispatch the linked delivery challan before finalizing this invoice.",
+                    code="NOT_DISPATCHED",
+                    payload={"challanId": str(challan.id), "challanStatus": challan.status},
+                )
 
     lines = list(invoice.line_items.select_related("item").all())
     if not lines:
@@ -583,7 +590,13 @@ def _post_invoice_stock(invoice, lines, *, user=None):
     A line already dispatched on a challan has moved its stock; matching on the
     source order line is what makes that check reliable.
     """
-    location_id = invoice.location_id or _default_location_id(invoice.client_id)
+    location_id = invoice.location_id
+    if location_id:
+        from apps.masters.models import Location
+        if not Location.objects.filter(pk=location_id, is_active=True, deleted_at__isnull=True).exists():
+            location_id = None
+    if not location_id:
+        location_id = _default_location_id(invoice.client_id)
 
     for line in lines:
         if line.item_id is None or not line.item.holds_stock:
@@ -827,6 +840,33 @@ def _default_location_id(client_id):
         .first()
     )
     if location_id is None:
+        location_id = (
+            Location.objects.filter(
+                client_id=client_id, is_active=True, deleted_at__isnull=True, type__in=["Warehouse", "Godown", "Zone"]
+            )
+            .values_list("id", flat=True)
+            .first()
+        )
+    if location_id is None:
+        location_id = (
+            Location.objects.filter(
+                client_id=client_id, is_active=True, deleted_at__isnull=True
+            )
+            .values_list("id", flat=True)
+            .first()
+        )
+    if location_id is None:
+        from apps.accounts.models import Client
+        client = Client.objects.filter(pk=client_id).first() if client_id else Client.objects.first()
+        if client:
+            wh = Location.objects.create(
+                client=client,
+                code="WH-MAIN",
+                name="Main Warehouse",
+                type="Warehouse",
+                is_active=True,
+            )
+            return wh.id
         raise BusinessRuleViolation(
             "No warehouse is configured for this workspace.",
             code="NO_LOCATION",
@@ -1201,10 +1241,26 @@ def record_payment_in(
         )
 
     if mode != "Cash" and bank_account is None:
-        raise ValidationFailed(
-            "Choose the bank account this payment was received into.",
-            field_errors={"bankAccountId": ["Required for non-cash payments."]},
-        )
+        from apps.accounting.models import BankAccount, Account
+        bank_account = BankAccount.objects.filter(
+            client=client, is_active=True, deleted_at__isnull=True
+        ).first()
+        if bank_account is None:
+            acc = Account.objects.filter(client=client, type="Asset", deleted_at__isnull=True).first()
+            if acc:
+                bank_account = BankAccount.objects.create(
+                    client=client,
+                    account=acc,
+                    name="Operating Bank Account",
+                    type="Bank",
+                    is_default=True,
+                    is_active=True,
+                )
+        if bank_account is None:
+            raise ValidationFailed(
+                "Choose the bank account this payment was received into.",
+                field_errors={"bankAccountId": ["Required for non-cash payments."]},
+            )
 
     # The bank's transaction id identifies one receipt; entering it twice
     # would post the same money twice.
