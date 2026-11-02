@@ -6125,7 +6125,7 @@ class BatchListView(APIView):
     GET /inventory/batches/?q=&origin=&ownership=&supplierId=&from=&to=&status=&page=&page_size=
         &itemId=&designId=&shadeId=&locationId=&holding=available|reserved|qcHold|rework|
          secondQuality|rejected|withJobWorker
-    The batch registry: one row per permanent batch ID with derived quantities.
+    The batch registry: one row per QC-passed batch posted to inventory stock.
     Design / shade / godown / holding look at the rolls in hand, so "navy in
     Surat" finds every batch with such a roll. ``summary`` totals the stock of
     all matching batches (not just the page).
@@ -6134,12 +6134,24 @@ class BatchListView(APIView):
     required_permissions = ["view_inventory"]
 
     def get(self, request):
+        from django.db.models import Prefetch
+
         from .batch_services import serialize_batch
+        from .batch_services import registry_eligible_takas
         from .models import Batch
 
         params = request.query_params
-        qs = Batch.objects.filter(client_id=request.client_id, deleted_at__isnull=True).select_related(
+        eligible_takas = registry_eligible_takas(request.client_id).select_related(
+            "item", "item__category", "location", "fabric_quality", "design", "shade", "supplier"
+        ).order_by("created_at")
+        qs = Batch.objects.filter(
+            client_id=request.client_id,
+            deleted_at__isnull=True,
+            pk__in=eligible_takas.values("batch_id"),
+        ).select_related(
             "item", "supplier", "owner_party"
+        ).prefetch_related(
+            Prefetch("takas", queryset=eligible_takas, to_attr="registry_eligible_takas")
         )
         q = (params.get("q") or "").strip()
         if q:
@@ -6216,7 +6228,9 @@ class BatchListView(APIView):
                     | Q(source_document_type__iexact="PurchaseBill", source_document_id__in=bill_ids)
                 ).distinct()
         if params.get("qcStatus"):
-            qs = qs.filter(takas__qc_status=params["qcStatus"]).distinct()
+            qs = qs.filter(
+                pk__in=eligible_takas.filter(qc_status=params["qcStatus"]).values("batch_id")
+            )
         if params.get("from"):
             qs = qs.filter(created_on__gte=params["from"])
         if params.get("to"):
@@ -6224,22 +6238,9 @@ class BatchListView(APIView):
         # Roll-level filters, in one condition so the same roll must match them all.
         from .batch_services import roll_filter, stock_totals
 
-        roll = roll_filter(params, prefix="takas__")
+        roll = roll_filter(params)
         if roll is not None:
-            qs = qs.filter(roll).distinct()
-        # Fabric received against a PO enters the registry only once QC has
-        # dealt with it: a purchase batch whose every roll still sits at QC
-        # Hold is listed under QC Work, not here (?awaitingQc=include shows
-        # them too, ?awaitingQc=only shows just them).
-        from .batch_services import awaiting_qc_filter
-
-        awaiting = awaiting_qc_filter(request.client_id)
-        awaiting_count = qs.filter(awaiting).count()
-        mode = params.get("awaitingQc")
-        if mode == "only":
-            qs = qs.filter(awaiting)
-        elif mode != "include":
-            qs = qs.exclude(awaiting)
+            qs = qs.filter(pk__in=eligible_takas.filter(roll).values("batch_id"))
         qs = qs.order_by("-created_on", "-created_at")
 
         try:
@@ -6252,16 +6253,27 @@ class BatchListView(APIView):
         with_cost = params.get("withCost") in ("1", "true") and _can_see_batch_cost(request.user)
         wanted_status = params.get("status")
         if wanted_status:
-            rows = [r for r in (serialize_batch(b, include_cost=with_cost) for b in qs) if r["status"] == wanted_status]
+            rows = [
+                r for r in (
+                    serialize_batch(b, takas=b.registry_eligible_takas, include_cost=with_cost)
+                    for b in qs
+                )
+                if r["status"] == wanted_status
+            ]
             total = len(rows)
             rows = rows[(page - 1) * page_size: page * page_size]
         else:
             total = qs.count()
-            rows = [serialize_batch(b, include_cost=with_cost) for b in qs[(page - 1) * page_size: page * page_size]]
+            rows = [
+                serialize_batch(b, takas=b.registry_eligible_takas, include_cost=with_cost)
+                for b in qs[(page - 1) * page_size: page * page_size]
+            ]
         body = envelope(rows, count=total, page=page, page_size=page_size)
         body["canSeeCost"] = _can_see_batch_cost(request.user)
-        body["awaitingQcCount"] = awaiting_count
-        body["summary"] = stock_totals(request.client_id, qs.values("id"), roll_filter(params))
+        body["awaitingQcCount"] = 0
+        body["summary"] = stock_totals(
+            request.client_id, qs.values("id"), roll_filter(params), eligible_only=True
+        )
         return Response(body)
 
     def post(self, request):

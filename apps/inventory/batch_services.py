@@ -258,6 +258,31 @@ def _takas(batch):
     )
 
 
+def registry_eligible_takas(client_id):
+    """Takas accepted by QC and posted to a non-system inventory location."""
+    from django.db.models import Exists, OuterRef
+
+    from .models import LotTaka, StockMovement
+
+    posted_qc_pass = StockMovement.objects.filter(
+        client_id=OuterRef("client_id"),
+        lot_taka_id=OuterRef("pk"),
+        type="QC_PASS",
+        quantity__gt=ZERO,
+        deleted_at__isnull=True,
+        reversal_movement__isnull=True,
+    ).exclude(location__code__startswith="SYS-")
+    return (
+        LotTaka.objects.filter(
+            client_id=client_id,
+            deleted_at__isnull=True,
+            qc_status__in=("Passed", "Pass", "Approved"),
+        )
+        .filter(Exists(posted_qc_pass))
+        .exclude(status__in=("Sample", "Reprocess", "Reject", "Rejected"))
+    )
+
+
 def _bucket(taka):
     code = (getattr(taka.location, "code", "") or "").upper()
     if code in BUCKET_BY_LOCATION_CODE:
@@ -1185,7 +1210,7 @@ def roll_filter(params, prefix=""):
     return Q(**{prefix + k: v for k, v in conditions.items()})
 
 
-def stock_totals(client_id, batch_ids, roll_filter=None):
+def stock_totals(client_id, batch_ids, roll_filter=None, *, eligible_only=False):
     """The stock tiles of the batch list: metres in hand on the rolls of
     ``batch_ids`` (matching ``roll_filter``, a LotTaka Q), by state. OSCAR's
     stock and customer material are kept apart."""
@@ -1197,6 +1222,8 @@ def stock_totals(client_id, batch_ids, roll_filter=None):
     ).select_related("location", "batch")
     if roll_filter is not None:
         rolls = rolls.filter(roll_filter)
+    if eligible_only:
+        rolls = rolls.filter(pk__in=registry_eligible_takas(client_id).values("pk"))
     for t in rolls:
         qty = D(t.available_quantity)
         totals["totalPhysical"] += qty

@@ -9,11 +9,14 @@
 * per-report permissions
 """
 import importlib
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from decimal import Decimal
+from threading import Barrier
 
 from django.apps import apps as django_apps
-from django.test import TestCase
+from django.db import IntegrityError, close_old_connections, transaction
+from django.test import TestCase, TransactionTestCase, skipUnlessDBFeature
 from django.utils import timezone
 from rest_framework.test import APIClient
 
@@ -31,6 +34,7 @@ from .models import (
     ORDER_STAGES,
     DeliveryChallan,
     SalesInvoice,
+    SalesInvoiceLine,
     SalesOrder,
     SalesOrderLine,
 )
@@ -203,18 +207,149 @@ class ConvertToInvoiceTests(Phase1Base):
         self.assertEqual(invoice.status_code, 201, invoice.content[:400])
         self.assertEqual(Decimal(str(invoice.json()["lineItems"][0]["qty"])), Decimal("4"))
 
+        repeated = self.post(f"/sales/orders/{order['id']}/convert-to-invoice/")
+        self.assertEqual(repeated.status_code, 200, repeated.content[:400])
+        self.assertEqual(repeated.json()["id"], invoice.json()["id"])
+        direct = self.post("/sales/invoices/", {
+            "salesOrder": order["id"],
+            "partyId": str(self.customer.id),
+            "date": str(timezone.localdate()),
+        })
+        self.assertEqual(direct.status_code, 200, direct.content[:400])
+        self.assertEqual(direct.json()["id"], invoice.json()["id"])
+        self.assertEqual(SalesOrder.objects.get(pk=order["id"]).invoices.count(), 1)
+
+    def test_partial_draft_invoice_reserves_quantity_but_allows_remaining(self):
+        order = self.order(qty=10)
+        line_id = order["lineItems"][0]["id"]
+        self.dispatch(order["id"], lines=[{"lineId": line_id, "qty": 10}])
+
+        first = self.post(
+            f"/sales/orders/{order['id']}/convert-to-invoice/",
+            {"lines": [{"lineId": line_id, "qty": 4}]},
+        )
+        self.assertEqual(first.status_code, 201, first.content[:400])
+        self.assertEqual(Decimal(str(first.json()["lineItems"][0]["qty"])), Decimal("4"))
+
+        remaining = self.post(
+            f"/sales/orders/{order['id']}/convert-to-invoice/",
+            {"lines": [{"lineId": line_id, "qty": 6}]},
+        )
+        self.assertEqual(remaining.status_code, 200, remaining.content[:400])
+        self.assertEqual(
+            Decimal(str(remaining.json()["lineItems"][0]["qty"])), Decimal("4")
+        )
+        self.assertEqual(remaining.json()["id"], first.json()["id"])
+
+        finalized = self.post(f"/sales/invoices/{first.json()['id']}/finalize/")
+        self.assertEqual(finalized.status_code, 200, finalized.content[:600])
+        self.assertEqual(finalized.json()["status"], "Unpaid")
+
+        remaining = self.post(
+            f"/sales/orders/{order['id']}/convert-to-invoice/",
+            {"lines": [{"lineId": line_id, "qty": 6}]},
+        )
+        self.assertEqual(remaining.status_code, 201, remaining.content[:400])
+        self.assertEqual(
+            Decimal(str(remaining.json()["lineItems"][0]["qty"])), Decimal("6")
+        )
+        repeated = self.post(
+            f"/sales/orders/{order['id']}/convert-to-invoice/",
+            {"lines": [{"lineId": line_id, "qty": 1}]},
+        )
+        self.assertEqual(repeated.status_code, 200, repeated.content[:400])
+        self.assertEqual(repeated.json()["id"], remaining.json()["id"])
+        self.assertEqual(SalesOrder.objects.get(pk=order["id"]).invoices.count(), 2)
+
+    def test_database_guard_blocks_a_second_active_draft(self):
+        order = self.order(qty=2)
+        first = SalesInvoice.objects.create(
+            client=self.tenant,
+            party=self.customer,
+            party_name=self.customer.name,
+            doc_date=timezone.localdate(),
+            sales_order_id=order["id"],
+            status="Draft",
+        )
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                SalesInvoice.objects.create(
+                    client=self.tenant,
+                    party=self.customer,
+                    party_name=self.customer.name,
+                    doc_date=timezone.localdate(),
+                    sales_order_id=order["id"],
+                    status="Draft",
+                )
+        first.refresh_from_db()
+        self.assertEqual(first.status, "Draft")
+        self.assertEqual(
+            SalesInvoice.objects.filter(sales_order_id=order["id"], status="Draft").count(),
+            1,
+        )
+
+    def test_draft_order_can_be_converted_to_invoice_directly(self):
+        # 1. Create a Draft Sales Order
+        response = self.post("/sales/orders/", {
+            "partyId": str(self.customer.id),
+            "date": str(timezone.localdate()),
+            "stage": "Draft",
+            "lineItems": [
+                {"itemId": str(self.fabric.id), "qty": 5, "rate": 200, "tax": 0},
+            ],
+        })
+        self.assertEqual(response.status_code, 201)
+        order_data = response.json()
+        order_id = order_data["id"]
+        SalesOrder.objects.filter(pk=order_id).update(stage="Draft")
+
+        # 2. Create its Sales Invoice
+        res = self.post(f"/sales/orders/{order_id}/convert-to-invoice/")
+        self.assertEqual(res.status_code, 201, res.content[:400])
+        invoice_data = res.json()
+        invoice_id = invoice_data["id"]
+
+        # 3. Verify that the invoice is saved and linked to the correct SO
+        inv = SalesInvoice.objects.get(pk=invoice_id)
+        self.assertEqual(str(inv.sales_order_id), str(order_id))
+        self.assertEqual(inv.status, "Draft")
+
+        # A saved Draft does not advance the Sales Order lifecycle.
+        order = SalesOrder.objects.get(pk=order_id)
+        self.assertEqual(order.stage, "Draft")
+        finalized = self.post(f"/sales/invoices/{invoice_id}/finalize/")
+        self.assertEqual(finalized.status_code, 200, finalized.content[:600])
+        self.assertEqual(finalized.json()["status"], "Unpaid")
+
+        # Only successful finalization advances the Sales Order lifecycle.
+        order.refresh_from_db()
+        self.assertEqual(order.stage, "Invoiced")
+        self.assertEqual(order.payment_status, "Unpaid")
+
+        # 5. Verify the API returns the updated Sales Order and invoice status
+        order_res = self.api.get(f"/api/v1/sales/orders/{order_id}/")
+        self.assertEqual(order_res.status_code, 200)
+        so_data = order_res.json()
+        self.assertEqual(so_data["stage"], "Invoiced")
+        self.assertEqual(so_data["paymentStatus"], "Unpaid")
+        self.assertTrue(so_data["hasInvoice"])
+        self.assertEqual(so_data["invoiceStatus"], "Invoiced")
+        self.assertEqual(so_data["linkedInvoiceId"], str(invoice_id))
+
+        # 6. Test repeated clicks and duplicate invoice prevention
+        duplicate = self.post(f"/sales/orders/{order_id}/convert-to-invoice/")
+        self.assertEqual(duplicate.status_code, 409, duplicate.content[:400])
+        self.assertEqual(order.invoices.count(), 1)
+
     def test_non_stock_lines_need_no_dispatch(self):
         order = self.order(qty=10, extra_lines=[
-            # Free-text (item-less) line: the only non-stock line left since
-            # masters 0025 made every item kind stock-holding.
-            {"itemName": "Stitching", "description": "Stitching", "qty": 1, "rate": 300, "tax": 0},
+            {"description": "Installation fee", "qty": 1, "rate": 300, "tax": 0},
         ])
         invoice = self.post(f"/sales/orders/{order['id']}/convert-to-invoice/")
         self.assertEqual(invoice.status_code, 201, invoice.content[:400])
         rows = invoice.json()["lineItems"]
         self.assertEqual(len(rows), 1)
-        self.assertIsNone(rows[0]["itemId"])
-        self.assertEqual(rows[0]["itemName"], "Stitching")
+        self.assertEqual(rows[0]["description"], "Installation fee")
 
     def test_challan_must_be_dispatched_and_billed_once(self):
         order = self.order(qty=10)
@@ -230,7 +365,375 @@ class ConvertToInvoiceTests(Phase1Base):
         first = self.post(f"/sales/challans/{challan_id}/convert-to-invoice/")
         self.assertEqual(first.status_code, 201, first.content[:400])
         second = self.post(f"/sales/challans/{challan_id}/convert-to-invoice/")
-        self.assertEqual(second.status_code, 409, second.content[:400])
+        self.assertEqual(second.status_code, 200, second.content[:400])
+        self.assertEqual(second.json()["id"], first.json()["id"])
+        finalized = self.post(f"/sales/invoices/{first.json()['id']}/finalize/")
+        self.assertEqual(finalized.status_code, 200, finalized.content[:600])
+        repeated_after_finalize = self.post(
+            f"/sales/challans/{challan_id}/convert-to-invoice/"
+        )
+        self.assertEqual(repeated_after_finalize.status_code, 200, repeated_after_finalize.content[:400])
+        self.assertEqual(repeated_after_finalize.json()["id"], first.json()["id"])
+
+
+    def test_draft_invoice_from_order_challan_is_reused_and_waits_for_dispatch(self):
+        order = self.order(qty=5)
+        challan_response = self.post(
+            f"/sales/orders/{order['id']}/convert-to-challan/"
+        )
+        self.assertEqual(challan_response.status_code, 201, challan_response.content[:600])
+        challan_id = challan_response.json()["id"]
+
+        repeated_challan = self.post(
+            f"/sales/orders/{order['id']}/convert-to-challan/"
+        )
+        self.assertEqual(repeated_challan.status_code, 200, repeated_challan.content[:600])
+        self.assertEqual(repeated_challan.json()["id"], challan_id)
+
+        created = self.post(
+            f"/sales/challans/{challan_id}/create-draft-invoice/"
+        )
+        self.assertEqual(created.status_code, 201, created.content[:600])
+        invoice_id = created.json()["id"]
+        invoice = SalesInvoice.objects.get(pk=invoice_id)
+        self.assertEqual(invoice.sales_order_id, SalesOrder.objects.get(pk=order["id"]).id)
+        self.assertEqual(str(invoice.delivery_challan_id), str(challan_id))
+        self.assertEqual(invoice.status, "Draft")
+        self.assertIsNone(invoice.posted_at)
+
+        repeated_invoice = self.post(
+            f"/sales/challans/{challan_id}/create-draft-invoice/"
+        )
+        self.assertEqual(repeated_invoice.status_code, 200, repeated_invoice.content[:600])
+        self.assertEqual(repeated_invoice.json()["id"], invoice_id)
+        self.assertTrue(repeated_invoice.json()["reused"])
+        self.assertEqual(
+            DeliveryChallan.objects.filter(sales_order_id=order["id"], status="Draft").count(),
+            1,
+        )
+        self.assertEqual(
+            SalesInvoice.objects.filter(
+                sales_order_id=order["id"], status="Draft", posted_at__isnull=True
+            ).count(),
+            1,
+        )
+
+        blocked = self.post(f"/sales/invoices/{invoice_id}/finalize/")
+        self.assertEqual(blocked.status_code, 422, blocked.content[:600])
+        self.assertEqual(blocked.json()["code"], "NOT_DISPATCHED")
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.status, "Draft")
+        self.assertIsNone(invoice.posted_at)
+
+        self.api.patch(
+            f"/api/v1/sales/challans/{challan_id}/",
+            {"locationId": str(self.location.id)},
+            format="json",
+        )
+        dispatched = self.post(f"/sales/challans/{challan_id}/dispatch/")
+        self.assertIn(dispatched.status_code, (200, 201), dispatched.content[:600])
+        finalized = self.post(f"/sales/invoices/{invoice_id}/finalize/")
+        self.assertEqual(finalized.status_code, 200, finalized.content[:600])
+        self.assertEqual(finalized.json()["id"], invoice_id)
+        self.assertEqual(finalized.json()["status"], "Unpaid")
+        invoice.refresh_from_db()
+        self.assertEqual(str(invoice.delivery_challan_id), str(challan_id))
+        self.assertIsNotNone(invoice.posted_at)
+
+    def test_challan_invoice_creation_reuses_existing_order_draft(self):
+        order = self.order(qty=5)
+        challan = self.post(f"/sales/orders/{order['id']}/convert-to-challan/")
+        self.assertEqual(challan.status_code, 201, challan.content[:600])
+        existing = SalesInvoice.objects.create(
+            client=self.tenant,
+            party=self.customer,
+            party_name=self.customer.name,
+            doc_date=timezone.localdate(),
+            sales_order_id=order["id"],
+            status="Draft",
+        )
+
+        response = self.post(
+            f"/sales/challans/{challan.json()['id']}/create-draft-invoice/"
+        )
+
+        self.assertEqual(response.status_code, 200, response.content[:600])
+        self.assertEqual(response.json()["id"], str(existing.id))
+        self.assertTrue(response.json()["reused"])
+        existing.refresh_from_db()
+        self.assertEqual(str(existing.delivery_challan_id), str(challan.json()["id"]))
+        self.assertEqual(existing.line_items.count(), 1)
+        self.assertEqual(
+            str(existing.line_items.get().delivery_challan_line.delivery_challan_id),
+            str(challan.json()["id"]),
+        )
+        self.assertEqual(
+            SalesInvoice.objects.filter(
+                sales_order_id=order["id"], status="Draft", posted_at__isnull=True
+            ).count(),
+            1,
+        )
+
+    def test_incompatible_order_draft_does_not_duplicate_challan_or_invoice(self):
+        order = self.order(qty=5)
+        challan = self.post(f"/sales/orders/{order['id']}/convert-to-challan/")
+        self.assertEqual(challan.status_code, 201, challan.content[:600])
+        existing = SalesInvoice.objects.create(
+            client=self.tenant,
+            party=self.customer,
+            party_name=self.customer.name,
+            doc_date=timezone.localdate(),
+            sales_order_id=order["id"],
+            status="Draft",
+        )
+        SalesInvoiceLine.objects.create(
+            client=self.tenant,
+            sales_invoice=existing,
+            sales_order_line_id=order["lineItems"][0]["id"],
+            item=self.fabric,
+            item_name=self.fabric.name,
+            qty=Decimal("4"),
+            rate=Decimal("100"),
+        )
+
+        rejected = self.post(
+            f"/sales/challans/{challan.json()['id']}/create-draft-invoice/"
+        )
+        self.assertEqual(rejected.status_code, 409, rejected.content[:600])
+        self.assertEqual(
+            DeliveryChallan.objects.filter(sales_order_id=order["id"], status="Draft").count(),
+            1,
+        )
+        self.assertEqual(
+            SalesInvoice.objects.filter(
+                sales_order_id=order["id"], status="Draft", posted_at__isnull=True
+            ).count(),
+            1,
+        )
+
+        existing.status = "Cancelled"
+        existing.save(update_fields=["status", "updated_at"])
+        retried = self.post(
+            f"/sales/challans/{challan.json()['id']}/create-draft-invoice/"
+        )
+        self.assertEqual(retried.status_code, 201, retried.content[:600])
+        self.assertEqual(
+            DeliveryChallan.objects.filter(sales_order_id=order["id"], status="Draft").count(),
+            1,
+        )
+
+    def test_partial_fulfilments_can_create_later_invoice_drafts(self):
+        order = self.order(qty=10)
+        line_id = order["lineItems"][0]["id"]
+        first_challan_id = self.dispatch(
+            order["id"], lines=[{"lineId": line_id, "qty": 4}]
+        )
+        first_invoice = self.post(
+            f"/sales/challans/{first_challan_id}/convert-to-invoice/"
+        )
+        self.assertEqual(first_invoice.status_code, 201, first_invoice.content[:600])
+        finalized = self.post(
+            f"/sales/invoices/{first_invoice.json()['id']}/finalize/"
+        )
+        self.assertEqual(finalized.status_code, 200, finalized.content[:600])
+
+        second_challan = self.post(
+            f"/sales/orders/{order['id']}/convert-to-challan/"
+        )
+        self.assertEqual(second_challan.status_code, 201, second_challan.content[:600])
+        second_invoice = self.post(
+            f"/sales/challans/{second_challan.json()['id']}/create-draft-invoice/"
+        )
+        self.assertEqual(second_invoice.status_code, 201, second_invoice.content[:600])
+        self.assertNotEqual(second_invoice.json()["id"], first_invoice.json()["id"])
+        self.assertEqual(
+            Decimal(str(second_invoice.json()["lineItems"][0]["qty"])),
+            Decimal("6"),
+        )
+        self.assertEqual(
+            SalesInvoice.objects.filter(
+                sales_order_id=order["id"], status="Unpaid", posted_at__isnull=False
+            ).count(),
+            1,
+        )
+        self.assertEqual(
+            SalesInvoice.objects.filter(
+                sales_order_id=order["id"], status="Draft", posted_at__isnull=True
+            ).count(),
+            1,
+        )
+
+
+@skipUnlessDBFeature("has_select_for_update")
+class CombinedWorkflowConcurrencyTests(TransactionTestCase):
+    reset_sequences = True
+
+    def setUp(self):
+        Phase1Base.setUp(self)
+
+    def post(self, path, data=None):
+        return self.api.post(f"/api/v1{path}", data or {}, format="json")
+
+    def _concurrent_posts(self, path):
+        barrier = Barrier(2)
+
+        def send_request(_):
+            close_old_connections()
+            client = APIClient()
+            client.credentials(
+                HTTP_AUTHORIZATION=f"Bearer {build_tokens(self.user)['access']}"
+            )
+            try:
+                barrier.wait(timeout=10)
+                response = client.post(f"/api/v1{path}", {}, format="json")
+                return response.status_code, response.json()
+            finally:
+                close_old_connections()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            return list(pool.map(send_request, range(2)))
+
+    def test_simultaneous_combined_requests_reuse_both_documents(self):
+        order = Phase1Base.order(self, qty=5)
+
+        challan_responses = self._concurrent_posts(
+            f"/sales/orders/{order['id']}/convert-to-challan/"
+        )
+        self.assertCountEqual(
+            [status_code for status_code, _ in challan_responses], [200, 201]
+        )
+        challan_ids = {body["id"] for _, body in challan_responses}
+        self.assertEqual(len(challan_ids), 1)
+        challan_id = challan_ids.pop()
+
+        invoice_responses = self._concurrent_posts(
+            f"/sales/challans/{challan_id}/create-draft-invoice/"
+        )
+        self.assertCountEqual(
+            [status_code for status_code, _ in invoice_responses], [200, 201]
+        )
+        invoice_ids = {body["id"] for _, body in invoice_responses}
+        self.assertEqual(len(invoice_ids), 1)
+        self.assertEqual(
+            DeliveryChallan.objects.filter(sales_order_id=order["id"]).count(), 1
+        )
+        self.assertEqual(
+            SalesInvoice.objects.filter(
+                sales_order_id=order["id"], status="Draft", posted_at__isnull=True
+            ).count(),
+            1,
+        )
+
+
+class CreditLimitApprovalTests(Phase1Base):
+    def test_create_and_finalize_failure_returns_the_saved_draft_and_error(self):
+        self.customer.credit_limit = Decimal("1")
+        self.customer.save(update_fields=["credit_limit", "updated_at"])
+        created = self.post("/sales/invoices/", {
+            "partyId": str(self.customer.id),
+            "date": str(timezone.localdate()),
+            "locationId": str(self.location.id),
+            "finalize": True,
+            "lineItems": [{"itemId": str(self.fabric.id), "qty": 1, "rate": 100, "tax": 0}],
+        })
+        self.assertEqual(created.status_code, 201, created.content[:800])
+        self.assertEqual(created.json()["finalizationError"]["code"], "CREDIT_LIMIT_EXCEEDED")
+        saved = SalesInvoice.objects.get(pk=created.json()["id"])
+        self.assertEqual(saved.status, "Draft")
+        self.assertIsNone(saved.posted_at)
+
+    def test_credit_limit_error_preserves_draft_and_approval_finalizes_same_invoice(self):
+        self.customer.credit_limit = Decimal("50000")
+        self.customer.balance = Decimal("11300")
+        self.customer.save(update_fields=["credit_limit", "balance", "updated_at"])
+        stock.post_movement(
+            client_id=self.tenant.id,
+            item=self.fabric,
+            location=self.location,
+            type="ADJUSTMENT",
+            quantity=500,
+            unit_cost=Decimal("40"),
+            notes="credit approval test stock",
+        )
+        created = self.post("/sales/invoices/", {
+            "partyId": str(self.customer.id),
+            "date": str(timezone.localdate()),
+            "locationId": str(self.location.id),
+            "lineItems": [{"itemId": str(self.fabric.id), "qty": 500, "rate": 100, "tax": 0}],
+        })
+        self.assertEqual(created.status_code, 201, created.content[:600])
+        invoice_id = created.json()["id"]
+
+        failed = self.post(
+            f"/sales/invoices/{invoice_id}/finalize/",
+            {"overrideCreditLimit": True},
+        )
+        self.assertEqual(failed.status_code, 422, failed.content[:800])
+        payload = failed.json()["payload"]
+        self.assertEqual(payload["customerName"], self.customer.name)
+        self.assertEqual(payload["creditLimit"], "50000.00")
+        self.assertEqual(payload["currentOutstanding"], "11300.00")
+        self.assertEqual(payload["currentInvoiceAmount"], "50000.00")
+        self.assertEqual(payload["projectedExposure"], "61300.00")
+        self.assertEqual(payload["excess"], "11300.00")
+        self.assertEqual(SalesInvoice.objects.get(pk=invoice_id).status, "Draft")
+
+        requested = self.post(
+            f"/sales/invoices/{invoice_id}/request-credit-override/",
+            {"reason": "Approved customer project; verified payment schedule."},
+        )
+        self.assertEqual(requested.status_code, 202, requested.content[:800])
+        from apps.core.models import ApprovalRequest
+
+        approval = ApprovalRequest.objects.get(pk=requested.json()["approvalRequestId"])
+        self.assertEqual(approval.document_type, "credit_limit_exceeded")
+        self.assertEqual(approval.reason, "Approved customer project; verified payment schedule.")
+        self.assertEqual(approval.new_values["projectedExposure"], "61300.00")
+
+        approved = self.post(
+            f"/approvals/requests/{approval.id}/approve/",
+            {"comments": "Credit override approved after review."},
+        )
+        self.assertEqual(approved.status_code, 200, approved.content[:800])
+        approval.refresh_from_db()
+        invoice = SalesInvoice.objects.get(pk=invoice_id)
+        self.assertEqual(approval.status, "Approved")
+        self.assertEqual(approval.decided_by_id, self.user.id)
+        self.assertIsNotNone(approval.decided_at)
+        self.assertEqual(invoice.status, "Unpaid")
+        self.assertIsNotNone(invoice.posted_at)
+
+    def test_unauthorized_user_cannot_approve_credit_override(self):
+        self.customer.credit_limit = Decimal("1")
+        self.customer.save(update_fields=["credit_limit", "updated_at"])
+        created = self.post("/sales/invoices/", {
+            "partyId": str(self.customer.id),
+            "date": str(timezone.localdate()),
+            "locationId": str(self.location.id),
+            "lineItems": [{"itemId": str(self.fabric.id), "qty": 1, "rate": 100, "tax": 0}],
+        })
+        self.assertEqual(created.status_code, 201, created.content[:600])
+        invoice_id = created.json()["id"]
+        requested = self.post(
+            f"/sales/invoices/{invoice_id}/request-credit-override/",
+            {"reason": "Customer payment arrangement."},
+        )
+        self.assertEqual(requested.status_code, 202, requested.content[:600])
+
+        outsider = User.objects.create_user(
+            email="credit-outsider@example.com",
+            password="test-pass-123",
+            client=self.tenant,
+        )
+        outsider_api = APIClient()
+        outsider_api.force_authenticate(outsider)
+        denied = outsider_api.post(
+            f"/api/v1/approvals/requests/{requested.json()['approvalRequestId']}/approve/",
+            {"comments": "Not authorized."},
+            format="json",
+        )
+        self.assertEqual(denied.status_code, 403, denied.content[:600])
+        self.assertEqual(SalesInvoice.objects.get(pk=invoice_id).status, "Draft")
 
 
 class OrderStageTests(Phase1Base):

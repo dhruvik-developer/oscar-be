@@ -1,13 +1,14 @@
 """Batch Registry grouping backed by purchase, receipt and stock records."""
+from collections import defaultdict
 from decimal import Decimal
 
-from django.db.models import Q
+from django.db.models import Prefetch, Q
 
 from apps.purchase.fabric_flow import quantities as po_quantities
 from apps.purchase.models import GoodsReceipt, PurchaseBill, PurchaseOrder
 
 from . import batch_services
-from .models import Batch
+from .models import Batch, LotTaka
 
 
 def _linked_purchase_order_id(batch, purchase_order_ids, receipt_po_ids, bill_po_ids):
@@ -49,7 +50,7 @@ def grouped_batch_registry(client_id, params, *, with_cost=False):
         return {
             "groups": [],
             "batchCount": 0,
-            "summary": batch_services.stock_totals(client_id, []),
+            "summary": batch_services.stock_totals(client_id, [], eligible_only=True),
             "purchaseOrders": purchase_order_options,
         }
     bill_po_ids = {
@@ -62,7 +63,7 @@ def grouped_batch_registry(client_id, params, *, with_cost=False):
     }
     receipts = list(
         GoodsReceipt.objects.filter(client_id=client_id, deleted_at__isnull=True)
-        .values("id", "purchase_order_id", "purchase_bill_id", "grn_number")
+        .values("id", "purchase_order_id", "purchase_bill_id", "grn_number", "receipt_date")
     )
     grn_by_id = {str(row["id"]): row for row in receipts}
     receipt_po_ids = {
@@ -70,8 +71,21 @@ def grouped_batch_registry(client_id, params, *, with_cost=False):
         for row in receipts if row["purchase_order_id"] or bill_po_ids.get(str(row["purchase_bill_id"]))
     }
 
-    qs = Batch.objects.filter(client_id=client_id, deleted_at__isnull=True).select_related(
+    eligible_takas = batch_services.registry_eligible_takas(client_id).select_related(
+        "item", "item__category", "location", "fabric_quality", "design", "shade", "supplier"
+    ).order_by("created_at")
+    all_takas = LotTaka.objects.filter(client_id=client_id, deleted_at__isnull=True).select_related(
+        "item", "item__category", "location", "fabric_quality", "design", "shade", "supplier"
+    ).order_by("created_at")
+    qs = Batch.objects.filter(
+        client_id=client_id,
+        deleted_at__isnull=True,
+        pk__in=eligible_takas.values("batch_id"),
+    ).select_related(
         "item", "supplier", "owner_party", "purchase_order", "purchase_order_line", "goods_receipt"
+    ).prefetch_related(
+        Prefetch("takas", queryset=eligible_takas, to_attr="registry_eligible_takas"),
+        Prefetch("takas", queryset=all_takas, to_attr="registry_all_takas"),
     )
     q = (params.get("q") or "").strip()
     if q:
@@ -119,11 +133,15 @@ def grouped_batch_registry(client_id, params, *, with_cost=False):
     if params.get("to"):
         qs = qs.filter(created_on__lte=params["to"])
     if params.get("qcStatus"):
-        qs = qs.filter(takas__qc_status=params["qcStatus"])
+        qs = qs.filter(
+            pk__in=eligible_takas.filter(qc_status=params["qcStatus"]).values("batch_id")
+        )
 
-    roll = batch_services.roll_filter(params, prefix="takas__")
+    roll = batch_services.roll_filter(params)
     if roll is not None:
-        qs = qs.filter(roll).distinct()
+        qs = qs.filter(
+            pk__in=eligible_takas.filter(roll).values("batch_id")
+        )
 
     po_filter = params.get("poId") or params.get("purchaseOrderId") or params.get("po") or params.get("poNumber")
     selected_po_id = None
@@ -151,13 +169,13 @@ def grouped_batch_registry(client_id, params, *, with_cost=False):
     wanted_status = params.get("status")
     for batch in qs.order_by("-created_on", "-created_at"):
         po_id = _linked_purchase_order_id(batch, po_by_id, receipt_po_ids, bill_po_ids)
-        takas = batch_services._takas(batch)
+        takas = batch.registry_eligible_takas
+        all_batch_takas = batch.registry_all_takas
         row = batch_services.serialize_batch(batch, takas=takas, include_cost=with_cost)
         if wanted_status and row["status"] != wanted_status:
             continue
 
-        qc_values = sorted({str(taka.qc_status).strip() for taka in takas if taka.qc_status})
-        row["qcStatus"] = qc_values[0] if len(qc_values) == 1 else ("Partially Approved" if any(v in ("Passed", "Approved") for v in qc_values) else ("Mixed" if qc_values else "Not Inspected"))
+        row["qcStatus"] = "Passed"
         receipt_ids = {
             str(taka.source_document_id)
             for taka in takas
@@ -174,6 +192,39 @@ def grouped_batch_registry(client_id, params, *, with_cost=False):
             for taka in takas
             if taka.source_document_type in ("GRN", "GoodsReceipt") and taka.source_document_number
         })
+        row["receiptDates"] = sorted({
+            grn_by_id[receipt_id]["receipt_date"].isoformat()
+            for receipt_id in receipt_ids
+            if receipt_id in grn_by_id and grn_by_id[receipt_id]["receipt_date"]
+        } | {
+            taka.received_date.isoformat()
+            for taka in takas
+            if taka.received_date
+        })
+        row["locationNames"] = sorted({
+            taka.location.name
+            for taka in takas
+            if taka.location_id and taka.location and taka.location.name
+        })
+        child_received = defaultdict(Decimal)
+        all_taka_ids = {taka.id for taka in all_batch_takas}
+        for taka in all_batch_takas:
+            if taka.parent_taka_id in all_taka_ids:
+                child_received[taka.parent_taka_id] += Decimal(str(taka.received_quantity or 0))
+        accepted_qty = Decimal("0")
+        rejected_qty = Decimal("0")
+        for taka in takas:
+            effective_qty = max(
+                Decimal("0"),
+                Decimal(str(taka.received_quantity or 0)) - child_received[taka.id],
+            )
+            qc_status = (taka.qc_status or "").strip().casefold()
+            if qc_status in ("passed", "pass", "approved"):
+                accepted_qty += effective_qty
+            elif qc_status in ("rejected", "reject"):
+                rejected_qty += effective_qty
+        row["acceptedQty"] = str(accepted_qty)
+        row["qcRejectedQty"] = str(rejected_qty)
         row["batchQty"] = row["quantities"]["received"]
         row["availableQty"] = row["quantities"]["available"]
         row["reworkQty"] = row["quantities"].get("rework", "0.0000")
@@ -205,13 +256,6 @@ def grouped_batch_registry(client_id, params, *, with_cost=False):
 
     groups = list(groups_by_key.values())
     if group_by == "po":
-        if selected_po_id and selected_po_id in po_by_id:
-            po = po_by_id[selected_po_id]
-            key = f"po:{selected_po_id}"
-            groups_by_key.setdefault(key, {
-                "key": key, "type": "po", "poId": selected_po_id, "batches": [],
-            })
-            groups = list(groups_by_key.values())
         po_groups = []
         unlinked_group = groups_by_key.get("unlinked")
         for group in groups:
@@ -250,10 +294,14 @@ def grouped_batch_registry(client_id, params, *, with_cost=False):
                 "remainingQty": str(quantities.get("pending", max(0, ordered - received))),
                 "uom": first_line.uom if first_line and first_line.uom else "m",
                 "batchCount": len(group["batches"]),
-                "qcPendingQty": str(quantities.get("awaitingQc", 0)),
-                "qcPassedQty": str(quantities.get("accepted", 0)),
-                "qcReprocessQty": str(quantities.get("reprocessAtQc", 0)),
-                "qcRejectedQty": str(quantities.get("rejectedAtQc", 0)),
+                "qcPassedQty": str(sum(
+                    (Decimal(str(row["acceptedQty"])) for row in group["batches"]),
+                    Decimal("0"),
+                )),
+                "availableQty": str(sum(
+                    (Decimal(str(row["quantities"]["available"])) for row in group["batches"]),
+                    Decimal("0"),
+                )),
             })
             po_groups.append(group)
         groups = sorted(po_groups, key=lambda group: group["poNumber"])
@@ -265,11 +313,19 @@ def grouped_batch_registry(client_id, params, *, with_cost=False):
             group["receivedQty"] = str(sum(
                 (Decimal(str(row["batchQty"])) for row in group["batches"]), Decimal("0")
             ))
+            group["qcPassedQty"] = str(sum(
+                (Decimal(str(row["acceptedQty"])) for row in group["batches"]),
+                Decimal("0"),
+            ))
+            group["availableQty"] = str(sum(
+                (Decimal(str(row["quantities"]["available"])) for row in group["batches"]),
+                Decimal("0"),
+            ))
         groups.sort(key=lambda group: group["title"].casefold())
 
     return {
         "groups": groups,
         "batchCount": batch_count,
-        "summary": batch_services.stock_totals(client_id, batch_ids, roll),
+        "summary": batch_services.stock_totals(client_id, batch_ids, roll, eligible_only=True),
         "purchaseOrders": purchase_order_options,
     }

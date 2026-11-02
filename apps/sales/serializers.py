@@ -156,27 +156,62 @@ class SalesOrderSerializer(DocumentSerializer):
 
     vehicleNo = serializers.CharField(source="vehicle_number", required=False, allow_blank=True, allow_null=True)
     dispatchDate = serializers.DateField(source="dispatch_date", required=False, allow_null=True)
-    crmLead = TenantPrimaryKeyRelatedField(
-        source="crm_lead", model="crm.Lead", required=False, allow_null=True
-    )
+    invoiceStatus = serializers.SerializerMethodField()
+    hasInvoice = serializers.SerializerMethodField()
+    linkedInvoiceId = serializers.SerializerMethodField()
+    linkedInvoiceNumber = serializers.SerializerMethodField()
+    linkedInvoice = serializers.SerializerMethodField()
+
+    def get_invoiceStatus(self, obj):
+        if obj.stage == "Invoiced":
+            return "Invoiced"
+        return None
+
+    def get_hasInvoice(self, obj):
+        if obj.stage == "Invoiced":
+            return True
+        return obj.invoices.filter(deleted_at__isnull=True).exclude(status="Cancelled").exists()
+
+    def get_linkedInvoiceId(self, obj):
+        inv = obj.invoices.filter(deleted_at__isnull=True).exclude(status="Cancelled").order_by("-created_at").first()
+        return str(inv.id) if inv else None
+
+    def get_linkedInvoiceNumber(self, obj):
+        inv = obj.invoices.filter(deleted_at__isnull=True).exclude(status="Cancelled").order_by("-created_at").first()
+        return inv.invoice_number if inv else None
+
+    def get_linkedInvoice(self, obj):
+        inv = obj.invoices.filter(deleted_at__isnull=True).exclude(status="Cancelled").order_by("-created_at").first()
+        if not inv:
+            return None
+        return {
+            "id": str(inv.id),
+            "invoiceNumber": inv.invoice_number,
+            "status": inv.status,
+            "total": str(inv.total) if inv.total is not None else "0",
+        }
 
     class Meta:
         model = SalesOrder
         fields = HEADER_FIELDS + [
             "order_number", "stage", "payment_status", "delivery_date",
-            "quotation", "pms_project", "reference_number", "crm_lead", "crmLead",
+            "quotation", "pms_project", "reference_number",
             "dispatch_date", "dispatchDate", "vehicle_number", "vehicleNo", "transporter",
+            "invoiceStatus", "hasInvoice", "linkedInvoiceId", "linkedInvoiceNumber", "linkedInvoice",
         ]
-        read_only_fields = READ_ONLY_HEADER_FIELDS + ["order_number", "payment_status"]
+        read_only_fields = READ_ONLY_HEADER_FIELDS + [
+            "order_number", "payment_status",
+            "invoiceStatus", "hasInvoice", "linkedInvoiceId", "linkedInvoiceNumber", "linkedInvoice",
+        ]
 
 
 class ConvertLinesSerializer(BaseSerializer):
-    """Partial conversion (api.md §5.4): ``{ lines: [{ lineId, qty, serials[] }] }``."""
-
     lines = serializers.ListField(child=serializers.DictField(), required=False, default=list)
     date = serializers.DateField(required=False)
     locationId = serializers.CharField(required=False, allow_null=True)
     notes = serializers.CharField(required=False, allow_blank=True)
+    directInvoice = serializers.BooleanField(required=False, default=False)
+    direct = serializers.BooleanField(required=False, default=False)
 
 
 # ---------------------------------------------------------------------------
@@ -543,4 +578,3 @@ class EarlyPaymentDiscountRequestSerializer(BaseModelSerializer):
 
     def get_invoiceOutstanding(self, obj):
         return services.invoice_balance(obj.invoice)
-

@@ -16,6 +16,7 @@ from apps.core.exceptions import (
     BusinessRuleViolation,
     Codes,
     Conflict,
+    EvenmoreAPIError,
     NotFound,
     ValidationFailed,
 )
@@ -811,7 +812,8 @@ class SalesOrderViewSet(SalesDocumentViewSet):
     @action(detail=True, methods=["post"], url_path="convert-to-challan")
     @transaction.atomic
     def convert_to_challan(self, request, pk=None):
-        order = self.get_object()
+        order = SalesOrder.objects.select_for_update().get(pk=pk)
+        self.check_object_permissions(request, order)
         serializer = ConvertLinesSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         return self._convert(order, serializer.validated_data, target="challan")
@@ -819,7 +821,8 @@ class SalesOrderViewSet(SalesDocumentViewSet):
     @action(detail=True, methods=["post"], url_path="convert-to-invoice")
     @transaction.atomic
     def convert_to_invoice(self, request, pk=None):
-        order = self.get_object()
+        order = SalesOrder.objects.select_for_update().get(pk=pk)
+        self.check_object_permissions(request, order)
         serializer = ConvertLinesSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         return self._convert(order, serializer.validated_data, target="invoice")
@@ -835,14 +838,67 @@ class SalesOrderViewSet(SalesDocumentViewSet):
                 code="APPROVAL_PENDING",
             )
 
+        if target == "challan" and not data.get("lines"):
+            existing_challan = order.challans.select_for_update().filter(
+                deleted_at__isnull=True, status="Draft"
+            ).order_by("-created_at", "-id").first()
+            if existing_challan:
+                body = DeliveryChallanSerializer(
+                    existing_challan, context=self.get_serializer_context()
+                ).data
+                body["reused"] = True
+                return Response(body)
+
+        if target == "invoice":
+            existing_draft = order.invoices.filter(
+                deleted_at__isnull=True,
+                status="Draft",
+                posted_at__isnull=True,
+            ).order_by("created_at", "id").first()
+            if existing_draft:
+                body = SalesInvoiceSerializer(
+                    existing_draft, context=self.get_serializer_context()
+                ).data
+                body["reused"] = True
+                return Response(
+                    body
+                )
+
+            if order.stage == "Invoiced":
+                existing = order.invoices.filter(deleted_at__isnull=True).exclude(status="Cancelled").first()
+                inv_label = existing.invoice_number or str(existing.id) if existing else "an existing invoice"
+                raise Conflict(
+                    f"Sales Order {order.order_number} has already been invoiced ({inv_label}).",
+                    code=Codes.ALREADY_DONE,
+                )
+
         requested = {
             str(row.get("lineId") or row.get("line_id")): row for row in data.get("lines") or []
         }
-        source_lines = list(
-            order.line_items.filter(deleted_at__isnull=True)
-            .select_related("item")
-            .order_by("line_no")
-        )
+        source_line_query = order.line_items.filter(deleted_at__isnull=True).select_related(
+            "item"
+        ).order_by("line_no")
+        if target == "invoice":
+            source_line_query = source_line_query.select_for_update(of=("self",))
+        source_lines = list(source_line_query)
+
+        draft_invoice_qty = {}
+        if target == "invoice":
+            source_lines_by_id = {line.id: line for line in source_lines}
+            draft_lines = SalesInvoiceLine.objects.filter(
+                client_id=order.client_id,
+                sales_invoice__sales_order_id=order.id,
+                sales_invoice__deleted_at__isnull=True,
+                sales_invoice__status="Draft",
+                deleted_at__isnull=True,
+                sales_order_line_id__in=source_lines_by_id,
+            ).select_related("sales_order_line")
+            for draft_line in draft_lines:
+                order_line = source_lines_by_id[draft_line.sales_order_line_id]
+                draft_invoice_qty[order_line.id] = (
+                    draft_invoice_qty.get(order_line.id, ZERO)
+                    + uom.between_lines(draft_line.qty, draft_line, order_line)
+                )
 
         selected = []
         awaiting_dispatch = []
@@ -853,14 +909,30 @@ class SalesOrderViewSet(SalesDocumentViewSet):
             if target == "challan":
                 remaining = D(line.qty) - D(line.dispatched_qty)
             elif line.item_id is not None and line.item.holds_stock:
-                # Stock lines are invoiced from what actually left the
-                # warehouse: dispatched minus already invoiced.
-                remaining = D(line.dispatched_qty) - D(line.invoiced_qty)
-                if D(line.qty) - D(line.dispatched_qty) > ZERO:
-                    awaiting_dispatch.append(line)
+                # If order is in Draft or directInvoice is requested, allow direct invoicing from order quantity:
+                if order.stage == "Draft" or data.get("directInvoice") or data.get("direct"):
+                    remaining = (
+                        D(line.qty)
+                        - D(line.invoiced_qty)
+                        - draft_invoice_qty.get(line.id, ZERO)
+                    )
+                else:
+                    # Stock lines are invoiced from what actually left the
+                    # warehouse: dispatched minus already invoiced.
+                    remaining = (
+                        D(line.dispatched_qty)
+                        - D(line.invoiced_qty)
+                        - draft_invoice_qty.get(line.id, ZERO)
+                    )
+                    if D(line.qty) - D(line.dispatched_qty) > ZERO:
+                        awaiting_dispatch.append(line)
             else:
                 # Non-stock lines (services, charges) never pass a challan.
-                remaining = D(line.qty) - D(line.invoiced_qty)
+                remaining = (
+                    D(line.qty)
+                    - D(line.invoiced_qty)
+                    - draft_invoice_qty.get(line.id, ZERO)
+                )
             remaining = remaining if remaining > ZERO else ZERO
             qty = D(row.get("qty")) if row and row.get("qty") is not None else remaining
             if qty <= ZERO:
@@ -936,6 +1008,7 @@ class SalesOrderViewSet(SalesDocumentViewSet):
         )
 
         for index, (source, qty, serials, takas) in enumerate(selected, start=1):
+            effective_takas = takas or getattr(source, "taka_allocations", []) or []
             new_line = line_model.objects.create(
                 client_id=order.client_id,
                 **{line_fk: document},
@@ -958,7 +1031,7 @@ class SalesOrderViewSet(SalesDocumentViewSet):
                 taka_allocations=[
                     {"lotTakaId": str(t.get("lotTakaId") or t.get("lot_taka_id")),
                      "qty": str(t.get("qty"))}
-                    for t in takas if (t.get("lotTakaId") or t.get("lot_taka_id"))
+                    for t in effective_takas if (t.get("lotTakaId") or t.get("lot_taka_id"))
                 ],
             )
             if serials:
@@ -1161,6 +1234,10 @@ class DeliveryChallanViewSet(SalesDocumentViewSet):
         (api.md §5.7 rule 3).
         """
         challan = self.get_object()
+        if challan.sales_order_id:
+            SalesOrder.objects.select_for_update().get(pk=challan.sales_order_id)
+        challan = DeliveryChallan.objects.select_for_update().get(pk=pk)
+        self.check_object_permissions(request, challan)
         if challan.status == "Cancelled":
             raise Conflict("This challan is cancelled.", code=Codes.ALREADY_CANCELLED)
         # Any post-dispatch status (Dispatched / In Transit / Delivered) can be
@@ -1172,22 +1249,163 @@ class DeliveryChallanViewSet(SalesDocumentViewSet):
                 detail=f"This challan is {challan.status}. Dispatch it first.",
             )
 
-        existing_invoice = (
-            SalesInvoice.objects.filter(
-                Q(delivery_challan=challan)
-                | Q(line_items__delivery_challan_line__delivery_challan=challan),
+        invoice, created = self._create_or_reuse_challan_invoice(challan, request.user)
+        body = SalesInvoiceSerializer(invoice, context=self.get_serializer_context()).data
+        if not created:
+            body["reused"] = True
+        return Response(
+            body,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=["post"], url_path="create-draft-invoice")
+    @transaction.atomic
+    def create_draft_invoice(self, request, pk=None):
+        """Create or reuse the invoice draft for a challan without dispatching it."""
+        challan = self.get_object()
+        if challan.sales_order_id:
+            SalesOrder.objects.select_for_update().get(pk=challan.sales_order_id)
+        challan = DeliveryChallan.objects.select_for_update().get(pk=pk)
+        self.check_object_permissions(request, challan)
+        if challan.status == "Cancelled":
+            raise Conflict("This challan is cancelled.", code=Codes.ALREADY_CANCELLED)
+        if not challan.sales_order_id:
+            raise ValidationFailed(
+                "The combined challan and invoice action requires a Sales Order.",
+                field_errors={"salesOrder": ["This challan is not linked to a Sales Order."]},
+            )
+        if not challan.line_items.filter(deleted_at__isnull=True).exists():
+            raise ValidationFailed(
+                "A draft invoice requires at least one challan line.",
+                field_errors={"lineItems": ["Add at least one line to the challan."]},
+            )
+
+        order = SalesOrder.objects.select_for_update().get(pk=challan.sales_order_id)
+        if order.stage == "Cancelled":
+            raise Conflict("This Sales Order is cancelled.", code=Codes.ALREADY_CANCELLED)
+
+        invoice, created = self._create_or_reuse_challan_invoice(challan, request.user)
+        body = SalesInvoiceSerializer(invoice, context=self.get_serializer_context()).data
+        if not created:
+            body["reused"] = True
+        return Response(
+            body,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+    def _create_or_reuse_challan_invoice(self, challan, user):
+        order = None
+        if challan.sales_order_id:
+            order = SalesOrder.objects.select_for_update().get(pk=challan.sales_order_id)
+
+        existing = SalesInvoice.objects.filter(
+            Q(delivery_challan=challan)
+            | Q(line_items__delivery_challan_line__delivery_challan=challan),
+            client_id=challan.client_id,
+            deleted_at__isnull=True,
+        ).exclude(status="Cancelled").distinct().order_by("-created_at", "-id").first()
+        if existing:
+            return existing, False
+
+        if order is not None:
+            existing_order_invoice = SalesInvoice.objects.filter(
+                sales_order=order,
                 client_id=challan.client_id,
                 deleted_at__isnull=True,
-            )
-            .exclude(status="Cancelled")
-            .distinct()
-            .first()
-        )
-        if existing_invoice:
-            raise Conflict(
-                f"An invoice ({existing_invoice.invoice_number or existing_invoice.id}) already exists for this challan.",
-                code=Codes.OVER_INVOICE,
-            )
+                status="Draft",
+                posted_at__isnull=True,
+            ).select_for_update().order_by("created_at", "id").first()
+            if existing_order_invoice:
+                if (
+                    existing_order_invoice.delivery_challan_id
+                    and existing_order_invoice.delivery_challan_id != challan.id
+                ):
+                    raise Conflict(
+                        f"Active draft invoice {existing_order_invoice.invoice_number or existing_order_invoice.id} "
+                        f"already exists for Sales Order {order.order_number} and is linked to another challan.",
+                        code=Codes.ALREADY_DONE,
+                        payload={"invoiceId": str(existing_order_invoice.id)},
+                    )
+
+                challan_lines = list(
+                    challan.line_items.filter(deleted_at__isnull=True).order_by("line_no")
+                )
+                invoice_lines = list(
+                    existing_order_invoice.line_items.filter(deleted_at__isnull=True).order_by("line_no")
+                )
+                if invoice_lines:
+                    if len(invoice_lines) != len(challan_lines):
+                        raise Conflict(
+                            f"Draft invoice {existing_order_invoice.invoice_number or existing_order_invoice.id} "
+                            "does not match the challan quantities and cannot be linked safely.",
+                            code=Codes.ALREADY_DONE,
+                            payload={"invoiceId": str(existing_order_invoice.id)},
+                        )
+                    unmatched_challan_lines = list(challan_lines)
+                    for invoice_line in invoice_lines:
+                        challan_line = next(
+                            (
+                                candidate
+                                for candidate in unmatched_challan_lines
+                                if candidate.sales_order_line_id == invoice_line.sales_order_line_id
+                                and candidate.item_id == invoice_line.item_id
+                                and D(candidate.qty) == D(invoice_line.qty)
+                                and candidate.uom == invoice_line.uom
+                                and D(candidate.uom_factor) == D(invoice_line.uom_factor)
+                                and D(candidate.rate) == D(invoice_line.rate)
+                                and D(candidate.discount_pct) == D(invoice_line.discount_pct)
+                                and D(candidate.tax_pct) == D(invoice_line.tax_pct)
+                                and candidate.is_bom_generated == invoice_line.is_bom_generated
+                                and candidate.bom_source_item_id == invoice_line.bom_source_item_id
+                                and candidate.parent_sku == invoice_line.parent_sku
+                            ),
+                            None,
+                        )
+                        if challan_line is None:
+                            raise Conflict(
+                                f"Draft invoice {existing_order_invoice.invoice_number or existing_order_invoice.id} "
+                                "does not match the challan quantities and cannot be linked safely.",
+                                code=Codes.ALREADY_DONE,
+                                payload={"invoiceId": str(existing_order_invoice.id)},
+                            )
+                        unmatched_challan_lines.remove(challan_line)
+                        invoice_line.delivery_challan_line = challan_line
+                        invoice_line.save(update_fields=["delivery_challan_line", "updated_at"])
+                else:
+                    for index, line in enumerate(challan_lines, start=1):
+                        SalesInvoiceLine.objects.create(
+                            client_id=challan.client_id,
+                            sales_invoice=existing_order_invoice,
+                            line_no=index,
+                            item_id=line.item_id,
+                            sku=line.sku,
+                            item_name=line.item_name,
+                            description=line.description,
+                            hsn_code=line.hsn_code,
+                            uom=line.uom,
+                            uom_factor=line.uom_factor,
+                            qty=line.qty,
+                            rate=line.rate,
+                            discount_pct=line.discount_pct,
+                            tax_pct=line.tax_pct,
+                            sales_order_line=line.sales_order_line,
+                            delivery_challan_line=line,
+                            is_bom_generated=line.is_bom_generated,
+                            bom_source_item_id=line.bom_source_item_id,
+                            parent_sku=line.parent_sku,
+                        )
+                existing_order_invoice.delivery_challan = challan
+                existing_order_invoice.save(update_fields=["delivery_challan", "updated_at"])
+                services.recalculate_document(existing_order_invoice)
+                self.write_audit(
+                    "convert",
+                    challan,
+                    description=(
+                        f"Linked draft invoice {existing_order_invoice.invoice_number or existing_order_invoice.id} "
+                        f"to challan {challan.challan_number}"
+                    ),
+                )
+                return existing_order_invoice, False
 
         invoice = SalesInvoice.objects.create(
             client_id=challan.client_id,
@@ -1204,7 +1422,7 @@ class DeliveryChallanViewSet(SalesDocumentViewSet):
             status="Draft",
             freight_charges=challan.freight_charges,
             other_charges=challan.other_charges,
-            created_by=request.user,
+            created_by=user,
         )
         for index, line in enumerate(
             challan.line_items.filter(deleted_at__isnull=True).order_by("line_no"), start=1
@@ -1231,10 +1449,12 @@ class DeliveryChallanViewSet(SalesDocumentViewSet):
                 parent_sku=line.parent_sku,
             )
         services.recalculate_document(invoice)
-        return Response(
-            SalesInvoiceSerializer(invoice, context=self.get_serializer_context()).data,
-            status=status.HTTP_201_CREATED,
+        self.write_audit(
+            "convert",
+            challan,
+            description=f"Created draft invoice {invoice.id} from challan {challan.challan_number}",
         )
+        return invoice, True
 
     @action(detail=True, methods=["post"], url_path="warranty-card")
     @transaction.atomic
@@ -1343,6 +1563,7 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
         "read": ["view_sales"],
         "write": ["create_invoice"],
         "finalize": ["finalize_invoice"],
+        "request_credit_override": ["create_invoice"],
         "cancel": ["cancel_invoice"],
         # Finer checks (draft vs finalized) live in early_payment.change_payment_terms.
         "payment_terms": ["view_sales"],
@@ -1356,6 +1577,49 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
                 total__gt=F("amount_paid") + F("settlement_discount"),
             ).exclude(status__in=["Cancelled", "Draft", "Paid"])
         return queryset
+
+    @transaction.atomic
+    def create(self, request, *args, **kwargs):
+        self._create_finalize_error = None
+        order_id = request.data.get("salesOrder") or request.data.get("sales_order")
+        if order_id:
+            order = SalesOrder.objects.select_for_update().filter(
+                client_id=self.get_client_id(),
+                pk=order_id,
+                deleted_at__isnull=True,
+            ).first()
+            if order is not None:
+                existing = SalesInvoice.objects.select_for_update().filter(
+                    client_id=self.get_client_id(),
+                    sales_order=order,
+                    status="Draft",
+                    posted_at__isnull=True,
+                    deleted_at__isnull=True,
+                ).order_by("created_at", "id").first()
+                if existing is not None:
+                    body = self.get_serializer(existing).data
+                    body["reused"] = True
+                    return Response(body)
+        response = super().create(request, *args, **kwargs)
+        if self._create_finalize_error and isinstance(response.data, dict):
+            response.data = {
+                **response.data,
+                "finalizationError": self._create_finalize_error,
+            }
+        return response
+
+    def perform_update(self, serializer):
+        from apps.core.approval_services import is_pending_approval
+
+        invoice = self.get_object()
+        if is_pending_approval(
+            invoice.client_id, "credit_limit_exceeded", invoice.id
+        ):
+            raise Conflict(
+                "This Draft invoice is locked while credit-limit approval is pending.",
+                code="APPROVAL_PENDING",
+            )
+        return super().perform_update(serializer)
 
     def get_aggregates(self, queryset):
         rows = queryset.aggregate(
@@ -1444,18 +1708,105 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
         A discount that needs an approver keeps the invoice in Draft; the
         approval request is opened and the invoice is finalized after it.
         """
+        order = serializer.validated_data.get("sales_order")
+        if order is not None:
+            order = SalesOrder.objects.select_for_update().get(
+                pk=order.pk, client_id=self.get_client_id(), deleted_at__isnull=True
+            )
+            existing = SalesInvoice.objects.select_for_update().filter(
+                client_id=self.get_client_id(),
+                sales_order=order,
+                status="Draft",
+                posted_at__isnull=True,
+                deleted_at__isnull=True,
+            ).order_by("created_at", "id").first()
+            if existing is not None:
+                raise Conflict(
+                    f"Sales Order {order.order_number} already has an active draft invoice.",
+                    code="ACTIVE_DRAFT_EXISTS",
+                    payload={
+                        "salesOrderId": str(order.id),
+                        "invoiceId": str(existing.id),
+                        "invoiceNumber": existing.invoice_number,
+                    },
+                )
+
         invoice = super().perform_create(serializer)
         if self.request.data.get("finalize"):
             _, req, _ = self._discount_gate(invoice)
             if req is not None:
                 return invoice
-            services.finalize_invoice(
-                invoice,
-                user=self.request.user,
-                override_credit_limit=bool(self.request.data.get("overrideCreditLimit")),
-            )
-            invoice.refresh_from_db()
+            try:
+                services.finalize_invoice(
+                    invoice,
+                    user=self.request.user,
+                )
+            except EvenmoreAPIError as error:
+                invoice.refresh_from_db()
+                self._create_finalize_error = {
+                    "message": error.message,
+                    "code": error.code,
+                    "payload": error.payload,
+                }
+            else:
+                invoice.refresh_from_db()
         return invoice
+
+    @action(detail=True, methods=["post"], url_path="request-credit-override")
+    @transaction.atomic
+    def request_credit_override(self, request, pk=None):
+        invoice = SalesInvoice.objects.select_for_update().filter(
+            client_id=self.get_client_id(), pk=pk, deleted_at__isnull=True
+        ).first()
+        if invoice is None:
+            raise NotFound("Sales invoice not found.")
+        if invoice.status != "Draft" or invoice.posted_at is not None:
+            raise Conflict("Only an unposted Draft invoice can request credit approval.")
+        reason = str(request.data.get("reason") or "").strip()
+        if not reason:
+            raise ValidationFailed(
+                "A business reason is required for credit-limit approval.",
+                field_errors={"reason": ["Enter a reason for the override request."]},
+            )
+        if invoice.party_id is None:
+            raise ValidationFailed("A customer is required before requesting credit approval.")
+
+        snapshot = services.credit_limit_snapshot(invoice.party, invoice.total)
+        if D(snapshot["excess"]) <= ZERO:
+            raise Conflict("This invoice is currently within the customer's credit limit.")
+
+        from apps.core.approval_services import raise_approval
+
+        approval = raise_approval(
+            client_id=invoice.client_id,
+            document_type="credit_limit_exceeded",
+            document_id=invoice.id,
+            document_number=invoice.invoice_number or f"Draft {str(invoice.id)[:8]}",
+            requested_by=request.user,
+            reason=reason,
+            approver_role_code="OWNER",
+            new_values=snapshot,
+            old_values={
+                "status": invoice.status,
+                "creditLimitSnapshot": snapshot,
+            },
+            variance_amount=D(snapshot["excess"]),
+        )
+        self.write_audit(
+            "request_credit_override",
+            invoice,
+            description=reason,
+            after={"approvalRequestId": str(approval.id), **snapshot},
+        )
+        return Response(
+            {
+                "approvalRequestId": str(approval.id),
+                "status": approval.status,
+                "invoiceId": str(invoice.id),
+                "snapshot": snapshot,
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )
 
     @action(detail=True, methods=["get"], url_path="discount-check")
     def discount_check(self, request, pk=None):
@@ -1467,6 +1818,15 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
     @action(detail=True, methods=["post"])
     def finalize(self, request, pk=None):
         draft = self.get_object()
+        from apps.core.approval_services import is_pending_approval
+
+        if is_pending_approval(
+            draft.client_id, "credit_limit_exceeded", draft.id
+        ):
+            raise Conflict(
+                "This invoice is waiting for credit-limit approval.",
+                code="APPROVAL_PENDING",
+            )
         if draft.status == "Draft":
             evaluation, req, number = self._discount_gate(draft)
             if req is not None:
@@ -1474,7 +1834,6 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
         invoice = services.finalize_invoice(
             draft,
             user=request.user,
-            override_credit_limit=bool(request.data.get("overrideCreditLimit")),
         )
         self.write_audit(
             "finalize", invoice, description=f"Finalized as {invoice.invoice_number}"
