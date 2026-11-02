@@ -400,14 +400,19 @@ class CompOffSerializer(BaseModelSerializer):
     employeeId = TenantPrimaryKeyRelatedField(
         source="employee", model="hrms.Employee", required=False, allow_null=True
     )
+    employeeName = serializers.CharField(source="employee.name", read_only=True)
+    employee = serializers.CharField(source="employee.name", read_only=True)
     workedDate = serializers.DateField(source="worked_date")
     workType = serializers.CharField(source="work_type", required=False, allow_null=True)
+    creditDays = serializers.DecimalField(source="days", max_digits=4, decimal_places=2, required=False)
     expiryDate = serializers.DateField(source="expiry_date", required=False, allow_null=True)
+    rejectReason = serializers.CharField(source="reject_reason", required=False, allow_null=True)
 
     class Meta:
         model = CompOff
         fields = [
-            "id", "employeeId", "workedDate", "workType", "days", "expiryDate",
+            "id", "employeeId", "employeeName", "employee", "workedDate", "workType",
+            "days", "creditDays", "expiryDate", "status", "rejectReason",
             "used", "created_at",
         ]
 
@@ -416,7 +421,9 @@ class LeaveEncashmentSerializer(BaseModelSerializer):
     employeeId = TenantPrimaryKeyRelatedField(
         source="employee", model="hrms.Employee", required=False, allow_null=True
     )
+    employeeName = serializers.CharField(source="employee.name", read_only=True)
     leaveTypeId = TenantPrimaryKeyRelatedField(source="leave_type", model="hrms.LeaveType")
+    leaveTypeName = serializers.CharField(source="leave_type.name", read_only=True)
     perDayRate = MoneyField(source="per_day_rate")
     # GeneratedField (days * per_day_rate) -- see LeaveBalanceSerializer.balance.
     amount = MoneyField(read_only=True)
@@ -424,8 +431,8 @@ class LeaveEncashmentSerializer(BaseModelSerializer):
     class Meta:
         model = LeaveEncashment
         fields = [
-            "id", "employeeId", "leaveTypeId", "days", "perDayRate", "amount",
-            "status", "created_at",
+            "id", "employeeId", "employeeName", "leaveTypeId", "leaveTypeName",
+            "days", "perDayRate", "amount", "status", "created_at",
         ]
         read_only_fields = ["amount"]
 
@@ -739,18 +746,28 @@ class AppraisalSerializer(BaseModelSerializer):
         source="employee", model="hrms.Employee", required=False, allow_null=True
     )
     employeeName = serializers.CharField(source="employee.name", read_only=True)
+    employee = serializers.CharField(source="employee.name", read_only=True)
     managerId = TenantPrimaryKeyRelatedField(
         source="manager", model="hrms.Employee", required=False, allow_null=True
     )
     cycleId = TenantPrimaryKeyRelatedField(source="cycle", model="hrms.AppraisalCycle")
     kpiScores = AppraisalKpiScoreSerializer(source="kpi_scores", many=True, read_only=True)
     history = AppraisalHistorySerializer(many=True, read_only=True)
+    selfRating = serializers.DecimalField(source="self_rating", max_digits=3, decimal_places=2, required=False, allow_null=True)
+    managerRating = serializers.DecimalField(source="manager_rating", max_digits=3, decimal_places=2, required=False, allow_null=True)
+    finalRating = serializers.DecimalField(source="final_rating", max_digits=3, decimal_places=2, required=False, allow_null=True)
+    rating = serializers.SerializerMethodField()
+
+    def get_rating(self, obj):
+        val = obj.final_rating or obj.manager_rating or obj.self_rating or 0.0
+        return float(val)
 
     class Meta:
         model = Appraisal
         fields = [
-            "id", "cycleId", "employeeId", "employeeName", "managerId", "stage",
+            "id", "cycleId", "employeeId", "employeeName", "employee", "managerId", "stage",
             "status", "self_rating", "manager_rating", "final_rating",
+            "selfRating", "managerRating", "finalRating", "rating",
             "strengths", "areas_for_improvement", "development_feedback",
             "hr_comments", "self_comments", "kpiScores", "history",
             "created_at", "updated_at",
@@ -762,12 +779,21 @@ class GoalSerializer(BaseModelSerializer):
     employeeId = TenantPrimaryKeyRelatedField(
         source="employee", model="hrms.Employee", required=False, allow_null=True
     )
+    employeeName = serializers.CharField(source="employee.name", read_only=True)
+    employee = serializers.CharField(source="employee.name", read_only=True)
+    cycleId = TenantPrimaryKeyRelatedField(
+        source="cycle", model="hrms.AppraisalCycle", required=False, allow_null=True
+    )
+    dueDate = serializers.DateField(source="target_date", required=False, allow_null=True)
+    progress = serializers.IntegerField(source="progress_pct", required=False)
+    progressPct = serializers.IntegerField(source="progress_pct", required=False)
 
     class Meta:
         model = Goal
         fields = [
-            "id", "employeeId", "cycle", "title", "description", "target_date",
-            "progress_pct", "status", "created_at",
+            "id", "employeeId", "employeeName", "employee", "cycle", "cycleId",
+            "title", "description", "target_date", "dueDate", "progress_pct",
+            "progress", "progressPct", "status", "created_at",
         ]
 
 
@@ -1181,12 +1207,17 @@ class TerminationSerializer(BaseModelSerializer):
     lastWorkingDay = serializers.DateField(
         source="last_working_day", required=False, allow_null=True
     )
+    terminationDate = serializers.DateField(
+        source="last_working_day", required=False, allow_null=True
+    )
+    settlementAmount = MoneyField(source="settlement_amount", required=False, allow_null=True)
 
     class Meta:
         model = Termination
         fields = [
             "id", "employeeId", "employeeName", "reason", "lastWorkingDay",
-            "letter_file", "settlement_amount", "status", "created_at",
+            "terminationDate", "letter_file", "settlement_amount", "settlementAmount",
+            "status", "created_at",
         ]
 
 
@@ -1206,14 +1237,16 @@ class ResignationSerializer(BaseModelSerializer):
     lastWorkingDay = serializers.DateField(
         source="last_working_day", required=False, allow_null=True
     )
+    handoverTo = serializers.CharField(source="handover_to", required=False, allow_null=True)
+    exitInterviewAt = serializers.DateTimeField(source="exit_interview_at", required=False, allow_null=True)
     checklist = ResignationChecklistItemSerializer(many=True, read_only=True)
 
     class Meta:
         model = Resignation
         fields = [
             "id", "employeeId", "employeeName", "submittedOn", "noticePeriodDays",
-            "lastWorkingDay", "exit_interview_at", "reason", "handover_to", "status",
-            "checklist", "created_at",
+            "lastWorkingDay", "exit_interview_at", "exitInterviewAt", "reason",
+            "handover_to", "handoverTo", "status", "checklist", "created_at",
         ]
 
 
@@ -1222,6 +1255,7 @@ class ComplaintSerializer(BaseModelSerializer):
     including exports (db.md §11.8)."""
 
     raisedBy = serializers.SerializerMethodField()
+    complainant = serializers.SerializerMethodField()
     raisedByEmployeeId = TenantPrimaryKeyRelatedField(
         source="raised_by_employee", model="hrms.Employee",
         required=False, allow_null=True, write_only=True,
@@ -1231,24 +1265,35 @@ class ComplaintSerializer(BaseModelSerializer):
         required=False, allow_null=True,
     )
     againstName = serializers.SerializerMethodField()
+    against = serializers.SerializerMethodField()
+    summary = serializers.CharField(source="description", required=False, allow_blank=True)
     isAnonymous = serializers.BooleanField(source="is_anonymous", required=False)
+    raisedDate = serializers.DateTimeField(source="created_at", read_only=True)
+    filedOn = serializers.DateTimeField(source="created_at", read_only=True)
 
     class Meta:
         model = Complaint
         fields = [
-            "id", "raisedBy", "raisedByEmployeeId", "againstEmployeeId",
-            "againstName", "category", "description", "isAnonymous", "status",
-            "assigned_to", "resolution", "resolved_at", "created_at",
+            "id", "raisedBy", "complainant", "raisedByEmployeeId", "againstEmployeeId",
+            "againstName", "against", "category", "description", "summary", "isAnonymous",
+            "status", "assigned_to", "resolution", "resolved_at", "created_at",
+            "raisedDate", "filedOn",
         ]
-        read_only_fields = ["resolved_at", "created_at"]
+        read_only_fields = ["resolved_at", "created_at", "raisedDate", "filedOn"]
 
     def get_raisedBy(self, complaint):
         if complaint.is_anonymous:
             return None
         return complaint.raised_by_employee.name if complaint.raised_by_employee_id else None
 
+    def get_complainant(self, complaint):
+        return self.get_raisedBy(complaint)
+
     def get_againstName(self, complaint):
         return complaint.against_employee.name if complaint.against_employee_id else None
+
+    def get_against(self, complaint):
+        return self.get_againstName(complaint)
 
 
 # =============================================================================

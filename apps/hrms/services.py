@@ -964,6 +964,28 @@ def split_structure(structure, earned_salary):
 
 
 @transaction.atomic
+
+def approve_leave_encashment(encashment, *, user=None):
+    """Approve a leave encashment request and increment LeaveBalance.encashed."""
+    if encashment.status == "Approved":
+        return encashment
+    year = encashment.created_at.year if encashment.created_at else timezone.now().year
+    balance = leave_balance_for(
+        encashment.client_id, encashment.employee_id, encashment.leave_type_id, year
+    )
+    available = D(balance.entitlement) + D(balance.carried_forward) - D(balance.used) - D(balance.encashed)
+    if D(encashment.days) > available:
+        raise BusinessRuleViolation(
+            f"Insufficient leave balance to encash {encashment.days} day(s); {available} available.",
+            code="INSUFFICIENT_LEAVE_BALANCE",
+        )
+    encashment.status = "Approved"
+    encashment.save(update_fields=["status", "updated_at"])
+    balance.encashed = D(balance.encashed or 0) + D(encashment.days)
+    balance.save(update_fields=["encashed", "updated_at"])
+    return encashment
+
+
 def process_payroll(*, client, period_month, employee_ids=None, user=None):
     """``POST /hrms/payroll/process/`` -- generate the run."""
     period_month = period_month.replace(day=1)
@@ -1014,7 +1036,16 @@ def process_payroll(*, client, period_month, employee_ids=None, user=None):
         previous = Payslip.objects.filter(
             payroll_run=run, employee=employee, deleted_at__isnull=True
         ).first()
-        additional = D(previous.additional_earnings) if previous else ZERO
+        # Factor in approved leave encashments for the month
+        encashments = LeaveEncashment.objects.filter(
+            client=client,
+            employee=employee,
+            status="Approved",
+            created_at__year=period_month.year,
+            created_at__month=period_month.month,
+        )
+        encashment_total = sum((D(e.amount or 0) for e in encashments), ZERO)
+        additional = (D(previous.additional_earnings) if previous else ZERO) + encashment_total
         other_deductions = D(previous.deductions) if previous else ZERO
         result = compute_salary(
             standard_salary=employee.standard_salary,
@@ -1375,7 +1406,7 @@ def org_chart(client_id):
     }
 
     superuser_emails = set(
-        User.objects.filter(is_superuser=True).values_list("email", flat=True)
+        User.objects.filter(client_id=client_id, is_superuser=True).values_list("email", flat=True)
     )
 
     roots = []
@@ -1498,20 +1529,32 @@ def assert_no_manager_cycle(employee, manager_id):
 
 def process_employee_separation(employee, *, separation_type="Resigned", last_working_day=None, user=None):
     """Lifecycle hook for Resignation/Termination.
-    Updates employee status, deactivates login User, and audits.
+    Updates employee status, saves last_working_day, deactivates login User & revokes sessions.
     """
-    from apps.accounts.models import User
+    from apps.accounts.models import User, UserSession
     status_label = "Terminated" if str(separation_type).lower() == "terminated" else "Resigned"
     employee.status = status_label
-    employee.save(update_fields=["status", "updated_at"])
+    if last_working_day:
+        employee.last_working_day = last_working_day
+    employee.save(update_fields=["status", "last_working_day", "updated_at"])
 
-    # Deactivate linked user login account
+    # Deactivate linked user login account and revoke active sessions
     if employee.email:
-        User.objects.filter(
+        users = User.objects.filter(
             client_id=employee.client_id,
             email__iexact=str(employee.email).strip(),
             deleted_at__isnull=True,
-        ).update(is_active=False, status="Inactive", updated_at=timezone.now())
+        )
+        user_ids = list(users.values_list("id", flat=True))
+        if user_ids:
+            users.update(is_active=False, status="Inactive", updated_at=timezone.now())
+            UserSession.objects.filter(
+                user_id__in=user_ids,
+                revoked_at__isnull=True,
+            ).update(
+                revoked_at=timezone.now(),
+                revoked_reason=f"employee_{status_label.lower()}",
+            )
 
     return employee
 

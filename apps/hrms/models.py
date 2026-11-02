@@ -452,6 +452,11 @@ class CompOff(TenantModel):
     work_type = models.TextField(null=True, blank=True)
     days = models.DecimalField(max_digits=4, decimal_places=2, default=1)
     expiry_date = models.DateField(null=True, blank=True)
+    status = models.TextField(
+        choices=[("Pending", "Pending"), ("Approved", "Approved"), ("Rejected", "Rejected")],
+        default="Pending",
+    )
+    reject_reason = models.TextField(null=True, blank=True)
     used = models.BooleanField(default=False)
     used_leave_request = models.ForeignKey(
         LeaveRequest, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
