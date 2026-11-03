@@ -99,7 +99,7 @@ class PurchaseOrderSerializer(DocumentSerializer):
     #: api.md §6.2/§6.4 name the same column ``vendorId``. Two *writable* fields
     #: on one source makes DRF demand both on create, so ``partyId`` is demoted
     #: to a read-only mirror and ``vendorId`` carries the write.
-    vendorId = TenantPrimaryKeyRelatedField(source="party", model="masters.Party")
+    vendorId = TenantPrimaryKeyRelatedField(source="party", model="masters.Party", required=False)
     vendorName = serializers.CharField(source="party_name", read_only=True)
     partyId = serializers.CharField(source="party_id", read_only=True)
 
@@ -413,6 +413,21 @@ class BillOutstandingSerializer(BaseSerializer):
 # ---------------------------------------------------------------------------
 class VendorBillLineSerializer(BaseModelSerializer):
     lineNo = serializers.IntegerField(source="line_no", required=False)
+    batchId = TenantPrimaryKeyRelatedField(
+        source="batch", model="inventory.Batch", required=False, allow_null=True
+    )
+    batchNumber = serializers.CharField(
+        source="batch_number", required=False, allow_null=True, allow_blank=True
+    )
+    batchCode = serializers.CharField(
+        source="batch.batch_code", read_only=True, allow_null=True
+    )
+    grnId = TenantPrimaryKeyRelatedField(
+        source="goods_receipt", model="purchase.GoodsReceipt", required=False, allow_null=True
+    )
+    grnNumber = serializers.CharField(
+        source="goods_receipt.grn_number", read_only=True, allow_null=True
+    )
     itemId = TenantPrimaryKeyRelatedField(
         source="item", model="masters.Item", required=False, allow_null=True
     )
@@ -426,7 +441,8 @@ class VendorBillLineSerializer(BaseModelSerializer):
     class Meta:
         model = VendorBillLine
         fields = [
-            "id", "lineNo", "itemId", "sku", "itemName", "uom",
+            "id", "lineNo", "batchId", "batchNumber", "batchCode", "grnId", "grnNumber",
+            "itemId", "sku", "itemName", "uom",
             "qty", "rate", "amount", "lineTotal",
         ]
         read_only_fields = ["amount"]
@@ -446,6 +462,15 @@ class VendorBillLineSerializer(BaseModelSerializer):
 
 
 class VendorBillSerializer(BaseModelSerializer):
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        po_id = data.get("purchaseOrderId") or data.get("purchase_order")
+        if po_id and not data.get("vendorId"):
+            from apps.purchase.models import PurchaseOrder
+            po = PurchaseOrder.objects.filter(pk=po_id).select_related("party").first()
+            if po and po.party_id:
+                data["vendorId"] = str(po.party_id)
+        return super().to_internal_value(data)
     vendorId = TenantPrimaryKeyRelatedField(source="party", model="masters.Party")
     vendorName = serializers.CharField(source="party_name", read_only=True)
     vendorBillNumber = serializers.CharField(source="vendor_bill_number")
@@ -529,6 +554,15 @@ class VendorBillSerializer(BaseModelSerializer):
                 raise serializers.ValidationError(
                     {"vendorBillNumber": "A vendor bill with this number already exists."}
                 )
+
+        po = attrs.get("purchase_order", getattr(self.instance, "purchase_order", None))
+        if self.instance is None and not po:
+            raise serializers.ValidationError(
+                {"purchaseOrderId": "Purchase order selection is mandatory."}
+            )
+        if po and po.party:
+            attrs["party"] = po.party
+
         gst_pct = attrs.get("gst_pct", getattr(self.instance, "gst_pct", None))
         if gst_pct is not None and D(gst_pct) < ZERO:
             raise serializers.ValidationError(
@@ -539,6 +573,66 @@ class VendorBillSerializer(BaseModelSerializer):
             raise serializers.ValidationError(
                 {"lineItems": "Add at least one line."}
             )
+
+        if lines and po:
+            from apps.inventory.models import Batch
+            from apps.purchase.models import PurchaseBillLine
+            for line in lines:
+                qty = D(str(line.get("qty") or 0))
+                rate = D(str(line.get("rate") or 0))
+                if qty <= ZERO:
+                    raise serializers.ValidationError(
+                        {"lineItems": "Billed quantity must be greater than zero."}
+                    )
+                if rate < ZERO:
+                    raise serializers.ValidationError(
+                        {"lineItems": "Rate cannot be negative."}
+                    )
+                b_id = line.get("batchId") or line.get("batch")
+                b_num = line.get("batchNumber") or line.get("batchCode")
+                batch = None
+                if b_id:
+                    batch = Batch.objects.filter(pk=b_id, deleted_at__isnull=True).first()
+                elif b_num:
+                    batch = Batch.objects.filter(
+                        purchase_order=po, batch_code=b_num, deleted_at__isnull=True
+                    ).first()
+                if batch:
+                    if batch.purchase_order_id != po.id:
+                        raise serializers.ValidationError(
+                            {"lineItems": f"Batch {batch.batch_code} does not belong to the selected purchase order {po.po_number}."}
+                        )
+                    gl = batch.goods_receipt_line
+                    lot_no = gl.batch_number if gl else ""
+                    recv_qty = D(str(gl.received_qty)) if gl else D("0")
+                    pb_billed = D("0")
+                    for pbl in PurchaseBillLine.objects.filter(
+                        purchase_bill__purchase_order=po,
+                        purchase_bill__deleted_at__isnull=True
+                    ).exclude(purchase_bill__status="Cancelled"):
+                        if pbl.batch_number and (pbl.batch_number == batch.batch_code or pbl.batch_number == lot_no):
+                            pb_billed += D(str(pbl.qty or 0))
+                    vb_billed = D("0")
+                    other_vbs = VendorBillLine.objects.filter(
+                        vendor_bill__purchase_order=po,
+                        vendor_bill__deleted_at__isnull=True
+                    ).exclude(vendor_bill__status__in=["Cancelled", "Rejected"])
+                    if self.instance is not None:
+                        other_vbs = other_vbs.exclude(vendor_bill=self.instance)
+                    for ovb in other_vbs:
+                        if (ovb.batch_id and ovb.batch_id == batch.id) or (ovb.batch_number and (ovb.batch_number == batch.batch_code or ovb.batch_number == lot_no)):
+                            vb_billed += D(str(ovb.qty or 0))
+                    total_billed = pb_billed + vb_billed
+                    rem_billable = max(ZERO, recv_qty - total_billed)
+                    if rem_billable <= ZERO:
+                        raise serializers.ValidationError(
+                            {"lineItems": f"Batch {batch.batch_code} is already fully billed and cannot be re-billed."}
+                        )
+                    if qty > rem_billable + D("0.0001"):
+                        raise serializers.ValidationError(
+                            {"lineItems": f"Billed quantity for batch {batch.batch_code} ({qty}) cannot exceed remaining billable quantity ({rem_billable})."}
+                        )
+
         return attrs
 
     def to_representation(self, instance):
@@ -577,6 +671,14 @@ class VendorBillSerializer(BaseModelSerializer):
             line_serializer.is_valid(raise_exception=True)
             data = dict(line_serializer.validated_data)
             data.setdefault("line_no", index)
+            batch_obj = data.get("batch")
+            if batch_obj:
+                if not data.get("batch_number"):
+                    data["batch_number"] = batch_obj.batch_code
+                if not data.get("goods_receipt") and batch_obj.goods_receipt:
+                    data["goods_receipt"] = batch_obj.goods_receipt
+                if not data.get("item") and batch_obj.item:
+                    data["item"] = batch_obj.item
             line = VendorBillLine(
                 client_id=bill.client_id, vendor_bill=bill, **data
             )

@@ -3548,6 +3548,186 @@ class VendorBillViewSet(TenantModelViewSet):
 
 
 
+    
+    @action(detail=False, methods=["get"], url_path="po-details")
+    def po_details(self, request):
+        """Fetch PO summary, vendor details, and batch-wise billing metrics."""
+        po_id = request.query_params.get("poId") or request.query_params.get("po")
+        if not po_id:
+            raise ValidationFailed("poId query parameter is required.", field_errors={"poId": ["Required."]})
+
+        po = (
+            PurchaseOrder.objects.filter(pk=po_id, client_id=request.client_id, deleted_at__isnull=True)
+            .select_related("party")
+            .prefetch_related("line_items__item", "receipts__lines")
+            .first()
+        )
+        if not po:
+            raise NotFound("Purchase order not found.")
+
+        from apps.inventory.models import Batch
+        from apps.purchase.models import PurchaseBillLine, VendorBillLine
+        from decimal import Decimal
+
+        party = po.party
+        primary_contact = None
+        if party:
+            primary_contact = (
+                party.contacts.filter(is_primary=True, deleted_at__isnull=True).first()
+                or party.contacts.filter(deleted_at__isnull=True).first()
+            )
+
+        billing_addr = party.billing_address if party and isinstance(party.billing_address, dict) else (po.billing_address if isinstance(po.billing_address, dict) else {})
+        addr_parts = [billing_addr.get("line1"), billing_addr.get("line2"), billing_addr.get("city"), billing_addr.get("state"), billing_addr.get("pincode")]
+        formatted_address = ", ".join([str(p).strip() for p in addr_parts if p and str(p).strip()]) or "—"
+
+        gstin = (party.gstin if party else po.party_gstin) or ""
+        state = billing_addr.get("state") or (party.place_of_supply if party else po.place_of_supply) or "—"
+        state_code = gstin[:2] if gstin and len(gstin) >= 2 and gstin[:2].isdigit() else "—"
+
+        vendor_data = {
+            "vendorId": str(party.id) if party else None,
+            "vendorName": party.name if party else (po.party_name or "—"),
+            "vendorCode": (party.code if party and party.code else "—"),
+            "vendorGstin": gstin or "—",
+            "contactPerson": primary_contact.name if primary_contact else "—",
+            "phone": primary_contact.phone if (primary_contact and primary_contact.phone) else ((party.phone if party and party.phone else "—")),
+            "email": primary_contact.email if (primary_contact and primary_contact.email) else ((party.email if party and party.email else "—")),
+            "billingAddress": formatted_address,
+            "state": state,
+            "stateCode": state_code,
+            "paymentTerms": (party.payment_terms if party and party.payment_terms else po.payment_terms) or "—",
+        }
+
+        # PO Summary metrics
+        first_line = po.line_items.filter(deleted_at__isnull=True).first()
+        ordered_qty = sum([Decimal(str(l.qty or 0)) for l in po.line_items.filter(deleted_at__isnull=True)])
+        original_po_rate = Decimal(str(first_line.rate or 0)) if first_line else Decimal("0")
+        original_po_amount = Decimal(str(po.total or 0))
+        fabric_quality = "—"
+        if first_line:
+            if getattr(first_line, "fabric_quality", None):
+                fq_obj = first_line.fabric_quality
+                fabric_quality = getattr(fq_obj, "name", None) or str(fq_obj)
+            elif first_line.item:
+                fabric_quality = first_line.item.name or "—"
+
+        batches_qs = Batch.objects.filter(
+            purchase_order=po, deleted_at__isnull=True
+        ).select_related("goods_receipt", "goods_receipt_line", "item")
+
+        pb_lines = list(
+            PurchaseBillLine.objects.filter(
+                purchase_bill__purchase_order=po,
+                purchase_bill__deleted_at__isnull=True
+            ).exclude(purchase_bill__status="Cancelled").values("batch_number", "qty")
+        )
+        vb_lines = list(
+            VendorBillLine.objects.filter(
+                vendor_bill__purchase_order=po,
+                vendor_bill__deleted_at__isnull=True
+            ).exclude(vendor_bill__status__in=["Cancelled", "Rejected"]).values("batch_id", "batch_number", "qty")
+        )
+
+        total_received = Decimal("0")
+        total_billed = Decimal("0")
+        batch_list = []
+
+        for b in batches_qs:
+            gl = b.goods_receipt_line
+            grn = b.goods_receipt
+            recv_qty = Decimal(str(gl.received_qty)) if gl else Decimal("0")
+            lot_no = gl.batch_number if gl else ""
+
+            billed_qty = Decimal("0")
+            for pbl in pb_lines:
+                pbl_batch = pbl.get("batch_number")
+                if pbl_batch and (pbl_batch == b.batch_code or pbl_batch == lot_no):
+                    billed_qty += Decimal(str(pbl.get("qty") or 0))
+            for vbl in vb_lines:
+                vbl_id = str(vbl.get("batch_id") or "")
+                vbl_num = vbl.get("batch_number") or ""
+                if (vbl_id and vbl_id == str(b.id)) or (vbl_num and (vbl_num == b.batch_code or vbl_num == lot_no)):
+                    billed_qty += Decimal(str(vbl.get("qty") or 0))
+
+            rem_billable = max(Decimal("0"), recv_qty - billed_qty)
+            total_received += recv_qty
+            total_billed += billed_qty
+
+            po_rate = original_po_rate
+            if b.purchase_order_line and b.purchase_order_line.rate:
+                po_rate = Decimal(str(b.purchase_order_line.rate))
+            elif b.item_id:
+                matching_pol = po.line_items.filter(item_id=b.item_id, deleted_at__isnull=True).first()
+                if matching_pol and matching_pol.rate:
+                    po_rate = Decimal(str(matching_pol.rate))
+
+            batch_list.append({
+                "batchId": str(b.id),
+                "batchCode": b.batch_code,
+                "grnId": str(grn.id) if grn else None,
+                "grnNumber": grn.grn_number if grn else (b.source_document_number or "—"),
+                "receiptDate": str(grn.receipt_date) if (grn and grn.receipt_date) else str(b.created_on or ""),
+                "itemId": str(b.item_id) if b.item_id else (str(first_line.item_id) if first_line and first_line.item_id else None),
+                "itemName": b.item.name if b.item else (first_line.item_name if first_line else "—"),
+                "sku": b.item.sku if b.item else (first_line.sku if first_line else ""),
+                "uom": b.uom or (b.item.uom if b.item else "Meter"),
+                "receivedQty": float(recv_qty),
+                "previouslyBilledQty": float(billed_qty),
+                "remainingBillableQty": float(rem_billable),
+                "originalPoRate": float(po_rate),
+                "billRate": float(po_rate),
+                "billQty": float(rem_billable),
+                "isFullyBilled": rem_billable <= Decimal("0"),
+            })
+
+        if not batch_list:
+            for l in po.line_items.filter(deleted_at__isnull=True):
+                recv = Decimal(str(l.received_qty or 0))
+                billed = Decimal(str(l.billed_qty or 0))
+                rem = max(Decimal("0"), (recv if recv > 0 else Decimal(str(l.qty or 0))) - billed)
+                total_received += (recv if recv > 0 else Decimal(str(l.qty or 0)))
+                total_billed += billed
+                batch_list.append({
+                    "batchId": None,
+                    "batchCode": "PO Line",
+                    "grnId": None,
+                    "grnNumber": "Direct PO",
+                    "receiptDate": str(po.doc_date or ""),
+                    "itemId": str(l.item_id) if l.item_id else None,
+                    "itemName": l.item_name or (l.item.name if l.item else "—"),
+                    "sku": l.sku or (l.item.sku if l.item else ""),
+                    "uom": l.uom or "Meter",
+                    "receivedQty": float(recv if recv > 0 else l.qty),
+                    "previouslyBilledQty": float(billed),
+                    "remainingBillableQty": float(rem),
+                    "originalPoRate": float(l.rate or 0),
+                    "billRate": float(l.rate or 0),
+                    "billQty": float(rem),
+                    "isFullyBilled": rem <= Decimal("0"),
+                })
+
+        po_summary = {
+            "poId": str(po.id),
+            "poNumber": po.po_number,
+            "poDate": str(po.doc_date),
+            "vendorName": party.name if party else (po.party_name or "—"),
+            "fabricQuality": fabric_quality,
+            "orderedQty": float(ordered_qty),
+            "receivedQty": float(total_received),
+            "previouslyBilledQty": float(total_billed),
+            "remainingBillableQty": float(max(Decimal("0"), total_received - total_billed)),
+            "originalPoRate": float(original_po_rate),
+            "originalPoAmount": float(original_po_amount),
+            "defaultGstPct": 5.0,
+        }
+
+        return Response({
+            "vendor": vendor_data,
+            "poSummary": po_summary,
+            "batches": batch_list,
+        })
+
     def get_aggregates(self, queryset):
 
         return queryset.aggregate(
@@ -3685,6 +3865,7 @@ class VendorBillViewSet(TenantModelViewSet):
                     line_no=line.line_no,
 
                     item=line.item,
+                    batch_number=line.batch_number,
 
                     sku=line.sku or (line.item.sku if line.item else None),
 

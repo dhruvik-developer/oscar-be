@@ -1708,6 +1708,46 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
         )
         return Response(self.get_serializer(invoice).data)
 
+    @action(detail=True, methods=["post"], url_path="request-credit-override")
+    def request_credit_override(self, request, pk=None):
+        """Ask an Owner to let this Draft through the credit limit. The approval
+        handler (approval_handlers.on_credit_limit_override) finalizes it."""
+        from apps.core.approval_services import raise_approval
+
+        invoice = self.get_object()
+        reason = str(request.data.get("reason") or "").strip()
+        if not reason:
+            raise ValidationFailed(
+                "Enter a business reason for the credit-limit approval.",
+                field_errors={"reason": ["This field is required."]},
+            )
+        if invoice.status != "Draft" or invoice.posted_at is not None:
+            raise Conflict("Only a Draft invoice can be sent for credit-limit approval.")
+        if invoice.party_id is None:
+            raise Conflict("The invoice has no customer to check a credit limit for.")
+        snapshot = services.credit_limit_snapshot(invoice.party, invoice.total)
+        label = invoice.invoice_number or f"Draft {str(invoice.id)[:8]}"
+        req = raise_approval(
+            client_id=invoice.client_id,
+            document_type="credit_limit_exceeded",
+            document_id=invoice.id,
+            document_number=label,
+            requested_by=request.user,
+            reason=reason,
+            approver_role_code="OWNER",
+            new_values={**snapshot, "invoiceId": str(invoice.id)},
+            variance_amount=D(snapshot["excess"]),
+            urgency="High",
+        )
+        self.write_audit(
+            "request_credit_override", invoice,
+            description=f"Credit-limit approval requested: {reason}",
+        )
+        return Response(
+            {"approvalRequestId": str(req.id), "status": req.status, **snapshot},
+            status=status.HTTP_202_ACCEPTED,
+        )
+
     @action(detail=True, methods=["post"])
     def cancel(self, request, pk=None):
         serializer = ReasonSerializer(data=request.data)
