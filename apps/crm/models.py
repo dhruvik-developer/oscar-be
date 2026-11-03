@@ -185,6 +185,9 @@ class Lead(TenantModel, LegacyIdMixin):
     created_on = models.DateField(auto_now_add=True)
     #: Values captured by a dynamic form (db.md §9.1).
     custom_values = models.JSONField(default=dict, blank=True)
+    #: Created to exercise the system, not a real enquiry. Kept (never
+    #: deleted) but left out of the business registers and their totals.
+    is_test_data = models.BooleanField(default=False)
 
     class Meta:
         db_table = "crm_leads"

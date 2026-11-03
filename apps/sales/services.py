@@ -428,23 +428,40 @@ def fill_salesperson(document):
 
 
 def fill_broker(document):
-    """Default a sales document's broker when nobody picked one.
+    """Carry the broker already assigned upstream onto a sales document.
 
-    Takes the broker the CRM lead was attributed to (source "Broker"), else the
-    customer's default broker. Conversions copy ``broker_fk`` forward, so the
-    first document off the lead carries it down the pipeline. Never overwrites
-    a broker already on the document. Returns True when it set one.
+    Inherits from the order / quotation / challan the document came from, else
+    the broker the CRM lead was attributed to. Never invents one (no party
+    default) and never overwrites a broker already on the document. Returns
+    True when it set one.
     """
     if getattr(document, "broker_fk_id", None) or (getattr(document, "broker", None) or "").strip():
         return False
     from .broker_services import _broker_from_lead
     from .models import order_lead
 
-    lead = order_lead(document) or order_lead(getattr(document, "sales_order", None))
-    broker = (
-        _broker_from_lead(lead, (lead.custom_values or {}) if lead is not None else {})
-        or getattr(getattr(document, "party", None), "default_broker", None)
+    broker = next(
+        (
+            source.broker_fk
+            for source in (
+                getattr(document, "sales_order", None),
+                getattr(document, "quotation", None),
+                getattr(document, "delivery_challan", None),
+            )
+            if source is not None and getattr(source, "broker_fk_id", None)
+        ),
+        None,
     )
+    if broker is None:
+        lead = (
+            getattr(document, "crm_lead", None)
+            or (getattr(document, "crm_deal", None).lead if getattr(document, "crm_deal", None) else None)
+            or order_lead(document)
+            or order_lead(getattr(document, "sales_order", None))
+            or order_lead(getattr(document, "delivery_challan", None))
+        )
+        if lead is not None:
+            broker = _broker_from_lead(lead, lead.custom_values or {})
     if broker is None:
         return False
     document.broker_fk = broker
@@ -604,6 +621,7 @@ def finalize_invoice(invoice, *, user=None, override_credit_limit=False, auto_di
         _advance_order_stage(invoice.sales_order)
 
     # 6. Broker commission calculation (PDF §12)
+    fill_broker(invoice)
     from .broker_services import calculate_broker_commission
     calculate_broker_commission(invoice, user=user)
 

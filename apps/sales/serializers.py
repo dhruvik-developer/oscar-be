@@ -705,13 +705,21 @@ class BrokerCommissionSerializer(BaseModelSerializer):
     brokerCode = serializers.CharField(source="broker.code", read_only=True)
     partyName = serializers.CharField(source="party.name", read_only=True)
     invoiceNumber = serializers.CharField(source="invoice.invoice_number", read_only=True)
+    broker_name = serializers.CharField(source="broker.name", read_only=True)
+    broker_code = serializers.CharField(source="broker.code", read_only=True)
+    party_name = serializers.CharField(source="party.name", read_only=True)
+    invoice_number = serializers.CharField(source="invoice.invoice_number", read_only=True)
     leadNumber = serializers.SerializerMethodField()
     leadName = serializers.SerializerMethodField()
+    lead_number = serializers.SerializerMethodField()
+    lead_name = serializers.SerializerMethodField()
 
     def _lead(self, commission):
         from .models import order_lead
-
-        return order_lead(commission.invoice.sales_order)
+        inv = commission.invoice
+        if inv is None:
+            return None
+        return order_lead(inv.sales_order) or order_lead(inv.delivery_challan) or order_lead(inv)
 
     def get_leadNumber(self, commission):
         lead = self._lead(commission)
@@ -721,11 +729,19 @@ class BrokerCommissionSerializer(BaseModelSerializer):
         lead = self._lead(commission)
         return lead.company or lead.name if lead else None
 
+    def get_lead_number(self, commission):
+        return self.get_leadNumber(commission)
+
+    def get_lead_name(self, commission):
+        return self.get_leadName(commission)
+
     class Meta:
         model = BrokerCommission
         fields = [
             "id", "commission_number", "broker", "brokerName", "brokerCode",
-            "invoice", "invoiceNumber", "leadNumber", "leadName", "party", "partyName", "salesperson",
+            "broker_name", "broker_code", "party_name", "invoice_number",
+            "invoice", "invoiceNumber", "leadNumber", "leadName", "lead_number", "lead_name",
+            "party", "partyName", "salesperson",
             "invoice_date", "invoice_amount", "commission_basis", "commission_type",
             "rate", "commission_amount", "paid_amount", "status",
             "approved_by", "approved_at", "paid_at", "payment_reference",

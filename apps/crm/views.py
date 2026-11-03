@@ -1479,6 +1479,9 @@ class DealViewSet(TenantModelViewSet):
             request.user.client, "QT", quotation.doc_date
         )
         quotation.save()
+        from apps.sales import services as sales_services
+        sales_services.fill_salesperson(quotation)
+        sales_services.fill_broker(quotation)
 
         deal.quotation = quotation
         deal.save(update_fields=["quotation", "updated_at"])

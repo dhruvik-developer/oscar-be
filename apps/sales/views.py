@@ -233,6 +233,12 @@ def _clone_document(source, target_model, overrides, *, number_field, series,
         "broker", "broker_fk_id", "salesperson", "salesperson_fk_id",
     ]
     payload = {field: getattr(source, field) for field in copied_fields}
+    if hasattr(target_model, "crm_lead") and "crm_lead" not in overrides:
+        source_lead = getattr(source, "crm_lead", None) or (
+            getattr(source, "crm_deal", None).lead if getattr(source, "crm_deal", None) else None
+        )
+        if source_lead:
+            payload["crm_lead"] = source_lead
     payload["doc_date"] = timezone.localdate()
     payload.update(overrides)
 
@@ -870,6 +876,7 @@ class SalesOrderViewSet(SalesDocumentViewSet):
             )
             challan.challan_number = allocate_number(order.client, "DC", challan.doc_date)
             challan.save(update_fields=["challan_number", "updated_at"])
+            services.fill_broker(challan)
 
             source_lines = list(
                 order.line_items.filter(deleted_at__isnull=True).order_by("line_no")
@@ -922,11 +929,17 @@ class SalesOrderViewSet(SalesDocumentViewSet):
                 doc_date=data.get("date") or timezone.localdate(),
                 sales_order=order,
                 delivery_challan=challan,
+                broker=order.broker or (challan.broker if challan else None),
+                broker_fk=order.broker_fk or (challan.broker_fk if challan else None),
+                salesperson=order.salesperson or (challan.salesperson if challan else None),
+                salesperson_fk=order.salesperson_fk or (challan.salesperson_fk if challan else None),
                 status="Draft",
                 location_id=data.get("locationId"),
                 notes=data.get("notes") or order.notes,
                 created_by=request.user if getattr(request.user, "is_authenticated", False) else None,
             )
+            services.fill_salesperson(invoice)
+            services.fill_broker(invoice)
             source_lines = list(
                 order.line_items.filter(deleted_at__isnull=True).order_by("line_no")
             )
@@ -964,6 +977,7 @@ class SalesOrderViewSet(SalesDocumentViewSet):
                     ],
                 )
             services.recalculate_document(invoice)
+            services.fill_broker(invoice)
 
         # 3. Advance order stage
         if order.stage not in ("Invoiced", "Closed", "Cancelled"):
@@ -1126,6 +1140,7 @@ class SalesOrderViewSet(SalesDocumentViewSet):
                 created_by=self.request.user,
             )
         document.save()
+        services.fill_broker(document)
 
         line_model = DeliveryChallanLine if target == "challan" else SalesInvoiceLine
         line_fk = "delivery_challan" if target == "challan" else "sales_invoice"
@@ -1443,12 +1458,18 @@ class DeliveryChallanViewSet(SalesDocumentViewSet):
             doc_date=timezone.localdate(),
             sales_order=challan.sales_order,
             delivery_challan=challan,
+            broker=challan.broker or (challan.sales_order.broker if challan.sales_order else None),
+            broker_fk=challan.broker_fk or (challan.sales_order.broker_fk if challan.sales_order else None),
+            salesperson=challan.salesperson or (challan.sales_order.salesperson if challan.sales_order else None),
+            salesperson_fk=challan.salesperson_fk or (challan.sales_order.salesperson_fk if challan.sales_order else None),
             location=challan.location,
             status="Draft",
             freight_charges=challan.freight_charges,
             other_charges=challan.other_charges,
             created_by=request.user,
         )
+        services.fill_salesperson(invoice)
+        services.fill_broker(invoice)
         for index, line in enumerate(
             challan.line_items.filter(deleted_at__isnull=True).order_by("line_no"), start=1
         ):
@@ -1474,6 +1495,7 @@ class DeliveryChallanViewSet(SalesDocumentViewSet):
                 parent_sku=line.parent_sku,
             )
         services.recalculate_document(invoice)
+        services.fill_broker(invoice)
         return Response(
             SalesInvoiceSerializer(invoice, context=self.get_serializer_context()).data,
             status=status.HTTP_201_CREATED,
@@ -2546,9 +2568,22 @@ class BrokerCommissionViewSet(TenantModelViewSet):
     audit_label_field = "commission_number"
     filter_map = {
         "brokerId": "broker_id",
+        "broker_id": "broker_id",
         "invoiceId": "invoice_id",
+        "invoice_id": "invoice_id",
         "status": "status",
     }
+
+    def _include_test_data(self):
+        return self.request.query_params.get("includeTestData") in ("1", "true")
+
+    def get_queryset(self):
+        """Every register, statement and analytic reads this one set: live
+        commissions, test data left out unless ``includeTestData=1``."""
+        queryset = super().get_queryset()
+        if self.action not in ("retrieve", "pay", "approve", "make_payable") and not self._include_test_data():
+            queryset = queryset.filter(is_test_data=False)
+        return queryset
 
     def perform_update(self, serializer):
         """Status and amount move only through the actions below, and a new
@@ -2644,6 +2679,9 @@ class BrokerCommissionViewSet(TenantModelViewSet):
             client_id=client_id,
             deleted_at__isnull=True,
         ).select_related("stage", "source", "party", "owner", "lost_reason").order_by("-is_pinned", "-created_at")
+        if not self._include_test_data():
+            leads_qs = leads_qs.filter(is_test_data=False)
+        commission_set = self.get_queryset()
 
         broker_id_filter = request.query_params.get("brokerId") or request.query_params.get("broker_id")
         status_filter = request.query_params.get("status")
@@ -2652,7 +2690,8 @@ class BrokerCommissionViewSet(TenantModelViewSet):
         results = []
         for lead in leads_qs:
             cv = lead.custom_values or {}
-            lead_broker_id = cv.get("broker_id") or cv.get("brokerId")
+            fields = cv.get("fields") if isinstance(cv, dict) and isinstance(cv.get("fields"), dict) else {}
+            lead_broker_id = cv.get("broker_id") or cv.get("brokerId") or fields.get("broker_id") or fields.get("brokerId")
             source_name = (lead.source.name if lead.source else "") or ""
             is_broker_lead = bool(lead_broker_id or cv.get("broker_name") or cv.get("brokerName") or source_name.lower() == "broker")
             if not is_broker_lead:
@@ -2686,7 +2725,10 @@ class BrokerCommissionViewSet(TenantModelViewSet):
 
             # Check linked quotations, orders, invoices
             linked_quotations = []
-            for q in Quotation.objects.filter(client_id=client_id, crm_lead=lead).only("id", "quotation_number", "doc_date", "total", "status"):
+            quote_qs = Quotation.objects.filter(client_id=client_id).filter(
+                Q(crm_lead=lead) | Q(crm_deal__lead=lead)
+            ).only("id", "quotation_number", "doc_date", "total", "status")
+            for q in quote_qs:
                 linked_quotations.append({
                     "id": str(q.id),
                     "number": q.quotation_number,
@@ -2697,7 +2739,9 @@ class BrokerCommissionViewSet(TenantModelViewSet):
 
             linked_orders = []
             q_ids = [q["id"] for q in linked_quotations]
-            for so in SalesOrder.objects.filter(client_id=client_id, quotation_id__in=q_ids).only("id", "order_number", "doc_date", "total", "stage"):
+            for so in SalesOrder.objects.filter(
+                Q(quotation_id__in=q_ids) | Q(crm_lead=lead), client_id=client_id, deleted_at__isnull=True,
+            ).only("id", "order_number", "doc_date", "total", "stage"):
                 linked_orders.append({
                     "id": str(so.id),
                     "number": so.order_number,
@@ -2708,7 +2752,9 @@ class BrokerCommissionViewSet(TenantModelViewSet):
 
             linked_invoices = []
             so_ids = [so["id"] for so in linked_orders]
-            for inv in SalesInvoice.objects.filter(client_id=client_id, sales_order_id__in=so_ids).only("id", "invoice_number", "doc_date", "total", "status"):
+            for inv in SalesInvoice.objects.filter(
+                client_id=client_id, sales_order_id__in=so_ids, deleted_at__isnull=True,
+            ).only("id", "invoice_number", "doc_date", "total", "status"):
                 linked_invoices.append({
                     "id": str(inv.id),
                     "number": inv.invoice_number,
@@ -2719,7 +2765,7 @@ class BrokerCommissionViewSet(TenantModelViewSet):
 
             # Check linked commission
             inv_ids = [inv["id"] for inv in linked_invoices]
-            linked_commissions = BrokerCommission.objects.filter(client_id=client_id, invoice_id__in=inv_ids)
+            linked_commissions = commission_set.filter(invoice_id__in=inv_ids)
             total_comm_earned = ZERO
             total_comm_paid = ZERO
             comm_status = "Unearned (In Pipeline)"
@@ -2775,9 +2821,11 @@ class BrokerCommissionViewSet(TenantModelViewSet):
 
         client_id = self.get_client_id()
         brokers = Broker.objects.filter(client_id=client_id, deleted_at__isnull=True)
-        commissions = BrokerCommission.objects.filter(client_id=client_id)
+        commissions = self.get_queryset()
 
         all_leads = Lead.objects.filter(client_id=client_id, deleted_at__isnull=True).select_related("stage", "source")
+        if not self._include_test_data():
+            all_leads = all_leads.filter(is_test_data=False)
         broker_leads = []
         for l in all_leads:
             cv = l.custom_values or {}

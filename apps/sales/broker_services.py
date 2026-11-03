@@ -11,7 +11,7 @@ Tracks broker commissions linked to sales invoices:
 from decimal import Decimal, InvalidOperation
 
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import F, Q, Sum
 from django.utils import timezone
 
@@ -23,41 +23,61 @@ from apps.core.money import ZERO, D, round2, round4
 from apps.core.numbering import allocate_number
 from apps.core.permissions import has_permission
 from apps.masters.models import Broker
-from apps.sales.models import BrokerCommission, order_lead
+from apps.sales.models import BrokerCommission, SalesInvoice, order_lead
 
 
 @transaction.atomic
 def calculate_broker_commission(invoice, *, user=None, rate_override=None, commission_type_override=None):
     """Calculate and accrue broker commission on a finalized sales invoice."""
     so = invoice.sales_order
-    lead = order_lead(so)
+    dc = invoice.delivery_challan
+    lead = order_lead(so) or order_lead(dc) or order_lead(invoice)
     if lead is not None and lead.stage and lead.stage.is_lost:
         return None
 
     cvals = (lead.custom_values or {}) if lead is not None else {}
-    broker = _broker_from_lead(lead, cvals) or invoice.broker_fk
+    broker = invoice.broker_fk or _broker_from_lead(lead, cvals)
     if broker is None and invoice.broker:
         broker = Broker.objects.filter(
             client_id=invoice.client_id, name__iexact=invoice.broker, deleted_at__isnull=True
         ).first()
 
-    # If still not found, check linked sales order / quotation / lead / party default
+    # If still not found, check linked sales order / quotation / challan / party default
     if broker is None and so and so.broker_fk:
         broker = so.broker_fk
     if broker is None and so and so.quotation and so.quotation.broker_fk:
         broker = so.quotation.broker_fk
+    if broker is None and dc and dc.broker_fk:
+        broker = dc.broker_fk
     if broker is None and invoice.party and getattr(invoice.party, "default_broker", None):
         broker = invoice.party.default_broker
 
     if broker is None:
         return None
 
+    # Ensure invoice has the broker linked
+    if invoice.broker_fk_id is None:
+        invoice.broker_fk = broker
+        invoice.broker = broker.name
+        invoice.save(update_fields=["broker_fk", "broker", "updated_at"])
+
     # Determine agreed terms from deal / lead if available
-    agreed_type = cvals.get("commission_basis") or cvals.get("commission_type")
+    fields = cvals.get("fields") if isinstance(cvals, dict) and isinstance(cvals.get("fields"), dict) else {}
+    agreed_type = (
+        cvals.get("commission_basis")
+        or cvals.get("commission_type")
+        or fields.get("commission_basis")
+        or fields.get("commission_type")
+    )
     agreed_rate = None
-    if cvals.get("commission_rate") is not None:
+    rate_raw = (
+        cvals.get("commission_rate")
+        if cvals.get("commission_rate") is not None
+        else fields.get("commission_rate")
+    )
+    if rate_raw is not None and str(rate_raw).strip() != "":
         try:
-            agreed_rate = D(str(cvals["commission_rate"]))
+            agreed_rate = D(str(rate_raw))
         except (InvalidOperation, TypeError, ValueError):
             agreed_rate = None
 
@@ -72,31 +92,58 @@ def calculate_broker_commission(invoice, *, user=None, rate_override=None, commi
     taxable_val = D(invoice.taxable_value or invoice.total or 0)
     amount = collection_commission_amount(invoice, comm_type, rate)
 
-    comm_no = allocate_number(invoice.client_id, "BRK-COMM")
-    commission, created = BrokerCommission.objects.update_or_create(
-        client_id=invoice.client_id,
-        invoice=invoice,
-        broker=broker,
-        defaults={
-            "commission_number": comm_no,
-            "party": invoice.party,
-            "salesperson": invoice.salesperson_fk,
-            "invoice_date": invoice.doc_date,
-            "invoice_amount": taxable_val,
-            "commission_basis": "QUANTITY" if comm_type in ("per_meter", "per_taka") else "INVOICE",
-            "commission_type": comm_type,
-            "rate": rate,
-            "commission_amount": amount,
-            "status": "Accrued" if amount > ZERO else "Awaiting Collection",
-        },
-    )
+    # One commission per invoice and broker. Re-running (a retried finalize, a
+    # repeated request) must not add a row, burn a new number or reset what
+    # has been approved or paid: bring the existing row up to date instead.
+    # The invoice row lock serialises concurrent callers; the unique index
+    # uq_broker_commission_invoice is the backstop if one slips past it.
+    SalesInvoice.objects.select_for_update(of=("self",)).filter(pk=invoice.pk).first()
+    existing = _live_commission(invoice, broker)
+    if existing is not None:
+        sync_broker_commissions_for_invoice(invoice, user=user)
+        existing.refresh_from_db()
+        return existing
+
+    try:
+        with transaction.atomic():
+            commission = BrokerCommission.objects.create(
+                client_id=invoice.client_id,
+                invoice=invoice,
+                broker=broker,
+                commission_number=allocate_number(invoice.client_id, "BRK-COMM"),
+                party=invoice.party,
+                salesperson=invoice.salesperson_fk,
+                invoice_date=invoice.doc_date,
+                invoice_amount=taxable_val,
+                commission_basis="QUANTITY" if comm_type in ("per_meter", "per_taka") else "INVOICE",
+                commission_type=comm_type,
+                rate=rate,
+                commission_amount=amount,
+                status="Accrued" if amount > ZERO else "Awaiting Collection",
+                is_test_data=bool(lead is not None and lead.is_test_data),
+            )
+    except IntegrityError:
+        return _live_commission(invoice, broker)
     return commission
 
 
-def _broker_from_lead(lead, custom_values):
+def _live_commission(invoice, broker):
+    return BrokerCommission.objects.filter(
+        client_id=invoice.client_id, invoice=invoice, broker=broker, deleted_at__isnull=True
+    ).first()
+
+
+def _broker_from_lead(lead, custom_values=None):
     if lead is None:
         return None
-    broker_id = custom_values.get("broker_id") or custom_values.get("brokerId")
+    cv = custom_values or lead.custom_values or {}
+    fields = cv.get("fields") if isinstance(cv, dict) and isinstance(cv.get("fields"), dict) else {}
+    broker_id = (
+        cv.get("broker_id")
+        or cv.get("brokerId")
+        or fields.get("broker_id")
+        or fields.get("brokerId")
+    )
     if broker_id:
         try:
             broker = Broker.objects.filter(
@@ -106,10 +153,15 @@ def _broker_from_lead(lead, custom_values):
             broker = None
         if broker is not None:
             return broker
-    broker_name = custom_values.get("broker_name") or custom_values.get("brokerName")
+    broker_name = (
+        cv.get("broker_name")
+        or cv.get("brokerName")
+        or fields.get("broker_name")
+        or fields.get("brokerName")
+    )
     if broker_name:
         return Broker.objects.filter(
-            client_id=lead.client_id, name__iexact=broker_name, deleted_at__isnull=True
+            client_id=lead.client_id, name__iexact=str(broker_name).strip(), deleted_at__isnull=True
         ).first()
     return None
 
@@ -137,6 +189,18 @@ def commission_amount(invoice, comm_type, rate):
     return round2(rate)  # fixed
 
 
+def paid_out_status(commission):
+    """Status of a commission something has been paid on.
+
+    ``commission_amount`` is only what has been earned so far (it follows the
+    customer's collections), so paying it all is not the end: ``Paid`` needs
+    the brokerage on the whole invoice to have been paid out.
+    """
+    paid = D(commission.paid_amount or ZERO)
+    full = commission_amount(commission.invoice, commission.commission_type, commission.rate)
+    return "Paid" if paid >= max(full, D(commission.commission_amount or ZERO)) else "Partially Paid"
+
+
 def collection_commission_amount(invoice, comm_type, rate):
     """Commission earned so far, proportional to customer cash received."""
     invoice_total = D(invoice.total or ZERO)
@@ -162,6 +226,12 @@ def sync_broker_commissions_for_invoice(invoice, *, user=None):
     commissions = BrokerCommission.objects.select_for_update().filter(
         client_id=invoice.client_id, invoice=invoice, deleted_at__isnull=True
     )
+    if not commissions.exists():
+        new_comm = calculate_broker_commission(invoice, user=user)
+        if new_comm is not None:
+            commissions = BrokerCommission.objects.select_for_update().filter(pk=new_comm.pk)
+        else:
+            return BrokerCommission.objects.none()
     for commission in commissions:
         if commission.status == "Cancelled":
             continue
@@ -185,11 +255,13 @@ def sync_broker_commissions_for_invoice(invoice, *, user=None):
             commission.status = "Awaiting Collection"
             update_fields.append("status")
         elif commission.status == "Payable" and D(commission.paid_amount) >= earned:
-            commission.status = "Paid" if D(commission.paid_amount) > ZERO else "Approved"
+            commission.status = (
+                paid_out_status(commission) if D(commission.paid_amount) > ZERO else "Approved"
+            )
             update_fields.append("status")
         elif commission.status in ("Paid", "Partially Paid"):
             commission.status = (
-                "Paid" if D(commission.paid_amount) >= earned
+                paid_out_status(commission) if D(commission.paid_amount) >= earned
                 else "Payable" if commission.approved_at else "Accrued"
             )
             update_fields.append("status")
@@ -421,6 +493,49 @@ def make_broker_payable(commission, *, user=None):
     return commission
 
 
+def _resolve_bank_account(bank_account, client_id):
+    """Safely resolve bank_account from a BankAccount instance, UUID, string name/account_number, or fallback."""
+    from apps.accounting.models import BankAccount
+    import uuid
+    from django.core.exceptions import ValidationError as DjangoValidationError
+
+    if bank_account is None:
+        return BankAccount.objects.filter(client_id=client_id, is_active=True).first()
+    if hasattr(bank_account, "account_id"):
+        return bank_account
+
+    if isinstance(bank_account, uuid.UUID):
+        return BankAccount.objects.filter(pk=bank_account, client_id=client_id).first()
+
+    clean_val = str(bank_account).strip()
+    if not clean_val:
+        return BankAccount.objects.filter(client_id=client_id, is_active=True).first()
+
+    # 1. Try as UUID
+    try:
+        uuid_obj = uuid.UUID(clean_val)
+        found = BankAccount.objects.filter(pk=uuid_obj, client_id=client_id).first()
+        if found:
+            return found
+    except (ValueError, TypeError, DjangoValidationError):
+        pass
+
+    # 2. Try match by name, bank_name, or account_number
+    found = BankAccount.objects.filter(
+        client_id=client_id,
+        is_active=True,
+    ).filter(
+        Q(name__icontains=clean_val)
+        | Q(account_number__icontains=clean_val)
+        | Q(bank_name__icontains=clean_val)
+    ).first()
+    if found:
+        return found
+
+    # 3. Fallback to any active bank account for this tenant
+    return BankAccount.objects.filter(client_id=client_id, is_active=True).first()
+
+
 @transaction.atomic
 def pay_broker_commission(commission, amount=None, *, payment_ref=None, payment_method=None, bank_account=None, user=None, remarks=None):
     """Record broker payment and post Dr Brokerage Payable / Cr Bank."""
@@ -447,25 +562,26 @@ def pay_broker_commission(commission, amount=None, *, payment_ref=None, payment_
 
     # Post the payout; a failure rolls the whole payment back rather than
     # marking it Paid with nothing in the books.
-    if bank_account is not None and not hasattr(bank_account, "account_id"):
-        from apps.accounting.models import BankAccount
-        bank_account = BankAccount.objects.filter(pk=bank_account, client_id=commission.client_id).first()
+    bank_account_obj = _resolve_bank_account(bank_account, commission.client_id)
     credit_account = (
-        bank_account.account if bank_account is not None and getattr(bank_account, "account_id", None)
+        bank_account_obj.account
+        if bank_account_obj is not None and getattr(bank_account_obj, "account_id", None)
         else ledger.system_account(commission.client_id, "bank")
     )
+    broker_title = commission.broker.name if commission.broker else "Broker"
+    inv_title = commission.invoice.invoice_number if commission.invoice else (commission.commission_number or "")
     entry = ledger.post_entry(
         client=commission.client_id,
         postings=[
             ledger.debit(
                 ledger.system_account(commission.client_id, "brokerage_payable"),
                 pay_amount,
-                description=f"Brokerage payout to {commission.broker.name} ({payment_method or 'Bank Transfer'})",
+                description=f"Brokerage payout to {broker_title} ({payment_method or 'Bank Transfer'})",
             ),
             ledger.credit(
                 credit_account,
                 pay_amount,
-                description=f"Brokerage payout for invoice {commission.invoice.invoice_number}",
+                description=f"Brokerage payout for invoice {inv_title}",
             ),
         ],
         narration=f"Broker payment {commission.commission_number or commission.id}: {remarks or ''}",
@@ -477,10 +593,7 @@ def pay_broker_commission(commission, amount=None, *, payment_ref=None, payment_
 
     new_total_paid = round2(D(commission.paid_amount) + pay_amount)
     commission.paid_amount = new_total_paid
-    if new_total_paid >= D(commission.commission_amount):
-        commission.status = "Paid"
-    else:
-        commission.status = "Partially Paid"
+    commission.status = paid_out_status(commission)
     commission.paid_at = timezone.now()
     if payment_ref:
         commission.payment_reference = payment_ref
