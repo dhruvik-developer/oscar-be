@@ -27,7 +27,7 @@ from apps.accounts.authentication import build_tokens
 from apps.accounts.models import Client, User
 from apps.core.money import AGEING_BUCKETS, ageing_bucket
 from apps.inventory import services as stock
-from apps.masters.models import Item, Location, Party
+from apps.masters.models import Broker, Item, Location, Party
 
 from .models import (
     NON_RESERVING_STAGES,
@@ -111,6 +111,85 @@ class Phase1Base(TestCase):
 
 
 class CogsPostingTests(Phase1Base):
+    def test_sales_order_broker_is_persisted_and_returned_after_refresh_and_update(self):
+        first_broker = Broker.objects.create(
+            client=self.tenant, code="BRK-SO-01", name="First Sales Broker"
+        )
+        second_broker = Broker.objects.create(
+            client=self.tenant, code="BRK-SO-02", name="Second Sales Broker"
+        )
+        response = self.post("/sales/orders/", {
+            "partyId": str(self.customer.id),
+            "date": str(timezone.localdate()),
+            "brokerId": str(first_broker.id),
+            "lineItems": [
+                {"itemId": str(self.fabric.id), "qty": 1, "rate": 100, "tax": 0},
+            ],
+        })
+
+        self.assertEqual(response.status_code, 201, response.content[:600])
+        order_data = response.json()
+        order = SalesOrder.objects.get(pk=order_data["id"])
+        self.assertEqual(order.broker_fk_id, first_broker.id)
+        self.assertEqual(order_data["brokerId"], str(first_broker.id))
+        self.assertEqual(order_data["brokerName"], first_broker.name)
+        self.assertEqual(order_data["brokerCode"], first_broker.code)
+
+        refreshed = self.api.get(f"/api/v1/sales/orders/{order.id}/")
+        self.assertEqual(refreshed.status_code, 200, refreshed.content[:600])
+        self.assertEqual(refreshed.json()["brokerName"], first_broker.name)
+        self.assertEqual(refreshed.json()["brokerCode"], first_broker.code)
+
+        changed = self.api.patch(
+            f"/api/v1/sales/orders/{order.id}/",
+            {"brokerId": str(second_broker.id)},
+            format="json",
+        )
+        self.assertEqual(changed.status_code, 200, changed.content[:600])
+        order.refresh_from_db()
+        self.assertEqual(order.broker_fk_id, second_broker.id)
+        self.assertEqual(changed.json()["brokerName"], second_broker.name)
+        self.assertEqual(changed.json()["brokerCode"], second_broker.code)
+
+    def test_sales_order_without_broker_returns_empty_broker_fields(self):
+        order_data = self.order()
+
+        self.assertIsNone(order_data["brokerId"])
+        self.assertIsNone(order_data["brokerName"])
+        self.assertIsNone(order_data["brokerCode"])
+
+    def test_existing_sales_order_broker_is_returned_from_master(self):
+        broker = Broker.objects.create(
+            client=self.tenant, code="BRK-SO-EXISTING", name="Existing Sales Broker"
+        )
+        order = SalesOrder.objects.create(
+            client=self.tenant,
+            party=self.customer,
+            doc_date=timezone.localdate(),
+            broker_fk=broker,
+            broker=broker.name,
+        )
+
+        response = self.api.get(f"/api/v1/sales/orders/{order.id}/")
+
+        self.assertEqual(response.status_code, 200, response.content[:600])
+        self.assertEqual(response.json()["brokerId"], str(broker.id))
+        self.assertEqual(response.json()["brokerName"], broker.name)
+        self.assertEqual(response.json()["brokerCode"], broker.code)
+
+    def test_sales_order_rejects_zero_unit_rate(self):
+        response = self.post("/sales/orders/", {
+            "partyId": str(self.customer.id),
+            "date": str(timezone.localdate()),
+            "lineItems": [
+                {"itemId": str(self.fabric.id), "qty": 1, "rate": 0, "tax": 0},
+            ],
+        })
+
+        self.assertEqual(response.status_code, 400, response.content[:600])
+        self.assertIn("Unit rate must be greater than zero", str(response.json()))
+        self.assertFalse(SalesOrder.objects.filter(client=self.tenant).exists())
+
     def test_direct_invoice_posts_cogs_at_weighted_average_cost(self):
         created = self.post("/sales/invoices/", {
             "partyId": str(self.customer.id),
@@ -375,6 +454,67 @@ class ConvertToInvoiceTests(Phase1Base):
         self.assertEqual(repeated_after_finalize.status_code, 200, repeated_after_finalize.content[:400])
         self.assertEqual(repeated_after_finalize.json()["id"], first.json()["id"])
 
+    def test_pod_confirmation_persists_delivery_status(self):
+        order = self.order(qty=10)
+        challan_id = self.dispatch(order["id"])
+
+        confirmed = self.post(f"/sales/challans/{challan_id}/confirm-pod/")
+        self.assertEqual(confirmed.status_code, 200, confirmed.content[:600])
+        self.assertEqual(confirmed.json()["status"], "Delivered")
+        self.assertIsNotNone(confirmed.json()["delivered_at"])
+
+        challan = DeliveryChallan.objects.get(pk=challan_id)
+        self.assertEqual(challan.status, "Delivered")
+        self.assertIsNotNone(challan.delivered_at)
+
+        repeated = self.post(f"/sales/challans/{challan_id}/confirm-pod/")
+        self.assertEqual(repeated.status_code, 200, repeated.content[:600])
+        self.assertEqual(repeated.json()["status"], "Delivered")
+
+    def test_one_active_challan_per_sales_order(self):
+        order = self.order(qty=10)
+        line_id = order["lineItems"][0]["id"]
+        first_challan_id = self.dispatch(
+            order["id"], lines=[{"lineId": line_id, "qty": 4}]
+        )
+
+        duplicate = self.post(
+            f"/sales/orders/{order['id']}/convert-to-challan/",
+            {"lines": [{"lineId": line_id, "qty": 6}]},
+        )
+        self.assertEqual(duplicate.status_code, 409, duplicate.content[:600])
+        self.assertEqual(
+            DeliveryChallan.objects.filter(sales_order_id=order["id"])
+            .exclude(status__in=["Delivered", "Cancelled"])
+            .count(),
+            1,
+        )
+        direct_duplicate = self.api.post(
+            "/api/v1/sales/challans/",
+            {
+                "partyId": str(self.customer.id),
+                "salesOrder": order["id"],
+                "date": str(timezone.localdate()),
+                "lineItems": [{
+                    "itemId": str(self.fabric.id),
+                    "qty": 6,
+                    "rate": 100,
+                    "tax": 0,
+                }],
+            },
+            format="json",
+        )
+        self.assertEqual(direct_duplicate.status_code, 409, direct_duplicate.content[:600])
+
+        pod = self.post(f"/sales/challans/{first_challan_id}/confirm-pod/")
+        self.assertEqual(pod.status_code, 200, pod.content[:600])
+        next_challan = self.post(f"/sales/orders/{order['id']}/convert-to-challan/")
+        self.assertEqual(next_challan.status_code, 201, next_challan.content[:600])
+        self.assertEqual(
+            Decimal(str(next_challan.json()["lineItems"][0]["qty"])),
+            Decimal("6"),
+        )
+
 
     def test_draft_invoice_from_order_challan_is_reused_and_waits_for_dispatch(self):
         order = self.order(qty=5)
@@ -536,6 +676,8 @@ class ConvertToInvoiceTests(Phase1Base):
             f"/sales/invoices/{first_invoice.json()['id']}/finalize/"
         )
         self.assertEqual(finalized.status_code, 200, finalized.content[:600])
+        pod = self.post(f"/sales/challans/{first_challan_id}/confirm-pod/")
+        self.assertEqual(pod.status_code, 200, pod.content[:600])
 
         second_challan = self.post(
             f"/sales/orders/{order['id']}/convert-to-challan/"

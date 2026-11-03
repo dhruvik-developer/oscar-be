@@ -2,36 +2,46 @@
 Broker commission services (PDF §12).
 
 Tracks broker commissions linked to sales invoices:
-- Status lifecycle: Accrued -> Approved -> Payable -> Partially Paid -> Paid / Hold / Cancelled.
+- Status lifecycle: Awaiting Collection -> Accrued -> Approved -> Payable -> Partially Paid -> Paid.
+- Customer collections earn commission proportionally; lost broker leads earn none.
 - Support commission types: percent (of taxable invoice value), per_meter (on dispatched meters), per_taka (on dispatched takas), fixed.
 - Broker payment posting: Dr Brokerage Payable / Cr Bank.
 - Automatic reversal on Sales Return / Claim.
 """
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
-from django.db.models import F, Sum
+from django.db.models import F, Q, Sum
 from django.utils import timezone
 
+from apps.accounts.models import User
+from apps.core.audit import notify
 from apps.accounting import services as ledger
 from apps.core.exceptions import BusinessRuleViolation, Codes, Conflict, NotFound, ValidationFailed
 from apps.core.money import ZERO, D, round2, round4
 from apps.core.numbering import allocate_number
+from apps.core.permissions import has_permission
 from apps.masters.models import Broker
-from apps.sales.models import BrokerCommission
+from apps.sales.models import BrokerCommission, order_lead
 
 
 @transaction.atomic
 def calculate_broker_commission(invoice, *, user=None, rate_override=None, commission_type_override=None):
     """Calculate and accrue broker commission on a finalized sales invoice."""
-    broker = invoice.broker_fk
+    so = invoice.sales_order
+    lead = order_lead(so)
+    if lead is not None and lead.stage and lead.stage.is_lost:
+        return None
+
+    cvals = (lead.custom_values or {}) if lead is not None else {}
+    broker = _broker_from_lead(lead, cvals) or invoice.broker_fk
     if broker is None and invoice.broker:
         broker = Broker.objects.filter(
             client_id=invoice.client_id, name__iexact=invoice.broker, deleted_at__isnull=True
         ).first()
 
     # If still not found, check linked sales order / quotation / lead / party default
-    so = invoice.sales_order
     if broker is None and so and so.broker_fk:
         broker = so.broker_fk
     if broker is None and so and so.quotation and so.quotation.broker_fk:
@@ -43,26 +53,24 @@ def calculate_broker_commission(invoice, *, user=None, rate_override=None, commi
         return None
 
     # Determine agreed terms from deal / lead if available
-    agreed_type = None
+    agreed_type = cvals.get("commission_basis") or cvals.get("commission_type")
     agreed_rate = None
-    from .models import order_lead
-
-    if order_lead(so) is not None:
-        lead = order_lead(so)
-        cvals = lead.custom_values or {}
-        agreed_type = cvals.get("commission_basis") or cvals.get("commission_type")
-        if cvals.get("commission_rate") is not None:
-            try:
-                agreed_rate = D(str(cvals.get("commission_rate")))
-            except Exception:
-                pass
+    if cvals.get("commission_rate") is not None:
+        try:
+            agreed_rate = D(str(cvals["commission_rate"]))
+        except (InvalidOperation, TypeError, ValueError):
+            agreed_rate = None
 
     comm_type = commission_type_override or agreed_type or broker.commission_type or "percent"
-    rate = D(rate_override if rate_override is not None else (agreed_rate if agreed_rate is not None else broker.default_value or 0))
+    rate = D(
+        rate_override
+        if rate_override is not None
+        else (agreed_rate if agreed_rate is not None else broker.default_value or 0)
+    )
 
     # Basis: exclude GST (use taxable_value)
     taxable_val = D(invoice.taxable_value or invoice.total or 0)
-    amount = commission_amount(invoice, comm_type, rate)
+    amount = collection_commission_amount(invoice, comm_type, rate)
 
     comm_no = allocate_number(invoice.client_id, "BRK-COMM")
     commission, created = BrokerCommission.objects.update_or_create(
@@ -79,10 +87,31 @@ def calculate_broker_commission(invoice, *, user=None, rate_override=None, commi
             "commission_type": comm_type,
             "rate": rate,
             "commission_amount": amount,
-            "status": "Accrued",
+            "status": "Accrued" if amount > ZERO else "Awaiting Collection",
         },
     )
     return commission
+
+
+def _broker_from_lead(lead, custom_values):
+    if lead is None:
+        return None
+    broker_id = custom_values.get("broker_id") or custom_values.get("brokerId")
+    if broker_id:
+        try:
+            broker = Broker.objects.filter(
+                pk=broker_id, client_id=lead.client_id, deleted_at__isnull=True
+            ).first()
+        except (DjangoValidationError, TypeError, ValueError):
+            broker = None
+        if broker is not None:
+            return broker
+    broker_name = custom_values.get("broker_name") or custom_values.get("brokerName")
+    if broker_name:
+        return Broker.objects.filter(
+            client_id=lead.client_id, name__iexact=broker_name, deleted_at__isnull=True
+        ).first()
+    return None
 
 
 def commission_amount(invoice, comm_type, rate):
@@ -106,6 +135,122 @@ def commission_amount(invoice, comm_type, rate):
                 takas_count += 1
         return round2(D(max(1, takas_count)) * rate)
     return round2(rate)  # fixed
+
+
+def collection_commission_amount(invoice, comm_type, rate):
+    """Commission earned so far, proportional to customer cash received."""
+    invoice_total = D(invoice.total or ZERO)
+    if invoice_total <= ZERO:
+        return ZERO
+    collected = min(max(D(invoice.amount_paid or ZERO), ZERO), invoice_total)
+    return round2(commission_amount(invoice, comm_type, rate) * collected / invoice_total)
+
+
+@transaction.atomic
+def sync_broker_commissions_for_invoice(invoice, *, user=None):
+    """Reconcile invoice commissions after customer allocations change."""
+    from apps.sales.models import SalesInvoice
+
+    # Lock only the invoice row: Postgres refuses FOR UPDATE on the nullable
+    # side of the outer joins select_related builds for order/lead.
+    invoice = SalesInvoice.objects.select_for_update(of=("self",)).select_related(
+        "sales_order__crm_lead__stage",
+        "sales_order__quotation__crm_lead__stage",
+    ).get(pk=invoice.pk)
+    lead = order_lead(invoice.sales_order)
+    lost = bool(lead is not None and lead.stage and lead.stage.is_lost)
+    commissions = BrokerCommission.objects.select_for_update().filter(
+        client_id=invoice.client_id, invoice=invoice, deleted_at__isnull=True
+    )
+    for commission in commissions:
+        if commission.status == "Cancelled":
+            continue
+        old_amount = D(commission.commission_amount)
+        earned = ZERO if lost else collection_commission_amount(
+            invoice, commission.commission_type, commission.rate
+        )
+        earned = max(earned, D(commission.paid_amount or ZERO))
+        update_fields = ["commission_amount", "updated_at"]
+        commission.commission_amount = round2(earned)
+
+        if lost:
+            if commission.status != "Cancelled":
+                commission.status = "Cancelled"
+                commission.notes = (commission.notes or "") + " [Cancelled: broker lead marked lost]"
+                update_fields.extend(["status", "notes"])
+        elif commission.status == "Awaiting Collection" and earned > ZERO:
+            commission.status = "Accrued"
+            update_fields.append("status")
+        elif commission.status == "Accrued" and earned <= ZERO:
+            commission.status = "Awaiting Collection"
+            update_fields.append("status")
+        elif commission.status == "Payable" and D(commission.paid_amount) >= earned:
+            commission.status = "Paid" if D(commission.paid_amount) > ZERO else "Approved"
+            update_fields.append("status")
+        elif commission.status in ("Paid", "Partially Paid"):
+            commission.status = (
+                "Paid" if D(commission.paid_amount) >= earned
+                else "Payable" if commission.approved_at else "Accrued"
+            )
+            update_fields.append("status")
+
+        commission.save(update_fields=update_fields)
+        if commission.status in ("Approved", "Payable", "Partially Paid", "Cancelled"):
+            _sync_accrual(commission, user=user, note="Brokerage collection adjustment")
+
+        if not lost and earned > old_amount:
+            _notify_collection_commission_due(commission, lead, earned - old_amount, user=user)
+    return commissions
+
+
+@transaction.atomic
+def sync_broker_commissions_for_lead(lead, *, user=None):
+    """Cancel any unearned commission when a linked broker lead is marked lost."""
+    from apps.sales.models import SalesInvoice, SalesOrder
+
+    orders = SalesOrder.objects.filter(client_id=lead.client_id).filter(
+        Q(crm_lead=lead) | Q(quotation__crm_lead=lead)
+    )
+    invoices = SalesInvoice.objects.filter(
+        client_id=lead.client_id, sales_order__in=orders, deleted_at__isnull=True
+    )
+    for invoice in invoices.iterator():
+        sync_broker_commissions_for_invoice(invoice, user=user)
+
+
+def _notify_collection_commission_due(commission, lead, increment, *, user=None):
+    recipients = [
+        recipient
+        for recipient in User.objects.filter(
+            client_id=commission.client_id, status="Active"
+        ).select_related("role")
+        if has_permission(recipient, "manage_brokers")
+    ]
+    if not recipients:
+        return
+    outstanding = round2(D(commission.commission_amount) - D(commission.paid_amount))
+    notify(
+        client=commission.client_id,
+        recipients=recipients,
+        type="broker_commission_due",
+        category="erp",
+        title=f"Broker commission due: {commission.broker.name}",
+        body=(
+            f"Customer payment received for invoice {commission.invoice.invoice_number or commission.invoice_id}. "
+            f"₹{round2(increment):,.2f} commission earned; ₹{outstanding:,.2f} is due "
+            f"for broker {commission.broker.name}."
+        ),
+        entity_type="BrokerCommission",
+        entity_id=commission.id,
+        actor=user,
+        payload={
+            "commissionId": str(commission.id),
+            "invoiceId": str(commission.invoice_id),
+            "leadId": str(lead.id) if lead is not None else None,
+            "earnedIncrement": str(round2(increment)),
+            "outstanding": str(outstanding),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -183,11 +328,13 @@ def apply_rate_change(req):
     commission.commission_basis = (
         "QUANTITY" if commission.commission_type in ("per_meter", "per_taka") else "INVOICE"
     )
-    commission.commission_amount = commission_amount(commission.invoice, commission.commission_type, rate)
+    commission.commission_amount = collection_commission_amount(
+        commission.invoice, commission.commission_type, rate
+    )
     commission.save(update_fields=[
         "rate", "commission_type", "commission_basis", "commission_amount", "updated_at",
     ])
-    if commission.status in ("Approved", "Payable"):
+    if commission.status in ("Approved", "Payable", "Partially Paid"):
         _sync_accrual(commission, user=req.decided_by, note="Brokerage rate change")
     return commission
 
@@ -213,7 +360,11 @@ def _accrued_amount(commission):
 def _sync_accrual(commission, *, user=None, note="Brokerage accrual"):
     """Bring the booked accrual in line with ``commission_amount``:
     Dr Brokerage Expense / Cr Brokerage Payable (or the reverse to reduce)."""
-    target = ZERO if commission.status == "Cancelled" else round2(D(commission.commission_amount))
+    target = (
+        round2(D(commission.paid_amount))
+        if commission.status == "Cancelled"
+        else round2(D(commission.commission_amount))
+    )
     delta = round2(target - _accrued_amount(commission))
     if delta == ZERO:
         return None
@@ -241,6 +392,11 @@ def approve_broker_commission(commission, *, user=None):
     commission = BrokerCommission.objects.select_for_update().get(pk=commission.pk)
     if commission.status not in ("Accrued", "Hold"):
         raise Conflict(f"Commission is currently {commission.status}, cannot approve.")
+    if D(commission.commission_amount) <= D(commission.paid_amount):
+        raise Conflict("Commission can only be approved after a customer payment is collected.")
+    lead = order_lead(commission.invoice.sales_order)
+    if lead is not None and lead.stage and lead.stage.is_lost:
+        raise Conflict("A lost broker lead is not eligible for commission.")
 
     commission.status = "Approved"
     commission.approved_by = user if getattr(user, "is_authenticated", False) else None
@@ -257,6 +413,8 @@ def make_broker_payable(commission, *, user=None):
     commission = BrokerCommission.objects.select_for_update().get(pk=commission.pk)
     if commission.status != "Approved":
         raise Conflict("Only Approved commissions can be marked as Payable.")
+    if D(commission.commission_amount) <= D(commission.paid_amount):
+        raise Conflict("Commission is not due until a customer payment is collected.")
 
     commission.status = "Payable"
     commission.save(update_fields=["status", "updated_at"])
@@ -271,6 +429,9 @@ def pay_broker_commission(commission, amount=None, *, payment_ref=None, payment_
         raise Conflict(
             f"Commission is {commission.status}; only an approved / payable commission can be paid."
         )
+    lead = order_lead(commission.invoice.sales_order)
+    if lead is not None and lead.stage and lead.stage.is_lost:
+        raise Conflict("A lost broker lead is not eligible for commission.")
     outstanding = round2(D(commission.commission_amount) - D(commission.paid_amount))
 
     pay_amount = round2(D(amount)) if amount is not None else outstanding
@@ -336,7 +497,7 @@ def reverse_broker_commission_for_invoice(invoice, *, user=None, return_val=None
         client_id=invoice.client_id, invoice=invoice, deleted_at__isnull=True
     )
     for comm in commissions:
-        if comm.status in ("Accrued", "Approved", "Payable", "Partially Paid"):
+        if comm.status in ("Awaiting Collection", "Accrued", "Approved", "Payable", "Partially Paid"):
             if return_val and D(return_val) < D(comm.invoice_amount) and D(comm.invoice_amount) > ZERO:
                 # Proportional reduction
                 reduction = round2(D(comm.commission_amount) * (D(return_val) / D(comm.invoice_amount)))

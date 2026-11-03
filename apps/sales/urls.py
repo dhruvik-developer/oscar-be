@@ -13,7 +13,13 @@ router.register(
 router.register("challans", views.DeliveryChallanViewSet, basename="sales-challans")
 router.register("delivery-challans", views.DeliveryChallanViewSet, basename="sales-delivery-challans")
 router.register("invoices", views.SalesInvoiceViewSet, basename="sales-invoices")
+router.register("receivables", views.ReceivablesViewSet, basename="sales-receivables")
 router.register("payments", views.PaymentInViewSet, basename="sales-payments")
+router.register(
+    "discount-requests",
+    views.EarlyPaymentDiscountRequestViewSet,
+    basename="sales-discount-requests",
+)
 router.register("returns", views.SalesReturnViewSet, basename="sales-returns")
 # [REMOVED] Customer Warranty endpoint removed from sales router
 router.register("broker-commissions", views.BrokerCommissionViewSet, basename="sales-broker-commissions")

@@ -427,6 +427,32 @@ def fill_salesperson(document):
     return True
 
 
+def fill_broker(document):
+    """Default a sales document's broker when nobody picked one.
+
+    Takes the broker the CRM lead was attributed to (source "Broker"), else the
+    customer's default broker. Conversions copy ``broker_fk`` forward, so the
+    first document off the lead carries it down the pipeline. Never overwrites
+    a broker already on the document. Returns True when it set one.
+    """
+    if getattr(document, "broker_fk_id", None) or (getattr(document, "broker", None) or "").strip():
+        return False
+    from .broker_services import _broker_from_lead
+    from .models import order_lead
+
+    lead = order_lead(document) or order_lead(getattr(document, "sales_order", None))
+    broker = (
+        _broker_from_lead(lead, (lead.custom_values or {}) if lead is not None else {})
+        or getattr(getattr(document, "party", None), "default_broker", None)
+    )
+    if broker is None:
+        return False
+    document.broker_fk = broker
+    document.broker = broker.name
+    document.save(update_fields=["broker_fk", "broker", "updated_at"])
+    return True
+
+
 def invoice_outstanding(invoice):
     """``GET /sales/invoices/{id}/outstanding/`` (api.md §5.7)."""
     from apps.core.money import ageing_bucket, days_overdue, effective_due_date
@@ -1045,6 +1071,52 @@ def _advance_order_after_dispatch(order):
 
 
 # ---------------------------------------------------------------------------
+# One invoice / one challan per sales order
+# ---------------------------------------------------------------------------
+def active_order_invoice(order, *, exclude_id=None):
+    """The order's live invoice (any status but Cancelled), if it has one."""
+    qs = order.invoices.filter(deleted_at__isnull=True).exclude(status="Cancelled")
+    if exclude_id:
+        qs = qs.exclude(pk=exclude_id)
+    return qs.order_by("created_at").first()
+
+
+def active_order_challan(order, *, exclude_id=None):
+    """The order's live challan (any status but Cancelled -- a Delivered one
+    still counts), if it has one."""
+    qs = order.challans.filter(deleted_at__isnull=True).exclude(status="Cancelled")
+    if exclude_id:
+        qs = qs.exclude(pk=exclude_id)
+    return qs.order_by("created_at").first()
+
+
+def assert_order_has_no_invoice(order, *, exclude_id=None):
+    """A sales order is billed on exactly one invoice; cancel it to re-bill."""
+    existing = active_order_invoice(order, exclude_id=exclude_id)
+    if existing is not None:
+        label = existing.invoice_number or f"draft {str(existing.id)[:8]}"
+        raise Conflict(
+            f"Sales Order {order.order_number} already has invoice {label}. "
+            "Only one invoice is allowed per sales order -- cancel it to create another.",
+            code=Codes.ALREADY_DONE,
+            payload={"invoiceId": str(existing.id)},
+        )
+
+
+def assert_order_has_no_challan(order, *, exclude_id=None):
+    """A sales order ships on exactly one challan; cancel it to re-issue."""
+    existing = active_order_challan(order, exclude_id=exclude_id)
+    if existing is not None:
+        raise Conflict(
+            f"Sales Order {order.order_number} already has delivery challan "
+            f"{existing.challan_number or existing.id}. Only one challan is allowed "
+            "per sales order -- cancel it to create another.",
+            code=Codes.ALREADY_DONE,
+            payload={"challanId": str(existing.id)},
+        )
+
+
+# ---------------------------------------------------------------------------
 # Cancellation (api.md §6.9)
 # ---------------------------------------------------------------------------
 def assert_no_dependents(document, dependents):
@@ -1398,9 +1470,11 @@ def allocate_payment_in(payment, allocations, *, user=None):
     # Money received releases held incentive / grows collection-based
     # incentive on those invoices (PDF §12).
     from apps.pms.production_services import sync_incentives_for_invoice
+    from .broker_services import sync_broker_commissions_for_invoice
 
     for invoice in paid_invoices:
         sync_incentives_for_invoice(invoice, user=user)
+        sync_broker_commissions_for_invoice(invoice, user=user)
     return payment
 
 
@@ -1449,11 +1523,13 @@ def cancel_payment_in(payment, *, reason=None, user=None):
         user=user,
     )
     from apps.pms.production_services import sync_incentives_for_invoice
+    from .broker_services import sync_broker_commissions_for_invoice
 
     for invoice in SalesInvoice.objects.filter(pk__in=invoice_ids):
         refresh_invoice_payment_status(invoice)
         # A bounced/cancelled receipt puts the incentive back on hold.
         sync_incentives_for_invoice(invoice, user=user)
+        sync_broker_commissions_for_invoice(invoice, user=user)
     ledger.recalculate_party_balance(payment.client_id, payment.party_id)
     return payment
 

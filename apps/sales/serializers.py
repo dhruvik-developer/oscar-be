@@ -1,4 +1,5 @@
 """Sales serializers (api.md §5)."""
+from django.utils import timezone
 from rest_framework import serializers
 
 from apps.core.document_serializers import (
@@ -10,14 +11,17 @@ from apps.core.document_serializers import (
 from apps.core.serializers import (
     BaseModelSerializer,
     BaseSerializer,
+    ISODateTimeField,
     MoneyField,
     QuantityField,
     TenantPrimaryKeyRelatedField,
 )
+from apps.core.money import ZERO, D, round2
 
 from .models import (
     BrokerCommission,
     DeliveryChallan,
+    EarlyPaymentDiscountRequest,
     DeliveryChallanLine,
     PaymentAllocation,
     PaymentIn,
@@ -131,6 +135,10 @@ class SalesOrderSerializer(DocumentSerializer):
     line_model = SalesOrderLine
     line_serializer = SalesOrderLineSerializer
     line_fk_name = "sales_order"
+
+    brokerCode = serializers.CharField(
+        source="broker_fk.code", read_only=True, allow_null=True
+    )
     line_table_name = "sales_order_lines"
 
     vehicleNo = serializers.CharField(source="vehicle_number", required=False, allow_blank=True, allow_null=True)
@@ -203,14 +211,14 @@ class SalesOrderSerializer(DocumentSerializer):
     class Meta:
         model = SalesOrder
         fields = HEADER_FIELDS + [
-            "order_number", "stage", "payment_status", "delivery_date",
+            "order_number", "stage", "payment_status", "delivery_date", "brokerCode",
             "quotation", "pms_project", "reference_number",
             "dispatch_date", "dispatchDate", "vehicle_number", "vehicleNo", "transporter",
             "invoiceStatus", "hasInvoice", "linkedInvoiceId", "linkedInvoiceNumber", "linkedInvoice",
             "hasChallan", "linkedChallanId", "linkedChallanNumber", "linkedChallan",
         ]
         read_only_fields = READ_ONLY_HEADER_FIELDS + [
-            "order_number", "payment_status",
+            "order_number", "payment_status", "brokerCode",
             "invoiceStatus", "hasInvoice", "linkedInvoiceId", "linkedInvoiceNumber", "linkedInvoice",
             "hasChallan", "linkedChallanId", "linkedChallanNumber", "linkedChallan",
         ]
@@ -321,6 +329,169 @@ class InvoiceOutstandingSerializer(BaseSerializer):
     dueDate = serializers.DateField(allow_null=True)
     daysOverdue = serializers.IntegerField()
     ageingBucket = serializers.CharField()
+
+
+class ReceivableRowSerializer(BaseModelSerializer):
+    customerId = serializers.CharField(source="party_id", read_only=True)
+    customerName = serializers.CharField(source="party.name", read_only=True)
+    invoiceNumber = serializers.CharField(source="invoice_number", read_only=True)
+    invoiceDate = serializers.DateField(source="doc_date", read_only=True)
+    dueDate = serializers.DateField(read_only=True, allow_null=True)
+    paymentTerms = serializers.CharField(read_only=True, allow_null=True)
+    creditDays = serializers.IntegerField(read_only=True, allow_null=True)
+    invoiceAmount = MoneyField(source="total", read_only=True)
+    paidAmount = MoneyField(source="amount_paid", read_only=True)
+    approvedDiscount = MoneyField(source="settlement_discount", read_only=True)
+    outstandingAmount = serializers.SerializerMethodField()
+    customerCredit = serializers.SerializerMethodField()
+    paymentStatus = serializers.SerializerMethodField()
+    daysOverdue = serializers.SerializerMethodField()
+    openDiscountRequests = serializers.SerializerMethodField()
+    hasEarlyPayment = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SalesInvoice
+        fields = [
+            "id", "customerId", "customerName", "invoiceNumber", "invoiceDate",
+            "dueDate", "paymentTerms", "creditDays", "invoiceAmount", "paidAmount",
+            "approvedDiscount", "outstandingAmount", "customerCredit", "paymentStatus",
+            "daysOverdue", "openDiscountRequests", "hasEarlyPayment",
+        ]
+
+    def get_outstandingAmount(self, invoice):
+        return services.invoice_balance(invoice)
+
+    def get_customerCredit(self, invoice):
+        return max(
+            round2(
+                D(invoice.amount_paid)
+                + D(invoice.settlement_discount)
+                - D(invoice.total)
+            ),
+            ZERO,
+        )
+
+    def get_paymentStatus(self, invoice):
+        outstanding = services.invoice_balance(invoice)
+        if outstanding <= ZERO:
+            return "Paid"
+        if invoice.due_date and invoice.due_date < timezone.localdate():
+            return "Overdue"
+        if invoice.due_date:
+            return "Due"
+        return invoice.status
+
+    def get_daysOverdue(self, invoice):
+        if invoice.due_date and services.invoice_balance(invoice) > ZERO:
+            return max(0, (timezone.localdate() - invoice.due_date).days)
+        return 0
+
+    def get_openDiscountRequests(self, invoice):
+        return invoice.discount_requests.filter(
+            status__in=["Draft", "Submitted", "Under Review"],
+            deleted_at__isnull=True,
+        ).count()
+
+    def get_hasEarlyPayment(self, invoice):
+        if invoice.due_date is None:
+            return False
+        allocations = PaymentAllocation.objects.filter(
+            client_id=invoice.client_id,
+            payment_side="in",
+            document_type="SalesInvoice",
+            document_id=invoice.id,
+            deleted_at__isnull=True,
+        ).values("payment_id")
+        return PaymentIn.objects.filter(
+            client_id=invoice.client_id,
+            pk__in=allocations,
+            status="Active",
+            payment_date__lt=invoice.due_date,
+            deleted_at__isnull=True,
+        ).exists()
+
+
+class EarlyPaymentDiscountRequestSerializer(BaseModelSerializer):
+    requestNumber = serializers.CharField(source="request_number", read_only=True)
+    customerName = serializers.CharField(source="party.name", read_only=True)
+    invoiceNumber = serializers.CharField(source="invoice_number", read_only=True)
+    invoiceDate = serializers.DateField(source="invoice_date", read_only=True)
+    invoiceTotal = MoneyField(source="invoice_total", read_only=True)
+    paymentTerms = serializers.CharField(source="payment_terms", read_only=True, allow_null=True)
+    dueDate = serializers.DateField(source="due_date", read_only=True, allow_null=True)
+    paymentDate = serializers.DateField(source="payment_date", read_only=True)
+    paymentNumber = serializers.CharField(source="payment.payment_number", read_only=True)
+    eligibleAmount = MoneyField(source="eligible_amount", read_only=True)
+    daysPaidEarly = serializers.IntegerField(source="days_paid_early", read_only=True)
+    requestedAmount = MoneyField(source="requested_amount", read_only=True)
+    proposedAmount = MoneyField(source="proposed_amount", read_only=True, allow_null=True)
+    approvedAmount = MoneyField(source="approved_amount", read_only=True, allow_null=True)
+    customerRequestDate = serializers.DateField(source="customer_request_date", read_only=True, allow_null=True)
+    requestedById = serializers.CharField(source="requested_by_id", read_only=True, allow_null=True)
+    requestedByName = serializers.CharField(source="requested_by.name", read_only=True, allow_null=True)
+    decidedByName = serializers.CharField(source="decided_by.name", read_only=True, allow_null=True)
+    decidedAt = ISODateTimeField(source="decided_at", read_only=True, allow_null=True)
+    decisionReason = serializers.CharField(source="decision_reason", read_only=True, allow_null=True)
+    cancellationReason = serializers.CharField(source="cancellation_reason", read_only=True, allow_null=True)
+    creditNoteNumber = serializers.CharField(source="credit_note.note_number", read_only=True, allow_null=True)
+    invoiceOutstanding = serializers.SerializerMethodField()
+
+    class Meta:
+        model = EarlyPaymentDiscountRequest
+        fields = [
+            "id", "requestNumber", "customerName", "invoice", "invoiceNumber",
+            "invoiceDate", "invoiceTotal", "paymentTerms", "dueDate", "payment",
+            "paymentNumber", "paymentDate", "eligibleAmount", "daysPaidEarly",
+            "requestedAmount", "proposedAmount", "approvedAmount", "customerRequestDate",
+            "reason", "notes", "attachments", "status", "requestedById",
+            "requestedByName", "decidedByName", "decidedAt", "decisionReason",
+            "cancellationReason", "creditNoteNumber", "invoiceOutstanding",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = fields
+
+    def get_invoiceOutstanding(self, request):
+        return services.invoice_balance(request.invoice)
+
+
+class EarlyPaymentDiscountCreateSerializer(BaseSerializer):
+    invoiceId = serializers.UUIDField(source="invoice_id")
+    paymentId = serializers.UUIDField(source="payment_id")
+    requestedAmount = MoneyField(source="requested_amount")
+    customerRequestDate = serializers.DateField(source="customer_request_date", required=False, allow_null=True)
+    reason = serializers.CharField()
+    notes = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    attachments = serializers.ListField(child=serializers.CharField(), required=False)
+    submit = serializers.BooleanField(required=False, default=False)
+
+
+class EarlyPaymentDiscountUpdateSerializer(BaseSerializer):
+    requestedAmount = MoneyField(source="requested_amount", required=False)
+    customerRequestDate = serializers.DateField(source="customer_request_date", required=False, allow_null=True)
+    reason = serializers.CharField(required=False)
+    notes = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    attachments = serializers.ListField(child=serializers.CharField(), required=False)
+
+
+class PaymentTermsChangeSerializer(BaseSerializer):
+    paymentTerms = serializers.CharField(source="payment_terms", required=False, allow_blank=True)
+    creditDays = serializers.IntegerField(source="credit_days", min_value=0)
+    dueDate = serializers.DateField(source="due_date", required=False, allow_null=True)
+    reason = serializers.CharField(required=False, allow_blank=True)
+
+
+class DiscountReviewSerializer(BaseSerializer):
+    comments = serializers.CharField(required=False, allow_blank=True)
+
+
+class DiscountProposeSerializer(BaseSerializer):
+    proposedAmount = MoneyField(source="amount")
+    reason = serializers.CharField(required=False, allow_blank=True)
+
+
+class DiscountDecisionSerializer(BaseSerializer):
+    approvedAmount = MoneyField(source="amount", required=False)
+    reason = serializers.CharField(required=False, allow_blank=True)
 
 
 # ---------------------------------------------------------------------------
@@ -534,16 +705,30 @@ class BrokerCommissionSerializer(BaseModelSerializer):
     brokerCode = serializers.CharField(source="broker.code", read_only=True)
     partyName = serializers.CharField(source="party.name", read_only=True)
     invoiceNumber = serializers.CharField(source="invoice.invoice_number", read_only=True)
+    leadNumber = serializers.SerializerMethodField()
+    leadName = serializers.SerializerMethodField()
+
+    def _lead(self, commission):
+        from .models import order_lead
+
+        return order_lead(commission.invoice.sales_order)
+
+    def get_leadNumber(self, commission):
+        lead = self._lead(commission)
+        return lead.lead_number if lead else None
+
+    def get_leadName(self, commission):
+        lead = self._lead(commission)
+        return lead.company or lead.name if lead else None
 
     class Meta:
         model = BrokerCommission
         fields = [
             "id", "commission_number", "broker", "brokerName", "brokerCode",
-            "invoice", "invoiceNumber", "party", "partyName", "salesperson",
+            "invoice", "invoiceNumber", "leadNumber", "leadName", "party", "partyName", "salesperson",
             "invoice_date", "invoice_amount", "commission_basis", "commission_type",
             "rate", "commission_amount", "paid_amount", "status",
             "approved_by", "approved_at", "paid_at", "payment_reference",
             "notes", "created_at", "updated_at",
         ]
         read_only_fields = ["created_at", "updated_at"]
-
