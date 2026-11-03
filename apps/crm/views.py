@@ -228,6 +228,10 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
             created_tasks = services.run_stage_automation(
                 lead, lead.stage, user=request.user
             )
+        if lead.stage and lead.stage.is_lost:
+            from apps.sales.broker_services import sync_broker_commissions_for_lead
+
+            sync_broker_commissions_for_lead(lead, user=request.user)
 
         services.annotate_lead_counters(request.client_id, [lead])
         return Response(
@@ -333,6 +337,9 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
         lead.stage = lost_stage
         lead.lost_reason = reason
         lead.save(update_fields=["stage", "lost_reason", "updated_at"])
+        from apps.sales.broker_services import sync_broker_commissions_for_lead
+
+        sync_broker_commissions_for_lead(lead, user=self.request.user)
         moved_deals = []
         open_deals = lead.deals.filter(deleted_at__isnull=True).exclude(stage__in=["Won", "Lost"])
         for deal in open_deals:

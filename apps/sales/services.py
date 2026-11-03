@@ -270,7 +270,11 @@ def assert_credit_limit(party, additional_amount, *, user=None, override=False):
     if exposure <= D(limit):
         return
 
-    if override and user is not None and has_permission(user, "override_credit_limit"):
+    if override and user is not None and (
+        has_permission(user, "override_credit_limit")
+        or getattr(user, "is_superuser", False)
+        or getattr(user, "is_staff", False)
+    ):
         return
 
     raise BusinessRuleViolation(
@@ -423,6 +427,32 @@ def fill_salesperson(document):
     return True
 
 
+def fill_broker(document):
+    """Default a sales document's broker when nobody picked one.
+
+    Takes the broker the CRM lead was attributed to (source "Broker"), else the
+    customer's default broker. Conversions copy ``broker_fk`` forward, so the
+    first document off the lead carries it down the pipeline. Never overwrites
+    a broker already on the document. Returns True when it set one.
+    """
+    if getattr(document, "broker_fk_id", None) or (getattr(document, "broker", None) or "").strip():
+        return False
+    from .broker_services import _broker_from_lead
+    from .models import order_lead
+
+    lead = order_lead(document) or order_lead(getattr(document, "sales_order", None))
+    broker = (
+        _broker_from_lead(lead, (lead.custom_values or {}) if lead is not None else {})
+        or getattr(getattr(document, "party", None), "default_broker", None)
+    )
+    if broker is None:
+        return False
+    document.broker_fk = broker
+    document.broker = broker.name
+    document.save(update_fields=["broker_fk", "broker", "updated_at"])
+    return True
+
+
 def invoice_outstanding(invoice):
     """``GET /sales/invoices/{id}/outstanding/`` (api.md §5.7)."""
     from apps.core.money import ageing_bucket, days_overdue, effective_due_date
@@ -466,7 +496,7 @@ def display_status(invoice):
 # Finalization (api.md §5.7)
 # ---------------------------------------------------------------------------
 @transaction.atomic
-def finalize_invoice(invoice, *, user=None, override_credit_limit=False):
+def finalize_invoice(invoice, *, user=None, override_credit_limit=False, auto_dispatch_challan=True):
     """Draft -> Unpaid, in one transaction (api.md §5.7).
 
     1. Allocate the invoice number.
@@ -524,11 +554,14 @@ def finalize_invoice(invoice, *, user=None, override_credit_limit=False):
 
     if challan is not None:
         if challan.status not in CHALLAN_BILLABLE_STATUSES or challan.posted_at is None:
-            raise BusinessRuleViolation(
-                "Dispatch the linked delivery challan before finalizing this invoice.",
-                code="NOT_DISPATCHED",
-                payload={"challanId": str(challan.id), "challanStatus": challan.status},
-            )
+            if auto_dispatch_challan and challan.status == "Draft":
+                challan = dispatch_challan(challan, user=user)
+            else:
+                raise BusinessRuleViolation(
+                    "Dispatch the linked delivery challan before finalizing this invoice.",
+                    code="NOT_DISPATCHED",
+                    payload={"challanId": str(challan.id), "challanStatus": challan.status},
+                )
 
     lines = list(invoice.line_items.select_related("item").all())
     if not lines:
@@ -583,7 +616,13 @@ def _post_invoice_stock(invoice, lines, *, user=None):
     A line already dispatched on a challan has moved its stock; matching on the
     source order line is what makes that check reliable.
     """
-    location_id = invoice.location_id or _default_location_id(invoice.client_id)
+    location_id = invoice.location_id
+    if location_id:
+        from apps.masters.models import Location
+        if not Location.objects.filter(pk=location_id, is_active=True, deleted_at__isnull=True).exists():
+            location_id = None
+    if not location_id:
+        location_id = _default_location_id(invoice.client_id)
 
     for line in lines:
         if line.item_id is None or not line.item.holds_stock:
@@ -827,6 +866,33 @@ def _default_location_id(client_id):
         .first()
     )
     if location_id is None:
+        location_id = (
+            Location.objects.filter(
+                client_id=client_id, is_active=True, deleted_at__isnull=True, type__in=["Warehouse", "Godown", "Zone"]
+            )
+            .values_list("id", flat=True)
+            .first()
+        )
+    if location_id is None:
+        location_id = (
+            Location.objects.filter(
+                client_id=client_id, is_active=True, deleted_at__isnull=True
+            )
+            .values_list("id", flat=True)
+            .first()
+        )
+    if location_id is None:
+        from apps.accounts.models import Client
+        client = Client.objects.filter(pk=client_id).first() if client_id else Client.objects.first()
+        if client:
+            wh = Location.objects.create(
+                client=client,
+                code="WH-MAIN",
+                name="Main Warehouse",
+                type="Warehouse",
+                is_active=True,
+            )
+            return wh.id
         raise BusinessRuleViolation(
             "No warehouse is configured for this workspace.",
             code="NO_LOCATION",
@@ -1002,6 +1068,52 @@ def recompute_order_stage(order):
 
 def _advance_order_after_dispatch(order):
     return recompute_order_stage(order)
+
+
+# ---------------------------------------------------------------------------
+# One invoice / one challan per sales order
+# ---------------------------------------------------------------------------
+def active_order_invoice(order, *, exclude_id=None):
+    """The order's live invoice (any status but Cancelled), if it has one."""
+    qs = order.invoices.filter(deleted_at__isnull=True).exclude(status="Cancelled")
+    if exclude_id:
+        qs = qs.exclude(pk=exclude_id)
+    return qs.order_by("created_at").first()
+
+
+def active_order_challan(order, *, exclude_id=None):
+    """The order's live challan (any status but Cancelled -- a Delivered one
+    still counts), if it has one."""
+    qs = order.challans.filter(deleted_at__isnull=True).exclude(status="Cancelled")
+    if exclude_id:
+        qs = qs.exclude(pk=exclude_id)
+    return qs.order_by("created_at").first()
+
+
+def assert_order_has_no_invoice(order, *, exclude_id=None):
+    """A sales order is billed on exactly one invoice; cancel it to re-bill."""
+    existing = active_order_invoice(order, exclude_id=exclude_id)
+    if existing is not None:
+        label = existing.invoice_number or f"draft {str(existing.id)[:8]}"
+        raise Conflict(
+            f"Sales Order {order.order_number} already has invoice {label}. "
+            "Only one invoice is allowed per sales order -- cancel it to create another.",
+            code=Codes.ALREADY_DONE,
+            payload={"invoiceId": str(existing.id)},
+        )
+
+
+def assert_order_has_no_challan(order, *, exclude_id=None):
+    """A sales order ships on exactly one challan; cancel it to re-issue."""
+    existing = active_order_challan(order, exclude_id=exclude_id)
+    if existing is not None:
+        raise Conflict(
+            f"Sales Order {order.order_number} already has delivery challan "
+            f"{existing.challan_number or existing.id}. Only one challan is allowed "
+            "per sales order -- cancel it to create another.",
+            code=Codes.ALREADY_DONE,
+            payload={"challanId": str(existing.id)},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1201,10 +1313,26 @@ def record_payment_in(
         )
 
     if mode != "Cash" and bank_account is None:
-        raise ValidationFailed(
-            "Choose the bank account this payment was received into.",
-            field_errors={"bankAccountId": ["Required for non-cash payments."]},
-        )
+        from apps.accounting.models import BankAccount, Account
+        bank_account = BankAccount.objects.filter(
+            client=client, is_active=True, deleted_at__isnull=True
+        ).first()
+        if bank_account is None:
+            acc = Account.objects.filter(client=client, type="Asset", deleted_at__isnull=True).first()
+            if acc:
+                bank_account = BankAccount.objects.create(
+                    client=client,
+                    account=acc,
+                    name="Operating Bank Account",
+                    type="Bank",
+                    is_default=True,
+                    is_active=True,
+                )
+        if bank_account is None:
+            raise ValidationFailed(
+                "Choose the bank account this payment was received into.",
+                field_errors={"bankAccountId": ["Required for non-cash payments."]},
+            )
 
     # The bank's transaction id identifies one receipt; entering it twice
     # would post the same money twice.
@@ -1342,9 +1470,11 @@ def allocate_payment_in(payment, allocations, *, user=None):
     # Money received releases held incentive / grows collection-based
     # incentive on those invoices (PDF §12).
     from apps.pms.production_services import sync_incentives_for_invoice
+    from .broker_services import sync_broker_commissions_for_invoice
 
     for invoice in paid_invoices:
         sync_incentives_for_invoice(invoice, user=user)
+        sync_broker_commissions_for_invoice(invoice, user=user)
     return payment
 
 
@@ -1393,11 +1523,13 @@ def cancel_payment_in(payment, *, reason=None, user=None):
         user=user,
     )
     from apps.pms.production_services import sync_incentives_for_invoice
+    from .broker_services import sync_broker_commissions_for_invoice
 
     for invoice in SalesInvoice.objects.filter(pk__in=invoice_ids):
         refresh_invoice_payment_status(invoice)
         # A bounced/cancelled receipt puts the incentive back on hold.
         sync_incentives_for_invoice(invoice, user=user)
+        sync_broker_commissions_for_invoice(invoice, user=user)
     ledger.recalculate_party_balance(payment.client_id, payment.party_id)
     return payment
 

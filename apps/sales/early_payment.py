@@ -252,6 +252,11 @@ def create_request(
             "That receipt has not been allocated to this invoice. Allocate it first.",
             field_errors={"paymentId": ["Not allocated to this invoice."]},
         )
+    if invoice.due_date is None or payment.payment_date >= invoice.due_date:
+        raise ValidationFailed(
+            "An early-payment discount is available only when the customer pays before the invoice due date.",
+            field_errors={"paymentId": ["This receipt was not paid before the due date."]},
+        )
     reason = (reason or "").strip()
     if not reason:
         raise ValidationFailed("Give the customer's reason for the request.", field_errors={"reason": ["Required."]})
@@ -417,6 +422,11 @@ def approve_request(req, *, user=None, amount=None, reason=None):
         raise BusinessRuleViolation(
             "The receipt behind this request is no longer allocated to the invoice.",
             code="PAYMENT_NOT_ALLOCATED",
+        )
+    if req.due_date is None or req.payment_date >= req.due_date:
+        raise BusinessRuleViolation(
+            "This receipt does not qualify for an early-payment discount because it was not paid before the due date.",
+            code="PAYMENT_NOT_EARLY",
         )
 
     chosen = amount if amount not in (None, "") else (

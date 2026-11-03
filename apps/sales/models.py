@@ -54,7 +54,7 @@ INVOICE_STATUSES = ["Draft", "Unpaid", "Partially Paid", "Paid", "Cancelled"]
 # PurchaseBillsPage and SalesInvoicesView between them offer all of these.
 PAYMENT_MODES = [
     "Cash", "Bank", "UPI", "Cheque", "Card",
-    "Bank Transfer", "Bank Wire", "ACH", "Corporate Card",
+    "Bank Transfer", "Bank Wire", "Bank Wire Direct", "ACH", "Corporate Card",
 ]
 
 
@@ -836,6 +836,7 @@ class BrokerCommission(TenantModel, LegacyIdMixin):
     """Broker commission ledger per invoice (PDF §12)."""
 
     STATUSES = [
+        ("Awaiting Collection", "Awaiting Collection"),
         ("Accrued", "Accrued"),
         ("Approved", "Approved"),
         ("Payable", "Payable"),
@@ -875,7 +876,7 @@ class BrokerCommission(TenantModel, LegacyIdMixin):
     rate = models.DecimalField(max_digits=9, decimal_places=2, default=0)
     commission_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     paid_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
-    status = models.TextField(choices=STATUSES, default="Accrued")
+    status = models.TextField(choices=STATUSES, default="Awaiting Collection")
     approved_by = models.ForeignKey(
         "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
@@ -897,4 +898,3 @@ class BrokerCommission(TenantModel, LegacyIdMixin):
 
     def __str__(self):
         return f"{self.commission_number or self.id} ({self.status}): {self.commission_amount}"
-
