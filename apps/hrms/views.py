@@ -1195,6 +1195,103 @@ class HrmsDashboardView(APIView):
 
 
 
+        # Monthly volume analytics for current year
+        months_abbr = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        current_year = today.year
+        emp_list = list(employees.select_related("department"))
+        dept_names = [d for d in Department.objects.filter(client_id=client_id, deleted_at__isnull=True).values_list("name", flat=True).distinct() if d]
+        if not dept_names:
+            dept_names = ["HR", "General"]
+
+        top_depts = (dept_names[:3] if len(dept_names) >= 3 else (dept_names + ["General", "Operations", "Sales"])[:3])
+
+        year_att = list(Attendance.objects.filter(client_id=client_id, work_date__year=current_year, deleted_at__isnull=True).values("work_date", "status", "employee__department__name"))
+        year_leaves = list(LeaveRequest.objects.filter(client_id=client_id, from_date__year=current_year, deleted_at__isnull=True).values("from_date", "leave_type__is_paid", "status", "employee__department__name"))
+        year_payslips = list(Payslip.objects.filter(client_id=client_id, period_month__year=current_year, deleted_at__isnull=True).values("period_month", "standard_salary", "earned_salary", "allowances", "additional_earnings", "employee__department__name"))
+        year_assets = list(Asset.objects.filter(client_id=client_id, deleted_at__isnull=True).values("created_at", "status", "category__name", "assigned_employee__department__name"))
+        year_candidates = list(Candidate.objects.filter(client_id=client_id, deleted_at__isnull=True).values("created_at", "stage"))
+        year_appraisals = list(Appraisal.objects.filter(client_id=client_id, deleted_at__isnull=True).values("created_at", "final_rating", "status"))
+
+        emp_months = []
+        att_months = []
+        leave_months = []
+        pay_months = []
+        perf_months = []
+        rec_months = []
+        asset_months = []
+        dept_months = []
+
+        import datetime as _dt
+        for m_idx, m_name in enumerate(months_abbr, 1):
+            if m_idx == 12:
+                m_end = _dt.date(current_year, 12, 31)
+            else:
+                m_end = _dt.date(current_year, m_idx + 1, 1) - _dt.timedelta(days=1)
+
+            ft, ct, intern = 0, 0, 0
+            dept_counts = {d: 0 for d in top_depts}
+            for e in emp_list:
+                j_date = e.joining_date or (e.created_at.date() if e.created_at else None)
+                if j_date and j_date <= m_end:
+                    lwd = e.last_working_day
+                    if lwd and lwd < _dt.date(current_year, m_idx, 1):
+                        continue
+                    et = (e.employment_type or "Full Time").lower()
+                    if "contract" in et:
+                        ct += 1
+                    elif "intern" in et:
+                        intern += 1
+                    else:
+                        ft += 1
+                    ed = getattr(e.department, "name", None) or "General"
+                    if ed in dept_counts:
+                        dept_counts[ed] += 1
+
+            emp_months.append({"month": m_name, "s1": ft, "s2": ct, "s3": intern, "total": ft + ct + intern})
+            dept_months.append({
+                "month": m_name,
+                "s1": dept_counts.get(top_depts[0], 0),
+                "s2": dept_counts.get(top_depts[1], 0),
+                "s3": dept_counts.get(top_depts[2], 0),
+                "total": sum(dept_counts.values())
+            })
+
+            m_att = [a for a in year_att if a["work_date"].month == m_idx]
+            att_s1 = sum(1 for a in m_att if a["status"] == "Present")
+            att_s2 = sum(1 for a in m_att if a["status"] in ("On Leave", "WFH"))
+            att_s3 = sum(1 for a in m_att if a["status"] in ("Half Day", "Late", "Grace"))
+            att_months.append({"month": m_name, "s1": att_s1, "s2": att_s2, "s3": att_s3, "total": att_s1 + att_s2 + att_s3})
+
+            m_l = [l for l in year_leaves if l["from_date"].month == m_idx]
+            l_s1 = sum(1 for l in m_l if l.get("leave_type__is_paid") is True)
+            l_s2 = sum(1 for l in m_l if l.get("leave_type__is_paid") is False)
+            l_s3 = sum(1 for l in m_l if l.get("leave_type__is_paid") is None)
+            leave_months.append({"month": m_name, "s1": l_s1, "s2": l_s2, "s3": l_s3, "total": l_s1 + l_s2 + l_s3})
+
+            m_p = [p for p in year_payslips if p["period_month"].month == m_idx]
+            p_s1 = round(sum(float(p["earned_salary"] or p["standard_salary"] or 0) for p in m_p) / 1000)
+            p_s2 = round(sum(float(p["allowances"] or 0) for p in m_p) / 1000)
+            p_s3 = round(sum(float(p["additional_earnings"] or 0) for p in m_p) / 1000)
+            pay_months.append({"month": m_name, "s1": p_s1, "s2": p_s2, "s3": p_s3, "total": p_s1 + p_s2 + p_s3})
+
+            m_perf = [pf for pf in year_appraisals if pf["created_at"] and pf["created_at"].month == m_idx]
+            perf_s1 = sum(1 for pf in m_perf if (pf.get("final_rating") or 0) >= 4)
+            perf_s2 = sum(1 for pf in m_perf if 3 <= (pf.get("final_rating") or 0) < 4)
+            perf_s3 = sum(1 for pf in m_perf if (pf.get("final_rating") or 0) < 3)
+            perf_months.append({"month": m_name, "s1": perf_s1, "s2": perf_s2, "s3": perf_s3, "total": perf_s1 + perf_s2 + perf_s3})
+
+            m_rec = [c for c in year_candidates if c["created_at"] and c["created_at"].month == m_idx]
+            rec_s1 = sum(1 for c in m_rec if c.get("stage") in ("Applied", "Screening", None))
+            rec_s2 = sum(1 for c in m_rec if c.get("stage") in ("Interview", "Technical Round"))
+            rec_s3 = sum(1 for c in m_rec if c.get("stage") in ("Offered", "Hired"))
+            rec_months.append({"month": m_name, "s1": rec_s1, "s2": rec_s2, "s3": rec_s3, "total": rec_s1 + rec_s2 + rec_s3})
+
+            m_ass = [a for a in year_assets if a["created_at"] and a["created_at"].date() <= m_end and a["status"] != "Disposed"]
+            ass_s1 = sum(1 for a in m_ass if "laptop" in (a.get("category__name") or "").lower())
+            ass_s2 = sum(1 for a in m_ass if "monitor" in (a.get("category__name") or "").lower() or "periph" in (a.get("category__name") or "").lower())
+            ass_s3 = max(0, len(m_ass) - ass_s1 - ass_s2)
+            asset_months.append({"month": m_name, "s1": ass_s1, "s2": ass_s2, "s3": ass_s3, "total": len(m_ass)})
+
         return Response(
 
             {
@@ -1240,6 +1337,20 @@ class HrmsDashboardView(APIView):
                 ).count(),
 
                 "upcomingEvents": CalendarEventSerializer(upcoming, many=True).data,
+
+                "departments": [{"name": d} for d in dept_names],
+
+                "analytics": {
+                    "Employee": emp_months,
+                    "Attendance": att_months,
+                    "Leave": leave_months,
+                    "Payroll": pay_months,
+                    "Performance": perf_months,
+                    "Recruitment": rec_months,
+                    "Asset": asset_months,
+                    "Department": dept_months,
+                    "departmentSeries": top_depts,
+                },
 
             }
 
@@ -2059,6 +2170,36 @@ class RegularizationViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
 
         self.check_own_employee(employee)
 
+        client = getattr(self.request.user, "client", None) or getattr(employee, "client", None)
+        work_date = serializer.validated_data.get("work_date")
+
+        if client and employee and work_date:
+            existing = (
+                AttendanceRegularization.objects.filter(
+                    client=client, employee=employee, work_date=work_date
+                )
+                .order_by("-created_at")
+                .first()
+            )
+            if existing:
+                if existing.status == "Approved":
+                    raise ValidationFailed(
+                        "An attendance request for this date has already been approved and cannot be modified or resubmitted."
+                    )
+                # An employee can only have one request per day: update existing pending request
+                update_fields = ["updated_at", "status", "approver", "decided_at", "remark"]
+                for field in ("requested_check_in", "requested_check_out", "requested_status", "reason"):
+                    if field in serializer.validated_data:
+                        setattr(existing, field, serializer.validated_data[field])
+                        update_fields.append(field)
+                existing.status = "Pending"
+                existing.approver = None
+                existing.decided_at = None
+                existing.remark = None
+                existing.save(update_fields=list(set(update_fields)))
+                serializer.instance = existing
+                return existing
+
         return super().perform_create(serializer)
 
 
@@ -2086,6 +2227,24 @@ class RegularizationViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
     def perform_update(self, serializer):
 
         """``{ approved, remark, status }`` -- an approval rewrites the attendance row."""
+
+        instance = self.get_object()
+
+        # Approved requests are locked and cannot be edited or modified
+        if instance.status == "Approved":
+            raise ValidationFailed(
+                "Approved attendance requests cannot be edited or modified."
+            )
+
+        new_date = serializer.validated_data.get("work_date")
+        if new_date and new_date != instance.work_date:
+            client = getattr(self.request.user, "client", None) or instance.client
+            if AttendanceRegularization.objects.filter(
+                client=client, employee=instance.employee, work_date=new_date, status="Approved"
+            ).exists():
+                raise ValidationFailed(
+                    "An attendance request for the new date has already been approved and cannot be modified."
+                )
 
         approved = self.request.data.get("approved")
 
@@ -2150,6 +2309,13 @@ class RegularizationViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
                 )
 
         return row
+
+    def perform_destroy(self, instance):
+        if instance.status == "Approved":
+            raise ValidationFailed(
+                "Approved attendance requests cannot be deleted."
+            )
+        return super().perform_destroy(instance)
 
 
 
@@ -5224,65 +5390,84 @@ class HolidayViewSet(TenantModelViewSet):
 
 
 class WorkingDayView(APIView):
-
     """``GET/PUT /hrms/working-days/``."""
 
-
-
     permission_classes = [HasModulePermission]
-
     permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
 
-
-
     def get(self, request):
+        from apps.core.models import Setting
+
+        row = Setting.objects.filter(
+            client_id=request.client_id, key="hrms_working_days"
+        ).first()
+        config_val = row.value if row and isinstance(row.value, dict) else {}
 
         rows = WorkingDay.objects.filter(
-
             client_id=request.client_id, deleted_at__isnull=True
-
         ).order_by("weekday")
+        days_data = WorkingDaySerializer(rows, many=True).data
 
-        return Response(envelope(WorkingDaySerializer(rows, many=True).data))
+        default_working_days = config_val.get("defaultWorkingDays", 24)
+        dept_working_days = config_val.get("departmentWorkingDays", {})
+        dept_working_hours = config_val.get("departmentWorkingHours", {})
 
-
+        return Response({
+            "count": len(days_data),
+            "results": days_data,
+            "days": days_data,
+            "defaultWorkingDays": default_working_days,
+            "departmentWorkingDays": dept_working_days,
+            "departmentWorkingHours": dept_working_hours,
+        })
 
     @transaction.atomic
-
     def put(self, request):
+        from apps.core.models import Setting
 
-        days = request.data.get("days") or request.data
+        data = request.data or {}
+        is_config_payload = isinstance(data, dict) and any(
+            k in data for k in ("defaultWorkingDays", "departmentWorkingDays", "departmentWorkingHours")
+        )
 
-        if not isinstance(days, list):
+        user = request.user if getattr(request, "user", None) and getattr(request.user, "is_authenticated", False) else None
 
-            raise ValidationFailed(
-
-                "Provide a list of weekday configurations.",
-
-                field_errors={"days": ["Expected a list."]},
-
-            )
-
-        for row in days:
-
-            WorkingDay.objects.update_or_create(
-
+        if is_config_payload:
+            row, _ = Setting.objects.get_or_create(
                 client_id=request.client_id,
+                key="hrms_working_days",
+                defaults={"value": {}, "updated_by": user},
+            )
+            val = dict(row.value or {})
+            if "defaultWorkingDays" in data:
+                val["defaultWorkingDays"] = data["defaultWorkingDays"]
+            if "departmentWorkingDays" in data:
+                val["departmentWorkingDays"] = data["departmentWorkingDays"]
+            if "departmentWorkingHours" in data:
+                val["departmentWorkingHours"] = data["departmentWorkingHours"]
+            row.value = val
+            if user:
+                row.updated_by = user
+            row.save(update_fields=["value", "updated_by", "updated_at"] if user else ["value", "updated_at"])
 
-                weekday=row.get("weekday"),
-
-                location_id=row.get("locationId"),
-
-                defaults={
-
-                    "is_working": row.get("isWorking", True),
-
-                    "shift_start": row.get("shiftStart"),
-
-                    "shift_end": row.get("shiftEnd"),
-
-                },
-
+        days = data.get("days") if isinstance(data, dict) else data
+        if isinstance(days, list):
+            for r in days:
+                if isinstance(r, dict) and r.get("weekday") is not None:
+                    WorkingDay.objects.update_or_create(
+                        client_id=request.client_id,
+                        weekday=r.get("weekday"),
+                        location_id=r.get("locationId"),
+                        defaults={
+                            "is_working": r.get("isWorking", True),
+                            "shift_start": r.get("shiftStart"),
+                            "shift_end": r.get("shiftEnd"),
+                        },
+                    )
+        elif not is_config_payload:
+            raise ValidationFailed(
+                "Provide a list of weekday configurations or working days configuration.",
+                field_errors={"days": ["Expected a list or config object."]},
             )
 
         return self.get(request)
