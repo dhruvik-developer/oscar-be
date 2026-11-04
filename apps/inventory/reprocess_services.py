@@ -53,9 +53,9 @@ def serialize_reprocess_record(record):
     """Serialize a ReprocessRecord with full history and return details."""
     returns = list(record.returns.all().order_by("-return_date", "-created_at"))
     latest_ret = returns[0] if returns else None
-    pending_ret = next((r for r in returns if r.qc_status == "Pending"), None) or latest_ret
+    pending_ret = next((r for r in returns if r.qc_status in ("Pending", "Draft")), None)
     latest_receipt_id = str(latest_ret.goods_receipt_id) if (latest_ret and latest_ret.goods_receipt_id) else None
-    pending_receipt_id = str(pending_ret.goods_receipt_id) if (pending_ret and pending_ret.goods_receipt_id) else latest_receipt_id
+    pending_receipt_id = str(pending_ret.goods_receipt_id) if (pending_ret and pending_ret.goods_receipt_id) else None
 
     return {
         "id": str(record.id),

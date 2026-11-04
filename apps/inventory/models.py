@@ -1472,3 +1472,82 @@ class BatchYarn(TenantModel):
                 name="ck_batch_yarn_qty_nonneg",
             ),
         ]
+
+
+class ReprocessRecord(TenantModel, LegacyIdMixin):
+    """Reprocess Record linking rejected/rework fabric sent to a vendor/processor
+    and tracking partial or full vendor returns with real receipts.
+    """
+
+    reprocess_number = models.TextField(db_index=True)
+    original_po = models.ForeignKey(
+        "purchase.PurchaseOrder", null=True, blank=True, on_delete=models.SET_NULL, related_name="reprocess_records"
+    )
+    original_po_number = models.TextField(null=True, blank=True)
+    original_batch = models.ForeignKey(
+        "inventory.Batch", null=True, blank=True, on_delete=models.SET_NULL, related_name="reprocess_records"
+    )
+    original_batch_code = models.TextField(db_index=True)
+    reprocess_batch = models.ForeignKey(
+        "inventory.Batch", null=True, blank=True, on_delete=models.SET_NULL, related_name="received_reprocess_records"
+    )
+    reprocess_batch_code = models.TextField(null=True, blank=True)
+    vendor = models.ForeignKey(
+        "masters.Party", null=True, blank=True, on_delete=models.SET_NULL, related_name="reprocess_records"
+    )
+    vendor_name = models.TextField(default="")
+    item = models.ForeignKey(
+        "masters.Item", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    item_name = models.TextField(default="")
+    outward_challan = models.TextField(default="")
+    sent_quantity = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    sent_date = models.DateField(default=timezone.localdate)
+    returned_quantity = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    outstanding_quantity = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    uom = models.TextField(default="m")
+    status = models.TextField(default="Sent to Vendor")
+    reprocess_qc_status = models.TextField(default="Pending")
+    reason = models.TextField(null=True, blank=True)
+    expected_return_date = models.DateField(null=True, blank=True)
+    remarks = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "inventory_reprocess_records"
+        ordering = ["-sent_date", "-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "reprocess_number"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_client_reprocess_number",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.reprocess_number} ({self.original_batch_code}) - {self.status}"
+
+
+class ReprocessReturn(TenantModel, LegacyIdMixin):
+    """A return receipt transaction against a ReprocessRecord."""
+
+    reprocess_record = models.ForeignKey(
+        ReprocessRecord, on_delete=models.CASCADE, related_name="returns"
+    )
+    goods_receipt = models.ForeignKey(
+        "purchase.GoodsReceipt", null=True, blank=True, on_delete=models.SET_NULL, related_name="reprocess_returns"
+    )
+    grn_number = models.TextField(null=True, blank=True)
+    return_quantity = models.DecimalField(max_digits=18, decimal_places=4)
+    return_date = models.DateField(default=timezone.localdate)
+    vendor_return_challan = models.TextField(default="")
+    reprocess_charges = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    remarks = models.TextField(null=True, blank=True)
+    idempotency_key = models.TextField(null=True, blank=True, db_index=True)
+    qc_status = models.TextField(default="Pending")
+
+    class Meta:
+        db_table = "inventory_reprocess_returns"
+        ordering = ["-return_date", "-created_at"]
+
+    def __str__(self):
+        return f"{self.reprocess_record.reprocess_number} Return: {self.return_quantity} ({self.grn_number})"

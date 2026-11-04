@@ -12,6 +12,8 @@ from django.db.models.functions import Coalesce
 
 from django.utils import timezone
 
+from django.utils.dateparse import parse_date
+
 from rest_framework import status
 
 from rest_framework.decorators import action
@@ -62,6 +64,7 @@ from .models import (
 
     PURCHASE_TYPE_VENDOR_A,
 
+    PAYMENT_MODES,
     VENDOR_BILL_PENDING_STATUSES,
 
     Expense,
@@ -2270,6 +2273,19 @@ class PurchaseBillViewSet(SalesDocumentViewSet):
 
     }
 
+    def get_object(self):
+        lookup_url_kwarg = self.lookup_url_kwarg or self.lookup_field
+        pk = self.kwargs.get(lookup_url_kwarg)
+        try:
+            import uuid
+            uuid.UUID(str(pk))
+        except (ValueError, TypeError, AttributeError):
+            obj = self.get_queryset().filter(bill_number__iexact=str(pk)).first()
+            if obj:
+                self.check_object_permissions(self.request, obj)
+                return obj
+        return super().get_object()
+
     permission_map = {"read": ["view_purchase"], "write": ["create_bill"]}
 
 
@@ -2638,7 +2654,18 @@ class GoodsReceiptViewSet(TenantModelViewSet):
 
     }
 
-
+    def get_object(self):
+        lookup_url_kwarg = self.lookup_url_kwarg or self.lookup_field
+        pk = self.kwargs.get(lookup_url_kwarg)
+        try:
+            import uuid
+            uuid.UUID(str(pk))
+        except (ValueError, TypeError, AttributeError):
+            obj = self.get_queryset().filter(grn_number__iexact=str(pk)).first()
+            if obj:
+                self.check_object_permissions(self.request, obj)
+                return obj
+        return super().get_object()
 
     def list(self, request, *args, **kwargs):
 
@@ -3524,7 +3551,26 @@ class VendorBillViewSet(TenantModelViewSet):
 
     permission_map = {"read": ["view_purchase"], "write": ["create_bill"]}
 
+    idempotent_create = True
 
+    @transaction.atomic
+    def create(self, request, *args, **kwargs):
+        return super().create(request, *args, **kwargs)
+
+    def _assert_editable(self, bill):
+        if bill.purchase_bill_id or bill.status not in ("Draft", *VENDOR_BILL_PENDING_STATUSES):
+            raise Conflict(
+                f"Vendor bill {bill.vendor_bill_number} is {bill.status} and can no longer be changed.",
+                code=Codes.DRAFT_ONLY,
+            )
+
+    def perform_update(self, serializer):
+        self._assert_editable(serializer.instance)
+        return super().perform_update(serializer)
+
+    def perform_destroy(self, instance):
+        self._assert_editable(instance)
+        return super().perform_destroy(instance)
 
     def get_queryset(self):
 
@@ -3565,10 +3611,6 @@ class VendorBillViewSet(TenantModelViewSet):
         if not po:
             raise NotFound("Purchase order not found.")
 
-        from apps.inventory.models import Batch
-        from apps.purchase.models import PurchaseBillLine, VendorBillLine
-        from decimal import Decimal
-
         party = po.party
         primary_contact = None
         if party:
@@ -3597,136 +3639,10 @@ class VendorBillViewSet(TenantModelViewSet):
             "state": state,
             "stateCode": state_code,
             "paymentTerms": (party.payment_terms if party and party.payment_terms else po.payment_terms) or "—",
+            "outstandingBalance": float(party.balance or 0) if party else 0.0,
         }
 
-        # PO Summary metrics
-        first_line = po.line_items.filter(deleted_at__isnull=True).first()
-        ordered_qty = sum([Decimal(str(l.qty or 0)) for l in po.line_items.filter(deleted_at__isnull=True)])
-        original_po_rate = Decimal(str(first_line.rate or 0)) if first_line else Decimal("0")
-        original_po_amount = Decimal(str(po.total or 0))
-        fabric_quality = "—"
-        if first_line:
-            if getattr(first_line, "fabric_quality", None):
-                fq_obj = first_line.fabric_quality
-                fabric_quality = getattr(fq_obj, "name", None) or str(fq_obj)
-            elif first_line.item:
-                fabric_quality = first_line.item.name or "—"
-
-        batches_qs = Batch.objects.filter(
-            purchase_order=po, deleted_at__isnull=True
-        ).select_related("goods_receipt", "goods_receipt_line", "item")
-
-        pb_lines = list(
-            PurchaseBillLine.objects.filter(
-                purchase_bill__purchase_order=po,
-                purchase_bill__deleted_at__isnull=True
-            ).exclude(purchase_bill__status="Cancelled").values("batch_number", "qty")
-        )
-        vb_lines = list(
-            VendorBillLine.objects.filter(
-                vendor_bill__purchase_order=po,
-                vendor_bill__deleted_at__isnull=True
-            ).exclude(vendor_bill__status__in=["Cancelled", "Rejected"]).values("batch_id", "batch_number", "qty")
-        )
-
-        total_received = Decimal("0")
-        total_billed = Decimal("0")
-        batch_list = []
-
-        for b in batches_qs:
-            gl = b.goods_receipt_line
-            grn = b.goods_receipt
-            recv_qty = Decimal(str(gl.received_qty)) if gl else Decimal("0")
-            lot_no = gl.batch_number if gl else ""
-
-            billed_qty = Decimal("0")
-            for pbl in pb_lines:
-                pbl_batch = pbl.get("batch_number")
-                if pbl_batch and (pbl_batch == b.batch_code or pbl_batch == lot_no):
-                    billed_qty += Decimal(str(pbl.get("qty") or 0))
-            for vbl in vb_lines:
-                vbl_id = str(vbl.get("batch_id") or "")
-                vbl_num = vbl.get("batch_number") or ""
-                if (vbl_id and vbl_id == str(b.id)) or (vbl_num and (vbl_num == b.batch_code or vbl_num == lot_no)):
-                    billed_qty += Decimal(str(vbl.get("qty") or 0))
-
-            rem_billable = max(Decimal("0"), recv_qty - billed_qty)
-            total_received += recv_qty
-            total_billed += billed_qty
-
-            po_rate = original_po_rate
-            if b.purchase_order_line and b.purchase_order_line.rate:
-                po_rate = Decimal(str(b.purchase_order_line.rate))
-            elif b.item_id:
-                matching_pol = po.line_items.filter(item_id=b.item_id, deleted_at__isnull=True).first()
-                if matching_pol and matching_pol.rate:
-                    po_rate = Decimal(str(matching_pol.rate))
-
-            batch_list.append({
-                "batchId": str(b.id),
-                "batchCode": b.batch_code,
-                "grnId": str(grn.id) if grn else None,
-                "grnNumber": grn.grn_number if grn else (b.source_document_number or "—"),
-                "receiptDate": str(grn.receipt_date) if (grn and grn.receipt_date) else str(b.created_on or ""),
-                "itemId": str(b.item_id) if b.item_id else (str(first_line.item_id) if first_line and first_line.item_id else None),
-                "itemName": b.item.name if b.item else (first_line.item_name if first_line else "—"),
-                "sku": b.item.sku if b.item else (first_line.sku if first_line else ""),
-                "uom": b.uom or (b.item.uom if b.item else "Meter"),
-                "receivedQty": float(recv_qty),
-                "previouslyBilledQty": float(billed_qty),
-                "remainingBillableQty": float(rem_billable),
-                "originalPoRate": float(po_rate),
-                "billRate": float(po_rate),
-                "billQty": float(rem_billable),
-                "isFullyBilled": rem_billable <= Decimal("0"),
-            })
-
-        if not batch_list:
-            for l in po.line_items.filter(deleted_at__isnull=True):
-                recv = Decimal(str(l.received_qty or 0))
-                billed = Decimal(str(l.billed_qty or 0))
-                rem = max(Decimal("0"), (recv if recv > 0 else Decimal(str(l.qty or 0))) - billed)
-                total_received += (recv if recv > 0 else Decimal(str(l.qty or 0)))
-                total_billed += billed
-                batch_list.append({
-                    "batchId": None,
-                    "batchCode": "PO Line",
-                    "grnId": None,
-                    "grnNumber": "Direct PO",
-                    "receiptDate": str(po.doc_date or ""),
-                    "itemId": str(l.item_id) if l.item_id else None,
-                    "itemName": l.item_name or (l.item.name if l.item else "—"),
-                    "sku": l.sku or (l.item.sku if l.item else ""),
-                    "uom": l.uom or "Meter",
-                    "receivedQty": float(recv if recv > 0 else l.qty),
-                    "previouslyBilledQty": float(billed),
-                    "remainingBillableQty": float(rem),
-                    "originalPoRate": float(l.rate or 0),
-                    "billRate": float(l.rate or 0),
-                    "billQty": float(rem),
-                    "isFullyBilled": rem <= Decimal("0"),
-                })
-
-        po_summary = {
-            "poId": str(po.id),
-            "poNumber": po.po_number,
-            "poDate": str(po.doc_date),
-            "vendorName": party.name if party else (po.party_name or "—"),
-            "fabricQuality": fabric_quality,
-            "orderedQty": float(ordered_qty),
-            "receivedQty": float(total_received),
-            "previouslyBilledQty": float(total_billed),
-            "remainingBillableQty": float(max(Decimal("0"), total_received - total_billed)),
-            "originalPoRate": float(original_po_rate),
-            "originalPoAmount": float(original_po_amount),
-            "defaultGstPct": 5.0,
-        }
-
-        return Response({
-            "vendor": vendor_data,
-            "poSummary": po_summary,
-            "batches": batch_list,
-        })
+        return Response({"vendor": vendor_data, **services.vendor_bill_po_snapshot(po)})
 
     def get_aggregates(self, queryset):
 
@@ -3768,7 +3684,7 @@ class VendorBillViewSet(TenantModelViewSet):
 
             )
 
-        if bill.match_status == "Matched" or bill.purchase_bill_id:
+        if bill.purchase_bill_id:
 
             raise Conflict(
 
@@ -4177,6 +4093,8 @@ class VendorBillViewSet(TenantModelViewSet):
 
         bill.match_result = matching
 
+        bill.match_status = "Mismatch" if is_mismatch else "Matched"
+
         history = list(bill.approval_history or [])
 
         history.append(
@@ -4205,123 +4123,18 @@ class VendorBillViewSet(TenantModelViewSet):
 
         auto_create_pb = request.data.get("createPayable", False) or getattr(request, "_create_payable", False)
 
-        if auto_create_pb and bill.purchase_bill_id is None:
-
-            final_po_data = matching.get("finalJobWorkPo")
-
-            final_po_id = final_po_data.get("id") if final_po_data else None
-
-            effective_po = PurchaseOrder.objects.filter(pk=final_po_id, client_id=bill.client_id).first() if final_po_id else bill.purchase_order
-
-            lines = bill.line_items.filter(deleted_at__isnull=True).order_by("line_no")
-
-            purchase_bill = PurchaseBill.objects.create(
-
-                client=bill.client,
-
-                party=bill.party,
-
-                purchase_order=effective_po,
-
-                doc_date=bill.bill_date,
-
-                status="Unpaid",
-
-                bill_number=allocate_number(bill.client, "BILL", bill.bill_date),
-
-                vendor_bill_number=bill.vendor_bill_number,
-
-                location_id=getattr(effective_po, "location_id", None),
-
-                notes=remarks or bill.remarks or f"Recorded from Vendor Bill {bill.vendor_bill_number}",
-
+        if auto_create_pb:
+            bill.purchase_bill = services.ensure_vendor_bill_payable(
+                bill, matching=matching, remarks=remarks, user=request.user
             )
 
-            for line in lines:
-
-                PurchaseBillLine.objects.create(
-
-                    client=bill.client,
-
-                    purchase_bill=purchase_bill,
-
-                    line_no=line.line_no,
-
-                    item=line.item,
-
-                    description=line.item_name or (line.item.name if line.item else "Fabric"),
-
-                    qty=line.qty,
-
-                    rate=line.rate,
-
-                    tax_pct=bill.gst_pct,
-
-                    uom=line.uom or "Meter",
-
-                )
-
-            from apps.sales.services import recalculate_document
-
-            from apps.accounting import services as ledger
-
-            from .models import PURCHASE_TYPE_FINAL_JOB_WORK
-
-
-
-            purchase_bill.freeze_party_snapshot()
-
-            recalculate_document(purchase_bill)
-
-            # The payable is real from here on, so it is posted like any other
-
-            # bill: Dr Inventory/Purchases + GST Input | Cr Creditors.
-
-            purchase_bill.posted_at = now
-
-            purchase_bill.posted_by = request.user if getattr(request.user, "is_authenticated", False) else None
-
-            # Job-work fabric is stocked at production verification and GRN-linked
-
-            # goods are already in stock; "Receive goods" on this bill would
-
-            # post them a second time.
-
-            if bill.goods_receipt_id or getattr(effective_po, "purchase_type", None) == PURCHASE_TYPE_FINAL_JOB_WORK:
-
-                purchase_bill.goods_received = True
-
-                purchase_bill.received_date = timezone.localdate()
-
-            purchase_bill.save()
-
-            entry = ledger.post_purchase_bill(purchase_bill, user=request.user)
-
-            if entry is not None:
-
-                purchase_bill.journal_entry = entry
-
-                purchase_bill.save(update_fields=["journal_entry", "updated_at"])
-
-            bill.purchase_bill = purchase_bill
-
-            bill.match_status = "Matched"
-
-
-
-        save_fields = [
-
-            "status", "approval_remarks", "approved_by", "approved_at",
-
-            "approval_history", "match_result", "updated_at",
-
-        ]
-
-        if bill.purchase_bill_id is not None:
-
-            save_fields.extend(["purchase_bill", "match_status"])
-
-        bill.save(update_fields=save_fields)
+        bill.save(
+            update_fields=[
+                "status", "approval_remarks", "approved_by", "approved_at",
+                "approval_history", "match_result", "match_status",
+                "purchase_bill", "updated_at",
+            ]
+        )
 
         description = remarks
 
@@ -4429,19 +4242,20 @@ class VendorBillViewSet(TenantModelViewSet):
 
     def recheck_matching(self, request, pk=None):
 
-        """Recompute the comparison and persist it on ``match_result``."""
+        """Recompute the comparison and persist it on ``match_result``.
 
+        A bill still awaiting approval also takes the result as its match
+        status; a decided bill keeps the status it was decided on.
+        """
         bill = self.get_object()
-
         result = services.compute_vendor_bill_matching(request.client_id, bill)
-
         bill.match_result = result
-
-        bill.save(update_fields=["match_result", "updated_at"])
-
+        update_fields = ["match_result", "updated_at"]
+        if bill.status in VENDOR_BILL_PENDING_STATUSES:
+            bill.match_status = "Matched" if result.get("overallStatus") == "Match" else "Mismatch"
+            update_fields.append("match_status")
+        bill.save(update_fields=update_fields)
         return Response(result)
-
-
 
     @action(detail=True, methods=["get"], url_path="approval-history")
 
@@ -4847,6 +4661,134 @@ class VendorBillViewSet(TenantModelViewSet):
 
 
 
+
+
+    @action(detail=True, methods=["post"], url_path="pay")
+    @transaction.atomic
+    def pay(self, request, pk=None):
+        """Pay an approved vendor bill through the normal payment-out flow.
+
+        The same Idempotency-Key replays the first voucher instead of adding
+        a second one. Payment progress lives on the payable, not on
+        ``bill.status``, so cancelling a payment needs nothing undone here.
+        """
+        from apps.accounting.models import BankAccount
+        from apps.core.exceptions import PermissionDenied
+        from apps.core.permissions import has_permission
+
+        if not has_permission(request.user, "record_payment_out"):
+            raise PermissionDenied(
+                "You do not have permission to record vendor payments.",
+                code="record_payment_out",
+            )
+        try:
+            record = idempotency.begin(request, request.client_id, request.path, request.data)
+        except idempotency.Replay as replay:
+            response = Response(replay.body, status=replay.status)
+            response["Idempotency-Replayed"] = "true"
+            return response
+
+        # Lock the row: two simultaneous payments must see each other's effect.
+        bill = (
+            VendorBill.objects.select_for_update(of=("self",))
+            .select_related("purchase_bill", "purchase_order")
+            .filter(pk=pk, client_id=request.client_id, deleted_at__isnull=True)
+            .first()
+        )
+        if bill is None:
+            raise NotFound("Vendor bill not found.")
+
+        workflow = services.vendor_bill_workflow(bill)
+        if "pay" not in workflow["actions"]:
+            if workflow["stage"] == "paid":
+                raise Conflict("This vendor bill is already fully paid.", code=Codes.ALREADY_SETTLED)
+            raise Conflict(
+                f"Only an approved vendor bill can be paid. This bill is: {workflow['label']}.",
+                code="BILL_NOT_PAYABLE",
+            )
+        po = bill.purchase_order
+        if po is not None and po.party_id and po.party_id != bill.party_id:
+            raise Conflict(
+                f"This bill's vendor does not match purchase order {po.po_number}.",
+                code="BILL_VENDOR_MISMATCH",
+            )
+
+        try:
+            amount = round2(D(str(request.data.get("amount") or 0)))
+        except ArithmeticError:
+            amount = ZERO
+        if amount <= ZERO:
+            raise ValidationFailed(
+                "Enter a valid payment amount greater than zero.",
+                field_errors={"amount": ["Must be greater than zero."]},
+            )
+
+        mode = request.data.get("mode") or "Bank Transfer"
+        if mode not in PAYMENT_MODES:
+            raise ValidationFailed(
+                f"{mode} is not a valid payment mode.",
+                field_errors={"mode": [f"Choose one of: {', '.join(PAYMENT_MODES)}."]},
+            )
+        payment_date = parse_date(str(request.data.get("date") or "")) or timezone.localdate()
+        bank_account = None
+        bank_account_id = request.data.get("bankAccountId")
+        if bank_account_id:
+            bank_account = BankAccount.objects.filter(
+                pk=bank_account_id, client_id=request.client_id, deleted_at__isnull=True
+            ).first()
+
+        reference_number = (request.data.get("reference") or "").strip() or None
+        if reference_number and PaymentOut.objects.filter(
+            client_id=request.client_id, party_id=bill.party_id, status="Active",
+            reference_number__iexact=reference_number, deleted_at__isnull=True,
+        ).exists():
+            raise Conflict(
+                f"A payment with reference {reference_number} is already recorded for this vendor.",
+                code="DUPLICATE_PAYMENT_REFERENCE",
+            )
+
+        # A bill approved without one still needs a posted payable to pay into.
+        payable = services.ensure_vendor_bill_payable(bill, user=request.user)
+        if bill.purchase_bill_id != payable.id:
+            bill.purchase_bill = payable
+            bill.save(update_fields=["purchase_bill", "updated_at"])
+
+        payment = services.record_payment_out(
+            client=request.user.client,
+            party=bill.party,
+            amount=amount,
+            payment_date=payment_date,
+            mode=mode,
+            bank_account=bank_account,
+            reference_number=reference_number,
+            notes=request.data.get("remarks") or (
+                f"Payment against Vendor Bill {bill.vendor_bill_number}"
+                + (f" (PO: {po.po_number})" if po else "")
+            ),
+            bill=payable,
+            user=request.user,
+        )
+
+        payable.refresh_from_db()
+        bill.purchase_bill = payable
+        summary = services.vendor_bill_payment_summary(bill)
+        self.write_audit(
+            "pay", bill,
+            description=f"Payment {payment.payment_number} of {amount} against {bill.vendor_bill_number}",
+        )
+        return idempotency.finish(
+            record,
+            Response({
+                "success": True,
+                "message": f"Payment of ₹{amount} recorded against bill {bill.vendor_bill_number}.",
+                "paymentId": str(payment.id),
+                "paymentNumber": payment.payment_number,
+                "amountPaid": float(summary["paid"]),
+                "outstandingAmount": float(summary["outstanding"]),
+                "paymentStatus": summary["paymentStatus"],
+            }),
+            payment,
+        )
 
 
 class VendorLookupViewSet(ReadOnlyTenantViewSet):

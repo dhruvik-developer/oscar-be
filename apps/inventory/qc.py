@@ -95,11 +95,7 @@ def verdict_for(cumulative, hold_now):
     passed = cumulative.get("good", ZERO) + cumulative.get("second", ZERO)
     if passed <= ZERO:
         return "Rework" if cumulative.get("reprocess", ZERO) > ZERO else "Rejected"
-    if (
-        cumulative.get("reprocess", ZERO)
-        + cumulative.get("reject", ZERO)
-        + cumulative.get("second", ZERO)
-    ) > ZERO:
+    if cumulative.get("reprocess", ZERO) > ZERO:
         return "Partially Approved"
     return "Approved"
 
@@ -119,13 +115,27 @@ def receipt_has_stock(receipt):
     ).exists()
 
 
-def receipt_pool(receipt):
+def receipt_pool(receipt, source_location=None, from_reprocess=False):
     """The stock of ``receipt`` still awaiting QC, as a list of units.
 
     A unit is one taka (``lot`` set) or, for items not held on takas, the
-    item's quantity held at QC Hold for this receipt.
+    item's quantity held at QC Hold or Reprocess for this receipt.
     """
-    qc_location = stock.system_location(receipt.client_id, "QC_HOLD")
+    if source_location is not None:
+        qc_location = source_location
+    elif from_reprocess or receipt.qc_status in ("Partially Approved", "Reprocess", "Rework"):
+        reprocess_loc = stock.system_location(receipt.client_id, "REPROCESS")
+        reprocess_held = StockMovement.objects.filter(
+            client_id=receipt.client_id,
+            source_document_id=receipt.id,
+            location_id=reprocess_loc.id,
+        ).aggregate(total=Sum("quantity"))["total"] or ZERO
+        if reprocess_held > ZERO or from_reprocess:
+            qc_location = reprocess_loc
+        else:
+            qc_location = stock.system_location(receipt.client_id, "QC_HOLD")
+    else:
+        qc_location = stock.system_location(receipt.client_id, "QC_HOLD")
     lines = list(receipt.lines.filter(deleted_at__isnull=True).select_related("item"))
     line_by_id = {line.id: line for line in lines}
 
@@ -221,6 +231,7 @@ def dispose_receipt(
     job_work_order=None,
     require_job_work_order=True,
     movement_date=None,
+    from_reprocess=False,
 ):
     from apps.purchase.models import GoodsReceipt, PurchaseBill
 
@@ -229,13 +240,29 @@ def dispose_receipt(
         .select_related("purchase_bill", "party")
         .get(pk=receipt.pk)
     )
-    if receipt.qc_status not in ("Pending", "Draft", "On Hold"):
-        raise Conflict(
-            f"QC inspection for {receipt.grn_number} has already been completed with status '{receipt.qc_status}'.",
-            code="QC_ALREADY_DONE",
-        )
+    reprocess_loc = stock.system_location(receipt.client_id, "REPROCESS")
+    reprocess_held = StockMovement.objects.filter(
+        client_id=receipt.client_id,
+        source_document_id=receipt.id,
+        location_id=reprocess_loc.id,
+    ).aggregate(total=Sum("quantity"))["total"] or ZERO
 
-    units, qc_location = receipt_pool(receipt)
+    is_reprocess_inspection = from_reprocess or (
+        receipt.qc_status in ("Partially Approved", "Reprocess", "Rework")
+    )
+
+    if not is_reprocess_inspection:
+        if receipt.qc_status not in ("Pending", "Draft", "On Hold"):
+            raise Conflict(
+                f"QC inspection for {receipt.grn_number} has already been completed with status '{receipt.qc_status}'.",
+                code="QC_ALREADY_DONE",
+            )
+
+    units, qc_location = receipt_pool(
+        receipt,
+        source_location=reprocess_loc if is_reprocess_inspection else None,
+        from_reprocess=is_reprocess_inspection,
+    )
     pool_total = round4(sum((unit["qty"] for unit in units), ZERO))
     record_only = False
 
@@ -465,6 +492,7 @@ def dispose_receipt(
     verdict = record_receipt_verdict(
         receipt, quantities, user=user, remarks=remarks, measurements=measurements,
         stock_posted=not record_only, reprocess_order=reprocess_order,
+        is_reprocess=is_reprocess_inspection,
     )
     return {
         "verdict": verdict,
@@ -477,7 +505,7 @@ def dispose_receipt(
 
 
 def record_receipt_verdict(receipt, quantities, *, user=None, remarks=None, measurements=None,
-                           stock_posted=True, reprocess_order=None):
+                           stock_posted=True, reprocess_order=None, is_reprocess=False):
     """Add a QC result to the receipt's running totals and set its verdict,
     bill QC status and audit trail. Shared by the quantity disposition and
     the roll-by-roll QC entry. Returns the verdict."""
@@ -488,8 +516,15 @@ def record_receipt_verdict(receipt, quantities, *, user=None, remarks=None, meas
         category: D(str(meta.get("cumulative", {}).get(category, 0)))
         for category in ("good", "second", "reprocess", "reject")
     }
-    for category in ("good", "second", "reprocess", "reject"):
-        cumulative[category] += quantities[category]
+    if is_reprocess:
+        dispositioned_from_reprocess = quantities.get("good", ZERO) + quantities.get("second", ZERO) + quantities.get("reject", ZERO)
+        cumulative["reprocess"] = max(ZERO, cumulative.get("reprocess", ZERO) - dispositioned_from_reprocess)
+        cumulative["good"] = cumulative.get("good", ZERO) + quantities.get("good", ZERO)
+        cumulative["second"] = cumulative.get("second", ZERO) + quantities.get("second", ZERO)
+        cumulative["reject"] = cumulative.get("reject", ZERO) + quantities.get("reject", ZERO)
+    else:
+        for category in ("good", "second", "reprocess", "reject"):
+            cumulative[category] += quantities[category]
     verdict = verdict_for(cumulative, quantities["hold"])
 
     previous_status = receipt.qc_status
@@ -518,6 +553,34 @@ def record_receipt_verdict(receipt, quantities, *, user=None, remarks=None, meas
             qc_note=remarks or None,
             updated_at=timezone.now(),
         )
+
+    if verdict in ("Approved", "Passed"):
+        from apps.inventory.models import Batch
+        Batch.objects.filter(goods_receipt=receipt).update(updated_at=timezone.now())
+
+    # Update any linked ReprocessReturn and its ReprocessRecord
+    try:
+        from apps.inventory.models import ReprocessReturn, ReprocessRecord
+        returns = list(ReprocessReturn.objects.filter(goods_receipt=receipt))
+        if returns:
+            rep_status = "Approved" if verdict in ("Approved", "Passed") else verdict
+            ReprocessReturn.objects.filter(goods_receipt=receipt).update(
+                qc_status=rep_status,
+                qc_notes=remarks or "",
+                updated_at=timezone.now(),
+            )
+            record_ids = {r.reprocess_record_id for r in returns if r.reprocess_record_id}
+            for rec in ReprocessRecord.objects.filter(id__in=record_ids):
+                all_rets = list(rec.returns.all())
+                any_pending = any(r.qc_status in ("Pending", "Draft") for r in all_rets)
+                if not any_pending:
+                    rec.reprocess_qc_status = "Passed"
+                    if rec.outstanding_quantity <= ZERO:
+                        rec.status = "Completed"
+                    rec.save(update_fields=["reprocess_qc_status", "status", "updated_at"])
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("Error updating reprocess return status: %s", e)
 
     from apps.core.audit import record_audit
 

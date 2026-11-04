@@ -23,6 +23,7 @@ from apps.core.serializers import (
 )
 from apps.sales.serializers import line_serializer_for
 
+from .services import vendor_bill_payment_summary
 from .models import (
     PURCHASE_TYPE_FINAL_JOB_WORK,
     PURCHASE_TYPES,
@@ -268,6 +269,13 @@ class GoodsReceiptLineSerializer(BaseModelSerializer):
     itemId = serializers.CharField(source="item_id", read_only=True)
     sku = serializers.CharField(source="item.sku", read_only=True)
     itemName = serializers.CharField(source="item.name", read_only=True)
+    unitCost = serializers.DecimalField(source="unit_cost", max_digits=14, decimal_places=4, read_only=True)
+    batchCost = serializers.SerializerMethodField()
+
+    def get_batchCost(self, obj):
+        if obj.unit_cost and obj.received_qty:
+            return str(round(float(obj.unit_cost) * float(obj.received_qty), 2))
+        return "0.00"
 
     class Meta:
         model = GoodsReceiptLine
@@ -276,7 +284,7 @@ class GoodsReceiptLineSerializer(BaseModelSerializer):
             "ordered_qty", "received_qty",
             "weighed_qty", "rejected_qty", "shortage_qty", "excess_qty",
             "roll_count", "weight_kg", "fabric_width", "remarks",
-            "batch_number", "unit_cost", "variation_pct",
+            "batch_number", "unit_cost", "unitCost", "batchCost", "variation_pct",
         ]
 
 
@@ -495,6 +503,7 @@ class VendorBillSerializer(BaseModelSerializer):
     gstPct = PercentField(source="gst_pct", required=False)
     subtotal = MoneyField(read_only=True)
     gstAmount = MoneyField(source="gst_amount", read_only=True)
+    otherCharges = MoneyField(source="other_charges", required=False)
     total = MoneyField(read_only=True)
     matchStatus = serializers.CharField(source="match_status", read_only=True)
     remarks = serializers.CharField(required=False, allow_null=True, allow_blank=True)
@@ -510,6 +519,19 @@ class VendorBillSerializer(BaseModelSerializer):
     lineItems = serializers.ListField(
         child=serializers.DictField(), required=False, write_only=True
     )
+    lines = VendorBillLineSerializer(source="line_items", many=True, read_only=True)
+    amountPaid = serializers.SerializerMethodField()
+    outstandingAmount = serializers.SerializerMethodField()
+    paymentStatus = serializers.SerializerMethodField()
+
+    def get_amountPaid(self, bill):
+        return float(vendor_bill_payment_summary(bill)["paid"])
+
+    def get_outstandingAmount(self, bill):
+        return float(vendor_bill_payment_summary(bill)["outstanding"])
+
+    def get_paymentStatus(self, bill):
+        return vendor_bill_payment_summary(bill)["paymentStatus"]
 
     class Meta:
         model = VendorBill
@@ -517,10 +539,10 @@ class VendorBillSerializer(BaseModelSerializer):
             "id", "vendorBillNumber", "billDate", "vendorId", "vendorName",
             "purchaseOrderId", "poNumber", "grnId", "attachmentFileId", "billFileName",
             "purchaseBillId", "purchaseBillNumber", "gstPct", "subtotal",
-            "gstAmount", "total", "remarks", "status", "matchStatus",
+            "gstAmount", "otherCharges", "total", "remarks", "status", "matchStatus",
             "approvalRemarks", "approvedAt", "approvedByName",
             "approvalHistory", "matchResult",
-            "lineItems", "created_at", "updated_at",
+            "lineItems", "lines", "amountPaid", "outstandingAmount", "paymentStatus", "created_at", "updated_at",
         ]
         # `status` moves only through approve / reject / matching actions.
         read_only_fields = [
@@ -528,6 +550,7 @@ class VendorBillSerializer(BaseModelSerializer):
             "subtotal", "gstAmount", "total", "matchStatus",
             "approvalRemarks", "approvedAt", "approvedByName",
             "approvalHistory", "matchResult",
+            "lines", "amountPaid", "outstandingAmount", "paymentStatus",
             "created_at", "updated_at",
         ]
 
@@ -560,9 +583,26 @@ class VendorBillSerializer(BaseModelSerializer):
             raise serializers.ValidationError(
                 {"purchaseOrderId": "Purchase order selection is mandatory."}
             )
+        if po is not None:
+            # Serialises concurrent bills on one PO: each sees what the other billed.
+            PurchaseOrder.objects.select_for_update().filter(pk=po.pk).first()
+            if po.status == "Cancelled":
+                raise serializers.ValidationError(
+                    {"purchaseOrderId": f"Purchase order {po.po_number} is cancelled."}
+                )
+        chosen_party = attrs.get("party")
+        if po and po.party_id and chosen_party is not None and chosen_party.pk != po.party_id:
+            raise serializers.ValidationError(
+                {"vendorId": f"This vendor is not the vendor on purchase order {po.po_number}."}
+            )
         if po and po.party:
             attrs["party"] = po.party
 
+        other_charges = attrs.get("other_charges")
+        if other_charges is not None and D(other_charges) < ZERO:
+            raise serializers.ValidationError(
+                {"otherCharges": "Other charges cannot be negative."}
+            )
         gst_pct = attrs.get("gst_pct", getattr(self.instance, "gst_pct", None))
         if gst_pct is not None and D(gst_pct) < ZERO:
             raise serializers.ValidationError(
@@ -584,9 +624,9 @@ class VendorBillSerializer(BaseModelSerializer):
                     raise serializers.ValidationError(
                         {"lineItems": "Billed quantity must be greater than zero."}
                     )
-                if rate < ZERO:
+                if rate <= ZERO:
                     raise serializers.ValidationError(
-                        {"lineItems": "Rate cannot be negative."}
+                        {"lineItems": "Enter the actual vendor rate from the invoice."}
                     )
                 b_id = line.get("batchId") or line.get("batch")
                 b_num = line.get("batchNumber") or line.get("batchCode")
@@ -606,10 +646,13 @@ class VendorBillSerializer(BaseModelSerializer):
                     lot_no = gl.batch_number if gl else ""
                     recv_qty = D(str(gl.received_qty)) if gl else D("0")
                     pb_billed = D("0")
+                    # A payable made from a vendor bill repeats that bill's lines.
                     for pbl in PurchaseBillLine.objects.filter(
                         purchase_bill__purchase_order=po,
                         purchase_bill__deleted_at__isnull=True
-                    ).exclude(purchase_bill__status="Cancelled"):
+                    ).exclude(purchase_bill__status="Cancelled").exclude(
+                        purchase_bill__vendor_bills__deleted_at__isnull=True
+                    ):
                         if pbl.batch_number and (pbl.batch_number == batch.batch_code or pbl.batch_number == lot_no):
                             pb_billed += D(str(pbl.qty or 0))
                     vb_billed = D("0")
@@ -661,6 +704,10 @@ class VendorBillSerializer(BaseModelSerializer):
         if line_payloads is not None:
             self._replace_lines(bill, line_payloads)
         self._recalculate(bill)
+        # The earlier comparison was of a bill that no longer exists.
+        bill.match_status = "Pending Matching"
+        bill.match_result = None
+        bill.save(update_fields=["match_status", "match_result", "updated_at"])
         return bill
 
     def _write_lines(self, bill, payloads):
@@ -713,7 +760,7 @@ class VendorBillSerializer(BaseModelSerializer):
         bill.gst_amount = round2(
             bill.subtotal * D(bill.gst_pct) / Decimal("100")
         )
-        bill.total = round2(bill.subtotal + bill.gst_amount)
+        bill.total = round2(bill.subtotal + bill.gst_amount + D(bill.other_charges or 0))
         bill.save(
             update_fields=["subtotal", "gst_amount", "total", "updated_at"]
         )
