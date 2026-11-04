@@ -29,6 +29,8 @@ from .models import (
     AssetCategory,
     AssetRequest,
     Attendance,
+    AttendanceBreak,
+    AttendancePunch,
     AttendanceRegularization,
     CalendarEvent,
     Candidate,
@@ -200,22 +202,85 @@ class AttendanceSerializer(BaseModelSerializer):
         source="employee", model="hrms.Employee", required=False, allow_null=True
     )
     employeeName = serializers.CharField(source="employee.name", read_only=True)
+    name = serializers.CharField(source="employee.name", read_only=True)
     employeeCode = serializers.CharField(source="employee.employee_code", read_only=True)
+    empId = serializers.CharField(source="employee.employee_code", read_only=True)
     department = serializers.CharField(source="employee.department.name", read_only=True)
+    dept = serializers.CharField(source="employee.department.name", read_only=True)
+    shift = serializers.CharField(source="employee.shift", read_only=True)
     date = serializers.DateField(source="work_date")
     checkIn = serializers.DateTimeField(source="check_in", required=False, allow_null=True)
     checkOut = serializers.DateTimeField(source="check_out", required=False, allow_null=True)
+    firstPunch = serializers.DateTimeField(source="first_punch", required=False, allow_null=True)
+    lastPunch = serializers.SerializerMethodField()
+    workingHours = serializers.DecimalField(source="working_hours", max_digits=6, decimal_places=2, required=False, allow_null=True)
+    totalBreakMinutes = serializers.IntegerField(source="total_break_minutes", required=False)
+    totalAttendanceHours = serializers.DecimalField(source="total_attendance_hours", max_digits=6, decimal_places=2, required=False, allow_null=True)
+    lateMinutes = serializers.IntegerField(source="late_minutes", required=False)
+    earlyLeavingMinutes = serializers.IntegerField(source="early_leaving_minutes", required=False)
+    overtimeHours = serializers.DecimalField(source="overtime_hours", max_digits=6, decimal_places=2, required=False)
+    punches = serializers.SerializerMethodField()
+    breaks = serializers.SerializerMethodField()
+    formattedWorkingHours = serializers.SerializerMethodField()
 
     class Meta:
         model = Attendance
         fields = [
-            "id", "employeeId", "employeeName", "employeeCode", "department",
-            "date", "checkIn", "checkOut", "hours", "status", "source",
-            "remark", "leave_request", "created_at", "updated_at",
+            "id", "employeeId", "employeeName", "name", "employeeCode", "empId", "department", "dept", "shift",
+            "date", "checkIn", "checkOut", "firstPunch", "lastPunch", "hours", "workingHours",
+            "totalBreakMinutes", "totalAttendanceHours", "lateMinutes", "earlyLeavingMinutes", "overtimeHours",
+            "punches", "breaks", "formattedWorkingHours",
+            "status", "source", "remark", "leave_request", "created_at", "updated_at",
         ]
-        # `hours` and the Late / Half Day verdict come from the flexibility
-        # policy, applied server-side (api.md §11.2).
-        read_only_fields = ["hours", "source", "leave_request", "created_at", "updated_at"]
+        read_only_fields = ["hours", "workingHours", "totalBreakMinutes", "totalAttendanceHours", "lateMinutes", "earlyLeavingMinutes", "overtimeHours", "source", "leave_request", "created_at", "updated_at"]
+
+    def get_lastPunch(self, obj):
+        val = obj.last_punch or obj.check_out
+        if not val:
+            return None
+        local_dt = timezone.localtime(val) if timezone.is_aware(val) else val
+        return local_dt.strftime("%I:%M %p")
+
+    def get_formattedWorkingHours(self, obj):
+        wh = obj.working_hours if obj.working_hours is not None else obj.hours
+        if wh is None:
+            return "00h 00m"
+        total_m = int(float(wh) * 60)
+        h = total_m // 60
+        m = total_m % 60
+        return f"{h:02d}h {m:02d}m"
+
+    def get_punches(self, obj):
+        punches = obj.punches.all().order_by("punch_time")
+        return [
+            {
+                "id": str(p.id),
+                "punchType": p.punch_type,
+                "punchTime": p.punch_time.isoformat(),
+                "timeDisplay": (timezone.localtime(p.punch_time) if timezone.is_aware(p.punch_time) else p.punch_time).strftime("%I:%M %p"),
+                "source": p.source,
+                "remark": p.remark,
+            }
+            for p in punches
+        ]
+
+    def get_breaks(self, obj):
+        breaks = obj.breaks.all().order_by("break_in_time")
+        return [
+            {
+                "id": str(b.id),
+                "breakIn": b.break_in_time.isoformat(),
+                "breakOut": b.break_out_time.isoformat() if b.break_out_time else None,
+                "breakInTime": (timezone.localtime(b.break_in_time) if timezone.is_aware(b.break_in_time) else b.break_in_time).strftime("%I:%M %p"),
+                "breakOutTime": (timezone.localtime(b.break_out_time) if timezone.is_aware(b.break_out_time) else b.break_out_time).strftime("%I:%M %p") if b.break_out_time else None,
+                "duration": f"{(b.duration_seconds // 3600):02d}h {((b.duration_seconds % 3600) // 60):02d}m" if b.break_out_time else "In Progress",
+                "durationSeconds": b.duration_seconds,
+                "durationMinutes": b.duration_minutes,
+                "breakType": b.break_type,
+                "remark": b.remark,
+            }
+            for b in breaks
+        ]
 
     def to_internal_value(self, data):
         data = data.copy() if hasattr(data, "copy") else dict(data)
@@ -253,6 +318,64 @@ class BulkAttendanceSerializer(BaseSerializer):
     records = serializers.ListField(child=serializers.DictField(), required=False, default=list)
     ids = serializers.ListField(child=serializers.CharField(), required=False, default=list)
     status = serializers.CharField(required=False, allow_null=True)
+
+
+class AttendancePunchSerializer(BaseModelSerializer):
+    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee", read_only=True)
+    employeeName = serializers.CharField(source="employee.name", read_only=True)
+    employeeCode = serializers.CharField(source="employee.employee_code", read_only=True)
+    punchType = serializers.CharField(source="punch_type")
+    punchTime = serializers.DateTimeField(source="punch_time")
+    timeDisplay = serializers.SerializerMethodField()
+    date = serializers.DateField(source="work_date", read_only=True)
+
+    class Meta:
+        model = AttendancePunch
+        fields = [
+            "id", "employeeId", "employeeName", "employeeCode", "date",
+            "punchType", "punchTime", "timeDisplay", "source", "remark", "created_at"
+        ]
+        read_only_fields = ["id", "employeeId", "date", "created_at"]
+
+    def get_timeDisplay(self, obj):
+        local_dt = timezone.localtime(obj.punch_time) if timezone.is_aware(obj.punch_time) else obj.punch_time
+        return local_dt.strftime("%I:%M %p")
+
+
+class AttendanceBreakSerializer(BaseModelSerializer):
+    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee", read_only=True)
+    breakIn = serializers.DateTimeField(source="break_in_time")
+    breakOut = serializers.DateTimeField(source="break_out_time", allow_null=True)
+    breakInTime = serializers.SerializerMethodField()
+    breakOutTime = serializers.SerializerMethodField()
+    duration = serializers.SerializerMethodField()
+    durationSeconds = serializers.IntegerField(source="duration_seconds", read_only=True)
+    durationMinutes = serializers.IntegerField(source="duration_minutes", read_only=True)
+    breakType = serializers.CharField(source="break_type")
+
+    class Meta:
+        model = AttendanceBreak
+        fields = [
+            "id", "employeeId", "breakIn", "breakOut", "breakInTime", "breakOutTime",
+            "duration", "durationSeconds", "durationMinutes", "breakType", "remark",
+        ]
+
+    def get_breakInTime(self, obj):
+        local_dt = timezone.localtime(obj.break_in_time) if timezone.is_aware(obj.break_in_time) else obj.break_in_time
+        return local_dt.strftime("%I:%M %p")
+
+    def get_breakOutTime(self, obj):
+        if not obj.break_out_time:
+            return None
+        local_dt = timezone.localtime(obj.break_out_time) if timezone.is_aware(obj.break_out_time) else obj.break_out_time
+        return local_dt.strftime("%I:%M %p")
+
+    def get_duration(self, obj):
+        if not obj.break_out_time:
+            return "In Progress"
+        h = obj.duration_seconds // 3600
+        m = (obj.duration_seconds % 3600) // 60
+        return f"{h:02d}h {m:02d}m"
 
 
 class RegularizationSerializer(BaseModelSerializer):
@@ -422,9 +545,11 @@ class LeaveEncashmentSerializer(BaseModelSerializer):
         source="employee", model="hrms.Employee", required=False, allow_null=True
     )
     employeeName = serializers.CharField(source="employee.name", read_only=True)
-    leaveTypeId = TenantPrimaryKeyRelatedField(source="leave_type", model="hrms.LeaveType")
+    leaveTypeId = TenantPrimaryKeyRelatedField(
+        source="leave_type", model="hrms.LeaveType", required=False, allow_null=True
+    )
     leaveTypeName = serializers.CharField(source="leave_type.name", read_only=True)
-    perDayRate = MoneyField(source="per_day_rate")
+    perDayRate = MoneyField(source="per_day_rate", required=False)
     # GeneratedField (days * per_day_rate) -- see LeaveBalanceSerializer.balance.
     amount = MoneyField(read_only=True)
 
@@ -435,6 +560,36 @@ class LeaveEncashmentSerializer(BaseModelSerializer):
             "days", "perDayRate", "amount", "status", "created_at",
         ]
         read_only_fields = ["amount"]
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        client = getattr(self.context.get("request"), "client", None)
+        client_id = getattr(self.context.get("request"), "client_id", None) or (client.id if client else None)
+
+        # Allow flexible employee resolution: employeeId, or matching by employee name
+        if not attrs.get("employee"):
+            emp_name = self.initial_data.get("employee") or self.initial_data.get("employeeName")
+            if emp_name and client_id:
+                emp = Employee.objects.filter(client_id=client_id, name__iexact=str(emp_name).strip()).first()
+                if emp:
+                    attrs["employee"] = emp
+
+        # Allow fallback perDayRate from ratePerDay or default
+        if not attrs.get("per_day_rate"):
+            rate = self.initial_data.get("ratePerDay") or self.initial_data.get("perDayRate") or 2083
+            attrs["per_day_rate"] = Decimal(str(rate))
+
+        # Allow fallback leaveTypeId to first active leave type if not provided
+        if not attrs.get("leave_type"):
+            lt_id = self.initial_data.get("leaveTypeId") or self.initial_data.get("leaveType")
+            if lt_id:
+                lt = LeaveType.objects.filter(id=lt_id).first()
+                if lt:
+                    attrs["leave_type"] = lt
+            if not attrs.get("leave_type") and client_id:
+                attrs["leave_type"] = LeaveType.objects.filter(client_id=client_id).first()
+
+        return attrs
 
 
 # ---------------------------------------------------------------------------
@@ -1194,9 +1349,54 @@ class TeamSerializer(BaseModelSerializer):
 
 
 class ApprovalChainSerializer(BaseModelSerializer):
+    module = serializers.CharField(source="name", required=False)
+    name = serializers.CharField(required=False)
+    applies_to = serializers.CharField(required=False)
+    tier1 = serializers.CharField(required=False, write_only=True)
+    tier2 = serializers.CharField(required=False, write_only=True)
+    tier3 = serializers.CharField(required=False, write_only=True)
+    autoEscalateDays = serializers.IntegerField(required=False, write_only=True)
+
     class Meta:
         model = ApprovalChain
-        fields = ["id", "name", "applies_to", "steps", "status", "created_at"]
+        fields = [
+            "id", "name", "module", "applies_to", "steps", "status", "created_at",
+            "tier1", "tier2", "tier3", "autoEscalateDays",
+        ]
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret["module"] = instance.name or instance.applies_to
+        steps = instance.steps if isinstance(instance.steps, list) else []
+        ret["tier1"] = steps[0].get("approver", "") if len(steps) > 0 and isinstance(steps[0], dict) else ""
+        ret["tier2"] = steps[1].get("approver", "") if len(steps) > 1 and isinstance(steps[1], dict) else ""
+        ret["tier3"] = steps[2].get("approver", "-") if len(steps) > 2 and isinstance(steps[2], dict) else "-"
+        ret["autoEscalateDays"] = steps[0].get("autoEscalateDays", 3) if steps and isinstance(steps[0], dict) else 3
+        return ret
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        # Support either module/tier frontend format or standard name/applies_to/steps format
+        name = attrs.get("name") or self.initial_data.get("module") or self.initial_data.get("name") or "Workflow"
+        attrs["name"] = name
+        if not attrs.get("applies_to"):
+            attrs["applies_to"] = self.initial_data.get("applies_to") or self.initial_data.get("module", "leave").lower().replace(" ", "_")
+
+        tier1 = self.initial_data.get("tier1") or attrs.pop("tier1", None)
+        tier2 = self.initial_data.get("tier2") or attrs.pop("tier2", None)
+        tier3 = self.initial_data.get("tier3") or attrs.pop("tier3", None)
+        escalate = self.initial_data.get("autoEscalateDays") or attrs.pop("autoEscalateDays", 3)
+
+        if tier1 or tier2 or tier3:
+            steps = []
+            if tier1:
+                steps.append({"level": 1, "approver": str(tier1), "approver_role": str(tier1), "autoEscalateDays": int(escalate)})
+            if tier2:
+                steps.append({"level": 2, "approver": str(tier2), "approver_role": str(tier2)})
+            if tier3 and tier3 != "-":
+                steps.append({"level": 3, "approver": str(tier3), "approver_role": str(tier3)})
+            attrs["steps"] = steps
+        return attrs
 
 
 class TerminationSerializer(BaseModelSerializer):

@@ -179,8 +179,14 @@ def post_standalone_note(note, *, user=None):
 
     client = note.client
     client_id = note.client_id
-    total = note.total_amount
-    taxable = note.taxable_amount
+    total = round2(D(note.total_amount))
+    tax = round2(D(note.cgst or 0) + D(note.sgst or 0) + D(note.igst or 0))
+    taxable = round2(D(note.taxable_amount or 0))
+    if taxable == ZERO:
+        taxable = round2(total - tax)
+    round_off = round2(total - (taxable + tax))
+    if round_off != ZERO:
+        taxable = round2(taxable + round_off)
     party = note.party
 
     is_customer = party.type in ("Customer", "Both")
@@ -188,54 +194,78 @@ def post_standalone_note(note, *, user=None):
 
     if note.note_type == "CREDIT_NOTE":
         if is_customer:
-            # Credit note to customer (e.g. rate difference discount, rebate):
-            # Dr Sales Returns / General Expense
-            # Cr Sundry Debtors (Party)
+            # Credit note to customer (e.g. rate difference discount, rebate, returns):
+            # Dr Sales Returns (taxable amount)
+            # Dr GST Output (tax amount - reverses GST liability)
+            # Cr Sundry Debtors (total amount)
             sales_ret_acc = ledger.system_account(client_id, "sales_return")
             debtors_acc = ledger.system_account(client_id, "debtors")
             postings.append(
-                ledger.debit(sales_ret_acc, total, description=f"Credit note {note.note_number} - {party.name}")
+                ledger.debit(sales_ret_acc, taxable, description=f"Credit note {note.note_number} - {party.name}")
             )
+            if tax > ZERO:
+                gst_output_acc = ledger.system_account(client_id, "gst_output")
+                postings.append(
+                    ledger.debit(gst_output_acc, tax, description=f"GST reversal on CN {note.note_number}")
+                )
             postings.append(
                 ledger.credit(debtors_acc, total, party=party, description=f"Credit note {note.note_number}")
             )
         else:
-            # Credit note received from vendor:
-            # Dr Sundry Creditors (Party)
-            # Cr Purchase Returns / General Expense
+            # Credit note to vendor (credit given to vendor, e.g. price increase/supplementary bill):
+            # Dr Purchases (taxable amount)
+            # Dr GST Input (tax amount)
+            # Cr Sundry Creditors (total amount - increases payable)
+            purch_acc = ledger.system_account(client_id, "purchases")
             creditors_acc = ledger.system_account(client_id, "creditors")
-            purch_ret_acc = ledger.system_account(client_id, "purchase_return")
             postings.append(
-                ledger.debit(creditors_acc, total, party=party, description=f"Credit note {note.note_number}")
+                ledger.debit(purch_acc, taxable, description=f"Credit note {note.note_number} to {party.name}")
             )
+            if tax > ZERO:
+                gst_input_acc = ledger.system_account(client_id, "gst_input")
+                postings.append(
+                    ledger.debit(gst_input_acc, tax, description=f"GST input on CN {note.note_number}")
+                )
             postings.append(
-                ledger.credit(purch_ret_acc, total, description=f"Credit note from {party.name}")
+                ledger.credit(creditors_acc, total, party=party, description=f"Credit note {note.note_number}")
             )
     else:  # DEBIT_NOTE
         if is_customer:
             # Debit note issued to customer (e.g. price increase, undercharge):
-            # Dr Sundry Debtors (Party)
-            # Cr Sales
+            # Dr Sundry Debtors (total amount - increases receivable)
+            # Cr Sales (taxable amount)
+            # Cr GST Output (tax amount)
             debtors_acc = ledger.system_account(client_id, "debtors")
             sales_acc = ledger.system_account(client_id, "sales")
             postings.append(
                 ledger.debit(debtors_acc, total, party=party, description=f"Debit note {note.note_number}")
             )
             postings.append(
-                ledger.credit(sales_acc, total, description=f"Debit note {note.note_number} - {party.name}")
+                ledger.credit(sales_acc, taxable, description=f"Debit note {note.note_number} - {party.name}")
             )
+            if tax > ZERO:
+                gst_output_acc = ledger.system_account(client_id, "gst_output")
+                postings.append(
+                    ledger.credit(gst_output_acc, tax, description=f"GST output on DN {note.note_number}")
+                )
         else:
-            # Debit note to vendor (e.g. rate difference debit, penalty, shortage):
-            # Dr Sundry Creditors (Party)
-            # Cr Purchase Returns / Other Direct Income
+            # Debit note to vendor (e.g. rate difference debit, penalty, shortage deduction):
+            # Dr Sundry Creditors (total amount - decreases payable)
+            # Cr Purchase Returns (taxable amount)
+            # Cr GST Input (tax amount - reverses input tax credit)
             creditors_acc = ledger.system_account(client_id, "creditors")
             purch_ret_acc = ledger.system_account(client_id, "purchase_return")
             postings.append(
                 ledger.debit(creditors_acc, total, party=party, description=f"Debit note {note.note_number}")
             )
             postings.append(
-                ledger.credit(purch_ret_acc, total, description=f"Debit note to {party.name}")
+                ledger.credit(purch_ret_acc, taxable, description=f"Debit note to {party.name}")
             )
+            if tax > ZERO:
+                gst_input_acc = ledger.system_account(client_id, "gst_input")
+                postings.append(
+                    ledger.credit(gst_input_acc, tax, description=f"GST input reversal on DN {note.note_number}")
+                )
 
     entry = ledger.post_entry(
         client=client,

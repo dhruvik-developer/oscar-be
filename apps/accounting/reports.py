@@ -60,7 +60,7 @@ def profit_and_loss(client_id, date_from=None, date_to=None):
             (
                 row["debit"] - row["credit"]
                 for row in expense
-                if row["account__system_key"] in ("cogs", "purchases")
+                if row["account__system_key"] in ("cogs", "purchases", "purchase_return")
             ),
             ZERO,
         )
@@ -70,7 +70,7 @@ def profit_and_loss(client_id, date_from=None, date_to=None):
             (
                 row["debit"] - row["credit"]
                 for row in expense
-                if row["account__system_key"] not in ("cogs", "purchases")
+                if row["account__system_key"] not in ("cogs", "purchases", "purchase_return")
             ),
             ZERO,
         )
@@ -427,7 +427,8 @@ def day_book(client_id, as_of_date=None):
         for t in trips_qs.order_by("-created_at")
     ]
 
-    # 6. Cash and Bank Balances
+    # 6. Cash and Bank Balances (including opening balance to match Cash/Bank page)
+    from .models import BankAccount
     bank_lines = JournalLine.objects.filter(
         client_id=client_id,
         account__type="Asset",
@@ -435,9 +436,20 @@ def day_book(client_id, as_of_date=None):
         journal_entry__entry_date__lte=as_of,
         deleted_at__isnull=True,
     ).exclude(journal_entry__status="Reversed").exclude(journal_entry__reversal_of__isnull=False)
-    cash_bank_balance = round2(
-        bank_lines.aggregate(val=Coalesce(Sum("debit") - Sum("credit"), Value(Decimal("0.00")), output_field=MONEY))["val"]
-    )
+    cash_bank_movement = bank_lines.aggregate(
+        val=Coalesce(Sum("debit") - Sum("credit"), Value(Decimal("0.00")), output_field=MONEY)
+    )["val"]
+
+    bank_openings = BankAccount.objects.filter(
+        client_id=client_id, deleted_at__isnull=True
+    ).aggregate(val=Coalesce(Sum("opening_balance"), Value(Decimal("0.00")), output_field=MONEY))["val"]
+    bank_acct_ids = set(BankAccount.objects.filter(client_id=client_id, deleted_at__isnull=True).values_list("account_id", flat=True))
+    other_openings = Account.objects.filter(
+        client_id=client_id, type="Asset", subtype="Bank", deleted_at__isnull=True
+    ).exclude(id__in=bank_acct_ids).aggregate(
+        val=Coalesce(Sum("opening_balance"), Value(Decimal("0.00")), output_field=MONEY)
+    )["val"]
+    cash_bank_balance = round2(D(bank_openings) + D(other_openings) + D(cash_bank_movement))
 
     # 7. Total Receivables and Payables as of as_of
     debtors_lines = JournalLine.objects.filter(
@@ -620,11 +632,11 @@ def sub_ledger_summary(client_id, ledger_type="jobwork", as_of=None):
                 "balance": ZERO,
             })
             amt = D(bc.commission_amount)
-            if bc.status == "Accrued":
+            if bc.status in ("Accrued", "Awaiting Collection"):
                 group["accrued"] += amt
             elif bc.status == "Approved":
                 group["approved"] += amt
-            elif bc.status == "Payable":
+            elif bc.status in ("Payable", "Hold"):
                 group["payable"] += amt
                 group["balance"] += amt
             elif bc.status == "Paid":
@@ -690,7 +702,7 @@ def sub_ledger_summary(client_id, ledger_type="jobwork", as_of=None):
         from apps.jobwork.models import JobWorkOrder
         jwos = JobWorkOrder.objects.filter(
             client_id=client_id, deleted_at__isnull=True
-        ).exclude(status="Draft").select_related("vendor")
+        ).exclude(status__in=["Draft", "Cancelled"]).select_related("vendor")
         by_processor = {}
         for jwo in jwos:
             key = str(jwo.vendor_id) if jwo.vendor_id else f"name:{jwo.vendor_name or 'Unassigned'}"

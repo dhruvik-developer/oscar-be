@@ -296,14 +296,23 @@ class Attendance(TenantModel):
         ("regularization", "regularization"),
         ("leave", "leave"),
         ("holiday", "holiday"),
+        ("punch", "punch"),
     ]
 
     employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name="attendance")
     work_date = models.DateField()
     check_in = models.DateTimeField(null=True, blank=True)
     check_out = models.DateTimeField(null=True, blank=True)
+    first_punch = models.DateTimeField(null=True, blank=True)
+    last_punch = models.DateTimeField(null=True, blank=True)
+    working_hours = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    late_minutes = models.IntegerField(default=0)
+    early_leaving_minutes = models.IntegerField(default=0)
+    overtime_hours = models.DecimalField(max_digits=6, decimal_places=2, default=0)
     #: DERIVED from check-in/out plus the attendance_flexibility policy.
     hours = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    total_break_minutes = models.IntegerField(default=0)
+    total_attendance_hours = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
     status = models.TextField(choices=ATTENDANCE_STATUSES)
     leave_request = models.ForeignKey(
         "LeaveRequest", null=True, blank=True, on_delete=models.SET_NULL, related_name="attendance_rows"
@@ -1682,12 +1691,15 @@ class AttendancePunch(TenantModel, LegacyIdMixin):
     PUNCH_TYPES = [
         ("IN", "Punch In"),
         ("OUT", "Punch Out"),
+        ("BREAK_IN", "Break In"),
+        ("BREAK_OUT", "Break Out"),
     ]
     SOURCES = [
         ("web", "Web / Topbar"),
         ("mobile", "Mobile App"),
         ("biometric", "Biometric Device"),
         ("manual", "Manual / Correction"),
+        ("auto_day_end", "Auto Day End / Forgot Punch Out"),
     ]
 
     employee = models.ForeignKey(
@@ -1697,7 +1709,7 @@ class AttendancePunch(TenantModel, LegacyIdMixin):
         Attendance, on_delete=models.CASCADE, related_name="punches", null=True, blank=True
     )
     work_date = models.DateField(db_index=True)
-    punch_type = models.CharField(max_length=10, choices=PUNCH_TYPES)
+    punch_type = models.CharField(max_length=15, choices=PUNCH_TYPES)
     punch_time = models.DateTimeField(db_index=True)
     source = models.CharField(max_length=20, choices=SOURCES, default="web")
     remark = models.TextField(null=True, blank=True)
@@ -1712,6 +1724,39 @@ class AttendancePunch(TenantModel, LegacyIdMixin):
 
     def __str__(self):
         return f"{self.employee} - {self.punch_type} @ {self.punch_time}"
+
+
+class AttendanceBreak(TenantModel, LegacyIdMixin):
+    BREAK_TYPES = [
+        ("general", "General Break"),
+        ("lunch", "Lunch Break"),
+        ("tea", "Tea Break"),
+    ]
+
+    employee = models.ForeignKey(
+        Employee, on_delete=models.CASCADE, related_name="breaks"
+    )
+    attendance = models.ForeignKey(
+        Attendance, on_delete=models.CASCADE, related_name="breaks", null=True, blank=True
+    )
+    work_date = models.DateField(db_index=True)
+    break_in_time = models.DateTimeField(db_index=True)
+    break_out_time = models.DateTimeField(null=True, blank=True)
+    duration_seconds = models.IntegerField(default=0)
+    duration_minutes = models.IntegerField(default=0)
+    break_type = models.CharField(max_length=20, choices=BREAK_TYPES, default="general")
+    remark = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "hrms_attendance_breaks"
+        ordering = ["break_in_time"]
+        indexes = [
+            models.Index(fields=["client", "employee", "work_date"], name="ix_hrms_break_emp_date"),
+            models.Index(fields=["client", "break_in_time"], name="ix_hrms_break_in_time"),
+        ]
+
+    def __str__(self):
+        return f"{self.employee} - Break: {self.break_in_time} -> {self.break_out_time}"
 
 
 # --- Company Meetings & Conference Room Booking ---
