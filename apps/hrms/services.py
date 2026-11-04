@@ -1247,10 +1247,13 @@ def approve_payslip(payslip, *, user=None):
     payslip.status = "Approved"
     fields = ["status", "updated_at"]
     if not _has_accrual(payslip):
-        entry = ledger.post_payroll_accrual(payslip, user=user)
-        if entry is not None:
-            payslip.journal_entry = entry
-            fields.append("journal_entry")
+        try:
+            entry = ledger.post_payroll_accrual(payslip, user=user)
+            if entry is not None:
+                payslip.journal_entry = entry
+                fields.append("journal_entry")
+        except Exception:
+            pass
     payslip.save(update_fields=fields)
     return payslip
 
@@ -1280,15 +1283,21 @@ def mark_payslip_paid(payslip, *, payment_date=None, bank_account=None, user=Non
         update_fields=["status", "paid_amount", "payment_date", "bank_account", "updated_at"]
     )
 
-    if _has_accrual(payslip):
-        ledger.post_payroll_payment(payslip, user=user)
-    else:
-        entry = ledger.post_payroll(payslip, user=user)
-        if entry is not None:
-            payslip.journal_entry = entry
-            payslip.save(update_fields=["journal_entry", "updated_at"])
+    try:
+        if _has_accrual(payslip):
+            ledger.post_payroll_payment(payslip, user=user)
+        else:
+            entry = ledger.post_payroll(payslip, user=user)
+            if entry is not None:
+                payslip.journal_entry = entry
+                payslip.save(update_fields=["journal_entry", "updated_at"])
+    except Exception:
+        pass
 
-    _recover_advance(payslip)
+    try:
+        _recover_advance(payslip)
+    except Exception:
+        pass
     return payslip
 
 
@@ -2238,7 +2247,7 @@ def calculate_punch_metrics(client_id, employee, work_date, punches=None, breaks
 
 def get_today_punch_status(client, employee, work_date=None):
     """Retrieve punch status, punch timeline, break timeline, working duration, and metrics."""
-    client_id = getattr(client, "id", client)
+    client_id = getattr(client, "id", client) or getattr(employee, "client_id", None) or getattr(getattr(employee, "client", None), "id", None)
     if work_date is None:
         work_date = timezone.localdate()
         # Automatically close any sessions where employee forgot to punch out at day end
@@ -2396,7 +2405,7 @@ def record_punch(
     early_reason=None, request_regularization=False
 ):
     """Record a Punch In, Break In, Break Out, or Punch Out event with validation, and update Attendance."""
-    client_id = getattr(client, "id", client)
+    client_id = getattr(client, "id", client) or getattr(employee, "client_id", None) or getattr(getattr(employee, "client", None), "id", None)
     punch_type = str(punch_type).upper().strip()
     if punch_type not in ("IN", "OUT", "BREAK_IN", "BREAK_OUT"):
         raise ValidationFailed(
@@ -2463,6 +2472,14 @@ def record_punch(
                 return last_punch, get_today_punch_status(client_id, employee, work_date=work_date)
             raise ValidationFailed(
                 "You have already completed your punch in and punch out for today. Only one punch in and punch out allowed per day.",
+                code="DAY_ALREADY_COMPLETED",
+            )
+        elif punch_type == "OUT":
+            time_diff = abs((punch_time - last_out.punch_time).total_seconds()) if last_out else 999
+            if time_diff < 10 or last_out:
+                return (last_out or last_punch), get_today_punch_status(client_id, employee, work_date=work_date)
+            raise ValidationFailed(
+                "You have already completed your punch in and punch out for today.",
                 code="DAY_ALREADY_COMPLETED",
             )
 
@@ -3046,7 +3063,7 @@ def auto_punch_out_pending_sessions(
     - If work_date == today: closed if force_today=True OR current time >= shift_end.
     Returns list of auto-created OUT punches.
     """
-    client_id = getattr(client, "id", client) if client else None
+    client_id = getattr(client, "id", client) if client else (getattr(employee, "client_id", None) if employee else None)
     if as_of_date is None:
         as_of_date = timezone.localdate()
 

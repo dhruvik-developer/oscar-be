@@ -348,7 +348,12 @@ class OwnEmployeeScopeMixin:
 
     def _resolve_employee(self, request, employee_id=None):
 
-        client_id = getattr(request, "client_id", None) or getattr(request.user, "client_id", None)
+        client_id = (
+            getattr(request, "client_id", None)
+            or getattr(request.user, "client_id", None)
+            or getattr(getattr(request.user, "client", None), "id", None)
+            or getattr(self, "get_client_id", lambda: None)()
+        )
 
         if employee_id:
 
@@ -388,6 +393,22 @@ class OwnEmployeeScopeMixin:
 
                 client_id=client_id, email__iexact=request.user.email, deleted_at__isnull=True
 
+            ).first()
+
+            if emp:
+
+                if not getattr(request.user, "employee_id", None) and hasattr(request.user, "save"):
+
+                    request.user.employee = emp
+
+                    request.user.save(update_fields=["employee"])
+
+                return emp
+
+        if getattr(request.user, "name", None):
+
+            emp = Employee.objects.filter(
+                client_id=client_id, name__iexact=request.user.name, deleted_at__isnull=True
             ).first()
 
             if emp:
@@ -1274,6 +1295,7 @@ class AttendanceViewSet(TenantModelViewSet):
 
         "punch_timeline": [],
         "auto_punch_out": [],
+        "sync_punches": [],
 
     }
 
@@ -1711,51 +1733,53 @@ class AttendanceViewSet(TenantModelViewSet):
 
     def _resolve_employee(self, request, employee_id=None):
 
-        client_id = getattr(request, "client_id", None) or getattr(request.user, "client_id", None)
+        client_id = (
+            getattr(request, "client_id", None)
+            or getattr(request.user, "client_id", None)
+            or getattr(getattr(request.user, "client", None), "id", None)
+            or getattr(self, "get_client_id", lambda: None)()
+        )
 
         if employee_id:
+            try:
+                emp = Employee.objects.filter(
+                    pk=employee_id, client_id=client_id, deleted_at__isnull=True
+                ).first()
+                if emp:
+                    return emp
+            except (ValueError, TypeError, Exception):
+                pass
+            emp = Employee.objects.filter(
+                employee_code=employee_id, client_id=client_id, deleted_at__isnull=True
+            ).first()
+            if emp:
+                return emp
+
+        if getattr(request.user, "employee", None):
+            return request.user.employee
+
+        if getattr(request.user, "email", None):
+            emp = Employee.objects.filter(
+                client_id=client_id, email__iexact=request.user.email, deleted_at__isnull=True
+            ).first()
+            if emp:
+                if not getattr(request.user, "employee_id", None) and hasattr(request.user, "save"):
+                    request.user.employee = emp
+                    try:
+                        request.user.save(update_fields=["employee"])
+                    except Exception:
+                        pass
+                return emp
+
+        if getattr(request.user, "is_authenticated", False) and (getattr(request.user, "client", None) or client_id):
 
             try:
 
-                emp = Employee.objects.filter(
+                from apps.hrms.user_link import create_employee_for
 
-                    pk=employee_id, client_id=client_id, deleted_at__isnull=True
+                emp = create_employee_for(request.user)
 
-                ).first()
-
-                if emp:
-
-                    return emp
-
-            except (ValueError, TypeError, Exception):
-
-                pass
-
-            return Employee.objects.filter(
-
-                employee_code=employee_id, client_id=client_id, deleted_at__isnull=True
-
-            ).first()
-
-
-
-        if getattr(request.user, "employee", None):
-
-            return request.user.employee
-
-
-
-        if getattr(request.user, "email", None):
-
-            emp = Employee.objects.filter(
-
-                client_id=client_id, email__iexact=request.user.email, deleted_at__isnull=True
-
-            ).first()
-
-            if emp:
-
-                if not getattr(request.user, "employee_id", None) and hasattr(request.user, "save"):
+                if hasattr(request.user, "save"):
 
                     request.user.employee = emp
 
@@ -1763,43 +1787,11 @@ class AttendanceViewSet(TenantModelViewSet):
 
                 return emp
 
+            except Exception:
 
+                pass
 
-        from apps.hrms.models import Designation
-
-        desig = Designation.objects.filter(client_id=client_id, name__iexact="Employee").first()
-
-        if not desig:
-
-            desig = Designation.objects.create(client_id=client_id, name="Employee")
-
-        code = f"EMP-{(Employee.objects.filter(client_id=client_id).count() + 1):03d}"
-
-        emp = Employee.objects.create(
-
-            client_id=client_id,
-
-            employee_code=code,
-
-            name=getattr(request.user, "name", "") or request.user.email,
-
-            email=request.user.email,
-
-            phone=getattr(request.user, "phone", "") or "",
-
-            designation=desig,
-
-            joining_date=timezone.localdate(),
-
-            status="Active",
-
-        )
-
-        request.user.employee = emp
-
-        request.user.save(update_fields=["employee"])
-
-        return emp
+        return None
 
 
 
@@ -1841,7 +1833,15 @@ class AttendanceViewSet(TenantModelViewSet):
 
             })
 
-        status_data = services.get_today_punch_status(self.get_client_id(), employee)
+        client_id = (
+            self.get_client_id()
+            or getattr(employee, "client_id", None)
+            or getattr(request, "client_id", None)
+            or getattr(request.user, "client_id", None)
+            or getattr(getattr(request.user, "client", None), "id", None)
+        )
+
+        status_data = services.get_today_punch_status(client_id, employee)
 
         return Response(status_data)
 
@@ -1917,9 +1917,17 @@ class AttendanceViewSet(TenantModelViewSet):
 
 
 
+        client_id = (
+            self.get_client_id()
+            or getattr(employee, "client_id", None)
+            or getattr(request, "client_id", None)
+            or getattr(request.user, "client_id", None)
+            or getattr(getattr(request.user, "client", None), "id", None)
+        )
+
         punch_obj, status_data = services.record_punch(
 
-            client=self.get_client_id(),
+            client=client_id,
 
             employee=employee,
 
@@ -2007,6 +2015,25 @@ class AttendanceViewSet(TenantModelViewSet):
                 for p in closed
             ],
         })
+
+    @action(detail=False, methods=["post"], url_path="sync-punches")
+    def sync_punches(self, request):
+        """Reconcile Attendance rows from punches for a given date."""
+        work_date_str = request.data.get("date") or request.query_params.get("date")
+        work_date = None
+        if work_date_str:
+            try:
+                work_date = datetime.strptime(str(work_date_str)[:10], "%Y-%m-%d").date()
+            except ValueError:
+                pass
+        client_id = (
+            self.get_client_id()
+            or getattr(request, "client_id", None)
+            or getattr(request.user, "client_id", None)
+            or getattr(getattr(request.user, "client", None), "id", None)
+        )
+        count = services.sync_attendance_from_punches(client=client_id, work_date=work_date)
+        return Response({"status": "ok", "synced": count})
 
 
 

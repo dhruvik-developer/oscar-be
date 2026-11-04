@@ -225,22 +225,47 @@ def create_employee_for(user, *, actor=None):
     from apps.core.numbering import allocate_number
     from apps.hrms.models import Department, Designation, Employee, Location
 
+    client_id = getattr(user, "client_id", None) or getattr(getattr(user, "client", None), "id", None)
+    client = getattr(user, "client", None)
+    if not client and client_id:
+        from apps.accounts.models import Client
+        client = Client.objects.filter(pk=client_id).first()
+
     designation = None
-    if user.role:
-        designation = _named(Designation, user.client_id, user.role.name)
+    if getattr(user, "role", None):
+        designation = _named(Designation, client_id, user.role.name)
+    if not designation and client_id:
+        designation = Designation.objects.filter(client_id=client_id, name__iexact="Employee").first()
+        if not designation:
+            designation = Designation.objects.create(client_id=client_id, name="Employee")
+
+    name = getattr(user, "name", None) or (user.email.split("@")[0] if getattr(user, "email", None) else "Admin")
+
+    code = None
+    if client:
+        try:
+            code = allocate_number(client, "EMP")
+        except Exception:
+            pass
+    if not code:
+        existing_codes = set(Employee.objects.filter(client_id=client_id).values_list("employee_code", flat=True))
+        idx = Employee.objects.filter(client_id=client_id).count() + 1
+        while f"EMP{idx:04d}" in existing_codes or f"EMP-{idx:03d}" in existing_codes:
+            idx += 1
+        code = f"EMP{idx:04d}"
 
     employee = Employee.objects.create(
-        client_id=user.client_id,
-        employee_code=allocate_number(user.client, "EMP"),
-        name=user.name,
-        email=user.email,
-        phone=user.phone,
-        avatar_url=user.avatar_url,
-        joining_date=user.joined_date or timezone.localdate(),
-        department=_named(Department, user.client_id, user.department),
+        client_id=client_id,
+        employee_code=code,
+        name=name,
+        email=getattr(user, "email", None),
+        phone=getattr(user, "phone", None),
+        avatar_url=getattr(user, "avatar_url", None),
+        joining_date=getattr(user, "joined_date", None) or timezone.localdate(),
+        department=_named(Department, client_id, getattr(user, "department", None)) if getattr(user, "department", None) else None,
         designation=designation,
-        location=_named(Location, user.client_id, user.location),
-        manager=linked_employee(user.reporting_manager) if user.reporting_manager_id else None,
+        location=_named(Location, client_id, getattr(user, "location", None)) if getattr(user, "location", None) else None,
+        manager=linked_employee(user.reporting_manager) if getattr(user, "reporting_manager_id", None) else None,
         status="Active",
         created_by=actor,
         updated_by=actor,
