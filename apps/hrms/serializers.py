@@ -166,6 +166,7 @@ class EmployeeSerializer(BaseModelSerializer):
         source="salary_structure", model="hrms.SalaryStructure",
         required=False, allow_null=True,
     )
+    standardSalary = MoneyField(source="standard_salary", required=False)
     avatar = serializers.CharField(source="avatar_url", required=False, allow_null=True)
 
     class Meta:
@@ -174,7 +175,7 @@ class EmployeeSerializer(BaseModelSerializer):
             "id", "employeeCode", "name", "email", "phone", "avatar",
             "designation", "designationId", "department", "departmentId",
             "manager", "managerId", "location", "locationId", "joining", "joiningDate",
-            "employmentType", "shift", "salaryStructureId", "standard_salary",
+            "employmentType", "shift", "salaryStructureId", "standard_salary", "standardSalary",
             "status", "date_of_birth", "gender", "blood_group", "personal_email",
             "emergency_contact", "address", "bank_account_number", "ifsc_code",
             "pan", "uan", "aadhaar_last4", "last_working_day",
@@ -1208,6 +1209,29 @@ class HrDocumentSerializer(BaseModelSerializer):
             "updatedOn", "tags", "description", "valid_from", "is_confidential",
             "created_at",
         ]
+
+    def to_internal_value(self, data):
+        # Resolve employeeId whether passed as UUID, employee code, or employee name
+        if isinstance(data, dict) and "employeeId" in data and data["employeeId"]:
+            val = str(data["employeeId"]).strip()
+            import uuid
+            is_valid_uuid = False
+            try:
+                uuid.UUID(val)
+                is_valid_uuid = True
+            except ValueError:
+                pass
+
+            if not is_valid_uuid:
+                from apps.hrms.models import Employee
+                client_id = getattr(self.context.get("request"), "client_id", None) or getattr(getattr(self.context.get("request"), "user", None), "client_id", None)
+                qs = Employee.objects.all()
+                if client_id:
+                    qs = qs.filter(client_id=client_id)
+                emp = qs.filter(models.Q(employee_code=val) | models.Q(name__iexact=val)).first()
+                if emp:
+                    data = {**data, "employeeId": str(emp.id)}
+        return super().to_internal_value(data)
 
     def get_hasFile(self, document):
         return document.file_id is not None

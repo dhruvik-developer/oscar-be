@@ -1115,6 +1115,21 @@ def process_payroll(*, client, period_month, employee_ids=None, user=None):
             payroll_run=run, employee=employee, status__in=["Approved", "Paid"]
         ).first()
         if settled is not None:
+            # If an existing payslip was generated with 0 salary prior to employee configuration,
+            # sync it with the employee's standard salary upon re-generation.
+            if settled.standard_salary == 0 and employee.standard_salary > 0:
+                settled.standard_salary = employee.standard_salary
+                settled.total_days = total_days
+                settled.attended_days = attended
+                settled.paid_leaves = paid_leaves
+                settled.earned_salary = result["earnedSalary"]
+                settled.net_payable = result["netPayable"]
+                if settled.paid_amount == 0:
+                    settled.paid_amount = result["netPayable"]
+                settled.save(update_fields=[
+                    "standard_salary", "total_days", "attended_days", "paid_leaves",
+                    "earned_salary", "net_payable", "paid_amount", "updated_at"
+                ])
             payslips.append(settled)
             continue
 

@@ -877,6 +877,45 @@ class EmployeeViewSet(TenantModelViewSet):
 
         employee = serializer.instance
 
+        if "standard_salary" in serializer.validated_data:
+            new_std = serializer.validated_data["standard_salary"]
+            try:
+                from apps.hrms.models import Payslip
+                from apps.hrms.services import recompute_payslip, compute_salary
+                slips = Payslip.objects.filter(
+                    client=employee.client,
+                    employee=employee,
+                )
+                for slip in slips:
+                    if slip.status in ["In Progress", "Ready for Review"]:
+                        slip.standard_salary = new_std
+                        slip.save(update_fields=["standard_salary", "updated_at"])
+                        try:
+                            recompute_payslip(slip, user=self.request.user)
+                        except Exception:
+                            pass
+                    elif slip.standard_salary == 0 and new_std > 0:
+                        # Slip was generated prior to salary being set
+                        slip.standard_salary = new_std
+                        res = compute_salary(
+                            standard_salary=new_std,
+                            total_days=slip.total_days,
+                            attended_days=slip.attended_days,
+                            paid_leaves=slip.paid_leaves,
+                            additional_earnings=slip.additional_earnings,
+                            deductions=slip.deductions,
+                            advance=slip.advance_recovery,
+                        )
+                        slip.earned_salary = res["earnedSalary"]
+                        slip.net_payable = res["netPayable"]
+                        update_flds = ["standard_salary", "earned_salary", "net_payable", "updated_at"]
+                        if slip.paid_amount == 0 and slip.status == "Paid":
+                            slip.paid_amount = res["netPayable"]
+                            update_flds.append("paid_amount")
+                        slip.save(update_fields=update_flds)
+            except Exception:
+                pass
+
         self._ensure_user_for_employee(
 
             employee, self.get_client_id(), actor=self.request.user

@@ -28,6 +28,8 @@ class MeUserSerializer(BaseModelSerializer):
 
     role = RoleRefSerializer(read_only=True)
     employeeId = serializers.SerializerMethodField()
+    employeeUuid = serializers.UUIDField(source="employee_id", read_only=True)
+    employee_id = serializers.UUIDField(source="employee_id", read_only=True)
     avatar = serializers.SerializerMethodField()
     reportingManager = serializers.SerializerMethodField()
     lastLogin = serializers.DateTimeField(source="last_login_at", read_only=True)
@@ -35,7 +37,7 @@ class MeUserSerializer(BaseModelSerializer):
     class Meta:
         model = User
         fields = [
-            "id", "name", "email", "phone", "avatar", "employeeId", "role",
+            "id", "name", "email", "phone", "avatar", "employeeId", "employeeUuid", "employee_id", "role",
             "department", "location", "reportingManager", "status", "lastLogin",
             "is_superuser",
         ]
