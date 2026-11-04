@@ -2027,22 +2027,207 @@ def supplier_reconciliation(client_id, *, vendor_id=None, date_from=None, date_t
 
 
 def supplier_ledger(client_id, vendor_id, *, date_from=None, date_to=None):
-    """Fetch chronological ledger entries for a supplier with running balance."""
+    """Fetch chronological ledger entries for a supplier or customer with running balance, summary, bills, payments, and notes."""
     from apps.accounting.services import party_ledger
     from apps.masters.models import Party
+    from apps.purchase.models import PurchaseBill, PaymentOut
+    from apps.sales.models import SalesInvoice, PaymentIn
+    from apps.accounting.models import StandaloneNote
+    from decimal import Decimal
 
     vendor = Party.objects.filter(pk=vendor_id, client_id=client_id, deleted_at__isnull=True).first()
     if not vendor:
-        raise ValidationFailed("Vendor not found.", field_errors={"vendorId": ["Invalid vendor ID."]})
+        raise ValidationFailed("Party not found.", field_errors={"vendorId": ["Invalid party ID."]})
 
+    is_customer = (vendor.type == "Customer")
     data = party_ledger(client_id, vendor_id, date_from=date_from, date_to=date_to)
+
+    entries = data.get("entries", [])
+    total_debits = sum(Decimal(str(e.get("debit") or 0)) for e in entries)
+    total_credits = sum(Decimal(str(e.get("credit") or 0)) for e in entries)
+
+    bal_type = data.get("balanceType")
+    if not bal_type:
+        if is_customer:
+            bal_type = "Dr" if (data.get("rawClosingBalance") or 0) >= 0 else "Cr"
+        else:
+            bal_type = "Cr" if (data.get("rawClosingBalance") or 0) >= 0 else "Dr"
+
+    data["summary"] = {
+        "openingBalance": float(data.get("openingBalance") or 0),
+        "totalDebits": float(total_debits),
+        "totalCredits": float(total_credits),
+        "closingBalance": float(data.get("closingBalance") or 0),
+        "rawClosingBalance": float(data.get("rawClosingBalance") or 0),
+        "balanceType": bal_type,
+        "transactionCount": len(entries),
+    }
+
+    if is_customer:
+        curr_bal = float(vendor.balance or 0)
+        curr_bal_type = "Dr" if curr_bal >= 0 else "Cr"
+        curr_category = "Receivable" if curr_bal >= 0 else "Advance"
+    else:
+        curr_bal = float(vendor.balance or 0)
+        curr_bal_type = "Cr" if curr_bal >= 0 else "Dr"
+        curr_category = "Payable" if curr_bal >= 0 else "Advance"
+
     data["vendor"] = {
         "id": str(vendor.id),
         "name": vendor.name,
         "code": vendor.code,
+        "type": vendor.type,
         "phone": vendor.phone,
         "gstin": vendor.gstin,
-        "currentBalance": float(vendor.balance or 0),
+        "openingBalance": float(vendor.opening_balance or 0),
+        "currentBalance": curr_bal,
+        "balanceType": curr_bal_type,
+        "balanceCategory": curr_category,
     }
+
+    # Fetch pending bills / invoices
+    if is_customer:
+        invoices_qs = SalesInvoice.objects.filter(
+            client_id=client_id,
+            party_id=vendor_id,
+            deleted_at__isnull=True,
+        )
+        if date_from:
+            invoices_qs = invoices_qs.filter(doc_date__gte=date_from)
+        if date_to:
+            invoices_qs = invoices_qs.filter(doc_date__lte=date_to)
+
+        pending_bills = []
+        for inv in invoices_qs.order_by("-doc_date", "-created_at")[:100]:
+            total_amt = float(inv.total or 0)
+            paid_amt = float(inv.amount_paid or 0)
+            bal_due = max(0.0, round(total_amt - paid_amt, 2))
+            if total_amt > 0 and bal_due <= 0.01:
+                status = "Paid"
+            elif paid_amt > 0:
+                status = "Partial"
+            else:
+                status = inv.status or "Unpaid"
+
+            pending_bills.append({
+                "id": str(inv.id),
+                "billNumber": inv.invoice_number or ("INV-" + str(inv.id)[:8]),
+                "billDate": str(inv.doc_date) if inv.doc_date else "",
+                "billAmount": total_amt,
+                "paidAmount": paid_amt,
+                "balanceDue": bal_due,
+                "status": status,
+            })
+        data["pendingBills"] = pending_bills
+
+        # Customer Receipts (PaymentIn)
+        receipts_qs = PaymentIn.objects.filter(
+            client_id=client_id,
+            party_id=vendor_id,
+            deleted_at__isnull=True,
+        )
+        if date_from:
+            receipts_qs = receipts_qs.filter(payment_date__gte=date_from)
+        if date_to:
+            receipts_qs = receipts_qs.filter(payment_date__lte=date_to)
+
+        payments_list = []
+        for p in receipts_qs.order_by("-payment_date", "-created_at")[:100]:
+            payments_list.append({
+                "id": str(p.id),
+                "paymentNumber": p.payment_number or ("REC-" + str(p.id)[:8]),
+                "paymentDate": str(p.payment_date) if p.payment_date else "",
+                "paymentMode": p.mode or "Bank",
+                "paymentAmount": float(p.amount or 0),
+                "reference": p.reference_number or p.transaction_reference or "",
+                "status": p.status or "Active",
+            })
+        data["payments"] = payments_list
+
+    else:
+        # Vendor Bills (PurchaseBill)
+        bills_qs = PurchaseBill.objects.filter(
+            client_id=client_id,
+            party_id=vendor_id,
+            deleted_at__isnull=True,
+        )
+        if date_from:
+            bills_qs = bills_qs.filter(doc_date__gte=date_from)
+        if date_to:
+            bills_qs = bills_qs.filter(doc_date__lte=date_to)
+
+        pending_bills = []
+        for b in bills_qs.order_by("-doc_date", "-created_at")[:100]:
+            total_amt = float(b.total or 0)
+            paid_amt = float(b.amount_paid or 0)
+            bal_due = max(0.0, round(total_amt - paid_amt, 2))
+            if total_amt > 0 and bal_due <= 0.01:
+                status = "Paid"
+            elif paid_amt > 0:
+                status = "Partial"
+            else:
+                status = b.status or "Unpaid"
+
+            pending_bills.append({
+                "id": str(b.id),
+                "billNumber": b.bill_number or b.vendor_bill_number or ("BILL-" + str(b.id)[:8]),
+                "billDate": str(b.doc_date) if b.doc_date else "",
+                "billAmount": total_amt,
+                "paidAmount": paid_amt,
+                "balanceDue": bal_due,
+                "status": status,
+            })
+        data["pendingBills"] = pending_bills
+
+        # Vendor Payments (PaymentOut)
+        payments_qs = PaymentOut.objects.filter(
+            client_id=client_id,
+            party_id=vendor_id,
+            deleted_at__isnull=True,
+        )
+        if date_from:
+            payments_qs = payments_qs.filter(payment_date__gte=date_from)
+        if date_to:
+            payments_qs = payments_qs.filter(payment_date__lte=date_to)
+
+        payments_list = []
+        for p in payments_qs.order_by("-payment_date", "-created_at")[:100]:
+            payments_list.append({
+                "id": str(p.id),
+                "paymentNumber": p.payment_number or ("PAY-" + str(p.id)[:8]),
+                "paymentDate": str(p.payment_date) if p.payment_date else "",
+                "paymentMode": p.mode or "Bank",
+                "paymentAmount": float(p.amount or 0),
+                "reference": p.reference_number or "",
+                "status": p.status or "Active",
+            })
+        data["payments"] = payments_list
+
+    # Debit / Credit Notes (StandaloneNote)
+    notes_qs = StandaloneNote.objects.filter(
+        client_id=client_id,
+        party_id=vendor_id,
+        deleted_at__isnull=True,
+    ).select_related("return_reason")
+    if date_from:
+        notes_qs = notes_qs.filter(note_date__gte=date_from)
+    if date_to:
+        notes_qs = notes_qs.filter(note_date__lte=date_to)
+
+    notes_list = []
+    for n in notes_qs.order_by("-note_date", "-created_at")[:100]:
+        note_type_str = n.get_note_type_display() if hasattr(n, "get_note_type_display") else n.note_type
+        reason_str = n.reason_notes or (n.return_reason.name if n.return_reason else "") or ""
+        notes_list.append({
+            "id": str(n.id),
+            "noteNumber": n.note_number or ("NOTE-" + str(n.id)[:8]),
+            "date": str(n.note_date) if n.note_date else "",
+            "noteType": note_type_str,
+            "amount": float(n.total_amount or 0),
+            "reason": reason_str,
+            "status": n.status or "Draft",
+        })
+    data["notes"] = notes_list
+
     return data
 

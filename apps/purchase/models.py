@@ -610,6 +610,13 @@ class VendorBillLine(TenantModel):
         VendorBill, on_delete=models.CASCADE, related_name="line_items"
     )
     line_no = models.IntegerField(default=1)
+    batch = models.ForeignKey(
+        "inventory.Batch", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    batch_number = models.TextField(null=True, blank=True)
+    goods_receipt = models.ForeignKey(
+        "purchase.GoodsReceipt", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
     item = models.ForeignKey(
         "masters.Item", null=True, blank=True, on_delete=models.PROTECT, related_name="+"
     )

@@ -63,7 +63,7 @@ def grouped_batch_registry(client_id, params, *, with_cost=False):
     }
     receipts = list(
         GoodsReceipt.objects.filter(client_id=client_id, deleted_at__isnull=True)
-        .values("id", "purchase_order_id", "purchase_bill_id", "grn_number", "receipt_date")
+        .values("id", "purchase_order_id", "purchase_bill_id", "grn_number", "receipt_date", "qc_status")
     )
     grn_by_id = {str(row["id"]): row for row in receipts}
     receipt_po_ids = {
@@ -77,10 +77,12 @@ def grouped_batch_registry(client_id, params, *, with_cost=False):
     all_takas = LotTaka.objects.filter(client_id=client_id, deleted_at__isnull=True).select_related(
         "item", "item__category", "location", "fabric_quality", "design", "shade", "supplier"
     ).order_by("created_at")
+    include_pending_qc = params.get("includePendingQc") in ("1", "true")
+    group_takas = all_takas if include_pending_qc else eligible_takas
     qs = Batch.objects.filter(
         client_id=client_id,
         deleted_at__isnull=True,
-        pk__in=eligible_takas.values("batch_id"),
+        pk__in=group_takas.values("batch_id"),
     ).select_related(
         "item", "supplier", "owner_party", "purchase_order", "purchase_order_line", "goods_receipt"
     ).prefetch_related(
@@ -134,13 +136,13 @@ def grouped_batch_registry(client_id, params, *, with_cost=False):
         qs = qs.filter(created_on__lte=params["to"])
     if params.get("qcStatus"):
         qs = qs.filter(
-            pk__in=eligible_takas.filter(qc_status=params["qcStatus"]).values("batch_id")
+            pk__in=group_takas.filter(qc_status=params["qcStatus"]).values("batch_id")
         )
 
     roll = batch_services.roll_filter(params)
     if roll is not None:
         qs = qs.filter(
-            pk__in=eligible_takas.filter(roll).values("batch_id")
+            pk__in=group_takas.filter(roll).values("batch_id")
         )
 
     po_filter = params.get("poId") or params.get("purchaseOrderId") or params.get("po") or params.get("poNumber")
@@ -175,21 +177,46 @@ def grouped_batch_registry(client_id, params, *, with_cost=False):
         if wanted_status and row["status"] != wanted_status:
             continue
 
-        row["qcStatus"] = "Passed"
+        row["qcStatus"] = "Not Inspected" if include_pending_qc else "Passed"
         receipt_ids = {
             str(taka.source_document_id)
-            for taka in takas
+            for taka in (all_batch_takas if include_pending_qc else takas)
             if taka.source_document_type in ("GRN", "GoodsReceipt") and taka.source_document_id
         }
         if batch.goods_receipt_id:
             receipt_ids.add(str(batch.goods_receipt_id))
+        if include_pending_qc:
+            receipt_statuses = {
+                grn_by_id[receipt_id]["qc_status"]
+                for receipt_id in receipt_ids
+                if receipt_id in grn_by_id
+            }
+            pending_receipt_ids = sorted(
+                receipt_id for receipt_id in receipt_ids
+                if receipt_id in grn_by_id
+                and grn_by_id[receipt_id]["qc_status"] in ("Pending", "Draft", "On Hold")
+            )
+            if pending_receipt_ids:
+                row["qcStatus"] = "Pending"
+                row["pendingQcReceiptId"] = pending_receipt_ids[0]
+            elif "Rejected" in receipt_statuses:
+                row["qcStatus"] = "Rejected"
+            elif "Rework" in receipt_statuses:
+                row["qcStatus"] = "Rework"
+            elif "Partially Approved" in receipt_statuses:
+                row["qcStatus"] = "Partially Approved"
+            elif receipt_statuses and receipt_statuses <= {"Approved"}:
+                row["qcStatus"] = "Passed"
+            elif receipt_statuses:
+                row["qcStatus"] = sorted(receipt_statuses)[0]
+        display_takas = all_batch_takas if include_pending_qc else takas
         row["receiptNumbers"] = sorted({
             grn_by_id[receipt_id]["grn_number"]
             for receipt_id in receipt_ids
             if receipt_id in grn_by_id and grn_by_id[receipt_id]["grn_number"]
         } | {
             str(taka.source_document_number)
-            for taka in takas
+            for taka in display_takas
             if taka.source_document_type in ("GRN", "GoodsReceipt") and taka.source_document_number
         })
         row["receiptDates"] = sorted({
@@ -198,12 +225,12 @@ def grouped_batch_registry(client_id, params, *, with_cost=False):
             if receipt_id in grn_by_id and grn_by_id[receipt_id]["receipt_date"]
         } | {
             taka.received_date.isoformat()
-            for taka in takas
+            for taka in display_takas
             if taka.received_date
         })
         row["locationNames"] = sorted({
             taka.location.name
-            for taka in takas
+            for taka in display_takas
             if taka.location_id and taka.location and taka.location.name
         })
         child_received = defaultdict(Decimal)
@@ -213,7 +240,7 @@ def grouped_batch_registry(client_id, params, *, with_cost=False):
                 child_received[taka.parent_taka_id] += Decimal(str(taka.received_quantity or 0))
         accepted_qty = Decimal("0")
         rejected_qty = Decimal("0")
-        for taka in takas:
+        for taka in (all_batch_takas if include_pending_qc else takas):
             effective_qty = max(
                 Decimal("0"),
                 Decimal(str(taka.received_quantity or 0)) - child_received[taka.id],
@@ -226,6 +253,17 @@ def grouped_batch_registry(client_id, params, *, with_cost=False):
         row["acceptedQty"] = str(accepted_qty)
         row["qcRejectedQty"] = str(rejected_qty)
         row["batchQty"] = row["quantities"]["received"]
+        if include_pending_qc:
+            row["batchQty"] = str(sum(
+                (
+                    max(
+                        Decimal("0"),
+                        Decimal(str(taka.received_quantity or 0)) - child_received[taka.id],
+                    )
+                    for taka in all_batch_takas
+                ),
+                Decimal("0"),
+            ))
         row["availableQty"] = row["quantities"]["available"]
         row["reworkQty"] = row["quantities"].get("rework", "0.0000")
         row["rejectedQty"] = row["quantities"].get("rejected", "0.0000")

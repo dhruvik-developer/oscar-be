@@ -389,6 +389,146 @@ class PurchaseOrderBatchTests(BatchTestBase):
 
 
 class BatchRegistryGroupingTests(BatchTestBase):
+    def test_po_linked_batches_expose_persisted_qc_state_for_linked_batch_actions(self):
+        from apps.purchase.models import GoodsReceipt, GoodsReceiptLine, PurchaseOrder, PurchaseOrderLine
+
+        po = PurchaseOrder.objects.create(
+            client=self.tenant, party=self.vendor, po_number="PO-QC-LINKED",
+            doc_date=date(2026, 9, 1),
+        )
+        po_line = PurchaseOrderLine.objects.create(
+            client=self.tenant, purchase_order=po, line_no=1, item=self.item,
+            item_name=self.item.name, uom="Meter", qty=Decimal("300"),
+        )
+        cases = (
+            ("Pending", "Pending"),
+            ("Passed", "Approved"),
+            ("Rejected", "Rejected"),
+        )
+        expected = {}
+        for index, (case, receipt_status) in enumerate(cases, start=1):
+            receipt = GoodsReceipt.objects.create(
+                client=self.tenant, party=self.vendor, purchase_order=po,
+                grn_number=f"GRN-QC-LINKED-{index}", receipt_date=date(2026, 9, index),
+                location=self.godown, qc_status=receipt_status,
+            )
+            GoodsReceiptLine.objects.create(
+                client=self.tenant, goods_receipt=receipt, purchase_order_line=po_line,
+                item=self.item, uom="Meter", ordered_qty=Decimal("100"),
+                received_qty=Decimal("100"),
+            )
+            taka = LotTaka.objects.create(
+                client=self.tenant, item=self.item, location=self.godown,
+                lot_number=f"PO-QC-LINKED-{index}", taka_number="1",
+                taka_id=f"TAK-{uuid.uuid4().hex[:6]}",
+                received_quantity=Decimal("100"), received_date=date(2026, 9, index),
+                source_document_type="GRN", source_document_id=receipt.id,
+                source_document_number=receipt.grn_number,
+                qc_status="Passed" if receipt_status == "Approved" else receipt_status,
+            )
+            batch = taka.batch
+            batch.source_document_type = "GRN"
+            batch.source_document_id = receipt.id
+            batch.source_document_number = receipt.grn_number
+            batch.save()
+            expected[batch.batch_code] = (case, receipt.id)
+
+        params = {
+            "groupBy": "po", "poId": str(po.id), "includePendingQc": "1",
+        }
+        response = self.api.get("/api/v1/inventory/batches/groups/", params)
+        self.assertEqual(response.status_code, 200, response.content)
+        rows = {row["batchCode"]: row for row in response.json()["groups"][0]["batches"]}
+        self.assertEqual({row["qcStatus"] for row in rows.values()}, {"Pending", "Passed", "Rejected"})
+        for batch_code, (qc_status, receipt_id) in expected.items():
+            row = rows[batch_code]
+            self.assertEqual(row["qcStatus"], qc_status)
+            if qc_status == "Pending":
+                self.assertEqual(row["pendingQcReceiptId"], str(receipt_id))
+            else:
+                self.assertNotIn("pendingQcReceiptId", row)
+
+        refreshed = self.api.get("/api/v1/inventory/batches/groups/", params)
+        self.assertEqual(refreshed.status_code, 200, refreshed.content)
+        refreshed_rows = {
+            row["batchCode"]: row
+            for row in refreshed.json()["groups"][0]["batches"]
+        }
+        self.assertEqual(
+            {code: row["qcStatus"] for code, row in refreshed_rows.items()},
+            {code: row["qcStatus"] for code, row in rows.items()},
+        )
+
+    def test_qc_through_the_api_closes_only_that_batch_and_cannot_repeat(self):
+        """QC done on one linked batch: it reads Passed (no QC action) from the
+        backend, a second submission is refused, and its sibling stays open."""
+        from apps.purchase.models import GoodsReceipt, GoodsReceiptLine, PurchaseOrder, PurchaseOrderLine
+
+        po = PurchaseOrder.objects.create(
+            client=self.tenant, party=self.vendor, po_number="PO-QC-FLOW", doc_date=date(2026, 9, 1),
+        )
+        po_line = PurchaseOrderLine.objects.create(
+            client=self.tenant, purchase_order=po, line_no=1, item=self.item,
+            item_name=self.item.name, uom="Meter", qty=Decimal("300"),
+        )
+        receipts = []
+        for index in (1, 2, 3):
+            receipt = GoodsReceipt.objects.create(
+                client=self.tenant, party=self.vendor, purchase_order=po,
+                grn_number=f"GRN-QC-FLOW-{index}", receipt_date=date(2026, 9, index),
+                location=self.godown, qc_status="Pending",
+            )
+            GoodsReceiptLine.objects.create(
+                client=self.tenant, goods_receipt=receipt, purchase_order_line=po_line,
+                item=self.item, uom="Meter", ordered_qty=Decimal("100"), received_qty=Decimal("100"),
+            )
+            taka = LotTaka.objects.create(
+                client=self.tenant, item=self.item, location=self.godown,
+                lot_number=f"PO-QC-FLOW-{index}", taka_number="1", taka_id=f"TAK-{uuid.uuid4().hex[:6]}",
+                received_quantity=Decimal("100"), received_date=date(2026, 9, index),
+                source_document_type="GRN", source_document_id=receipt.id,
+                source_document_number=receipt.grn_number, qc_status="Pending",
+            )
+            batch = taka.batch
+            batch.source_document_type = "GRN"
+            batch.source_document_id = receipt.id
+            batch.source_document_number = receipt.grn_number
+            batch.save()
+            receipts.append((receipt, batch.batch_code))
+
+        def rows():
+            response = self.api.get("/api/v1/inventory/batches/groups/", {
+                "groupBy": "po", "poId": str(po.id), "includePendingQc": "1",
+            })
+            self.assertEqual(response.status_code, 200, response.content)
+            return {row["batchCode"]: row for row in response.json()["groups"][0]["batches"]}
+
+        before = rows()
+        for receipt, code in receipts:
+            self.assertEqual(before[code]["qcStatus"], "Pending")
+            self.assertEqual(before[code]["pendingQcReceiptId"], str(receipt.id))
+
+        dispose = "/api/v1/inventory/qc/disposition/"
+        (passed, passed_code), (rejected, rejected_code), (_, open_code) = receipts
+        r = self.api.post(dispose, {"receiptId": str(passed.id), "goodQty": 100}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        r = self.api.post(dispose, {"receiptId": str(rejected.id), "rejectedQty": 100}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+
+        # A second QC on a finished receipt is refused by the backend.
+        again = self.api.post(dispose, {"receiptId": str(passed.id), "goodQty": 100}, format="json")
+        self.assertEqual(again.status_code, 409, again.content)
+        self.assertEqual(again.json()["code"], "QC_ALREADY_DONE")
+
+        # Read twice: what a reload of the page sees.
+        for after in (rows(), rows()):
+            self.assertEqual(after[passed_code]["qcStatus"], "Passed")
+            self.assertNotIn("pendingQcReceiptId", after[passed_code])
+            self.assertEqual(after[rejected_code]["qcStatus"], "Rejected")
+            self.assertNotIn("pendingQcReceiptId", after[rejected_code])
+            self.assertEqual(after[open_code]["qcStatus"], "Pending")
+            self.assertEqual(after[open_code]["pendingQcReceiptId"], str(receipts[2][0].id))
+
     def test_po_groups_include_only_linked_batches_and_real_po_summaries(self):
         from apps.purchase.models import GoodsReceipt, GoodsReceiptLine, PurchaseOrder, PurchaseOrderLine
 

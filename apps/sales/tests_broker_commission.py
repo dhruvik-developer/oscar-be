@@ -63,6 +63,7 @@ class BrokerCollectionCommissionTests(TestCase):
             party=self.customer,
             sales_order=self.order,
             doc_date=timezone.localdate(),
+            subtotal=Decimal("1000"),
             total=Decimal("1000"),
             taxable_value=Decimal("1000"),
         )
