@@ -68,37 +68,11 @@ def assign_batch(taka):
     if parent is not None and parent.batch_id:
         taka.batch_id = parent.batch_id
         return
-    # One purchase order is one batch per HSN code: every receipt against the
-    # PO (partial or repeat deliveries) joins the batch its first receipt of
-    # that HSN opened.
+
+    # In Batch-Wise receiving, every receipt line opens/links to its own batch
     po = _purchase_order_for(taka)
-    if po is not None and po.fabric_flow:
+    if taka.source_document_type in ("GRN", "GoodsReceipt") or taka.source_line_id or po is not None:
         taka.batch = _receipt_line_batch(taka, po)
-        return
-    if po is not None:
-        hsn = item_hsn(taka.item)
-        existing = next((
-            b for b in Batch.objects.filter(
-                client_id=taka.client_id, source_document_type="PurchaseOrder",
-                source_document_id=po.id, deleted_at__isnull=True,
-            ).select_related("item__category").order_by("created_at")
-            if item_hsn(b.item) == hsn
-        ), None)
-        if existing is None:
-            on_date = taka.received_date if hasattr(taka.received_date, "year") else None
-            existing = Batch.objects.create(
-                client_id=taka.client_id,
-                batch_code=allocate_number(taka.client_id, "BAT", on_date),
-                origin="PURCHASE",
-                item_id=taka.item_id,
-                supplier_id=po.party_id or taka.supplier_id,
-                source_document_type="PurchaseOrder",
-                source_document_number=po.po_number,
-                source_document_id=po.id,
-                **({"created_on": on_date} if on_date else {}),
-                uom=taka.uom,
-            )
-        taka.batch = existing
         return
     sibling = (
         LotTaka.objects.filter(
@@ -135,11 +109,12 @@ def assign_batch(taka):
 
 
 def _receipt_line_batch(taka, po):
-    """The batch of one received line of a factory fabric order, opened by the
-    line's first roll. Keyed on the GRN line, so a replayed or repeated save
-    of the same receipt line can never open a second batch."""
+    """The batch of one received line, opened by the receipt line. Keyed on the
+    GRN line, so a replayed or repeated save of the same receipt line can never
+    open a second batch."""
     from apps.core.numbering import allocate_number
-    from apps.purchase.models import FABRIC_FLOW_FACTORY_TO_MILL, GoodsReceiptLine
+    from apps.purchase.fabric_flow import receipt_fabric_type
+    from apps.purchase.models import GoodsReceiptLine
 
     from .models import Batch
 
@@ -148,31 +123,44 @@ def _receipt_line_batch(taka, po):
         if taka.source_line_id else None
     )
     receipt_id = grn_line.goods_receipt_id if grn_line else taka.source_document_id
+    receipt_num = grn_line.goods_receipt.grn_number if (grn_line and grn_line.goods_receipt) else taka.source_document_number
+
     existing = Batch.objects.filter(
         client_id=taka.client_id, goods_receipt_id=receipt_id,
         goods_receipt_line_id=grn_line.id if grn_line else None, deleted_at__isnull=True,
     ).first()
     if existing is not None:
+        if grn_line and not grn_line.batch_number:
+            grn_line.batch_number = existing.batch_code
+            grn_line.save(update_fields=["batch_number"])
         return existing
-    fabric_type = "DYED" if po.fabric_flow == FABRIC_FLOW_FACTORY_TO_MILL else "GREY"
+    fabric_type = receipt_fabric_type(po)
+    dyed = fabric_type == "DYED"
     on_date = taka.received_date if hasattr(taka.received_date, "year") else None
-    return Batch.objects.create(
+    supplier_id = (po.party_id if po else None) or taka.supplier_id
+    batch = Batch.objects.create(
         client_id=taka.client_id,
         batch_code=allocate_number(taka.client_id, batch_series(fabric_type), on_date),
         origin="PURCHASE",
         fabric_type=fabric_type,
         item_id=taka.item_id,
-        supplier_id=po.party_id or taka.supplier_id,
-        source_document_type="GRN",
-        source_document_number=taka.source_document_number,
+        supplier_id=supplier_id,
+        source_document_type="GoodsReceipt",
+        source_document_number=receipt_num,
         source_document_id=receipt_id,
         purchase_order=po,
         purchase_order_line_id=grn_line.purchase_order_line_id if grn_line else None,
         goods_receipt_id=receipt_id,
         goods_receipt_line=grn_line,
+        dyeing_colour_name=po.dyeing_colour_name if dyed else None,
+        dyeing_colour_hex=po.dyeing_colour_hex if dyed else None,
         **({"created_on": on_date} if on_date else {}),
         uom=taka.uom,
     )
+    if grn_line and not grn_line.batch_number:
+        grn_line.batch_number = batch.batch_code
+        grn_line.save(update_fields=["batch_number"])
+    return batch
 
 
 def awaiting_qc_filter(client_id):
@@ -784,7 +772,11 @@ def serialize_batch(batch, *, takas=None, include_cost=False, detail=False):
         "hsnMissingFor": hsn_missing,
         "fabricQuality": getattr(getattr(first, "fabric_quality", None), "name", None),
         "design": getattr(getattr(first, "design", None), "name", None),
-        "shade": getattr(getattr(first, "shade", None), "name", None),
+        "shade": getattr(getattr(first, "shade", None), "name", None) or batch.dyeing_colour_name,
+        "dyeingColourName": batch.dyeing_colour_name,
+        "dyeingColourHex": batch.dyeing_colour_hex,
+        "purchaseOrderId": str(batch.purchase_order_id) if batch.purchase_order_id else None,
+        "poNumber": batch.purchase_order.po_number if batch.purchase_order_id else None,
         "width": str(first.width) if first and first.width is not None else None,
         "gsm": str(first.gsm) if first and first.gsm is not None else None,
         "supplierName": batch.supplier.name if batch.supplier_id else None,

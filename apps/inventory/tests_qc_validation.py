@@ -1,3 +1,4 @@
+import json
 import uuid
 from decimal import Decimal
 from datetime import date
@@ -7,8 +8,8 @@ from apps.accounts.models import Client, User
 from apps.accounts.authentication import build_tokens
 from apps.masters.models import Item, ItemCategory, Location, Party, Unit
 from apps.purchase.models import PurchaseOrder, PurchaseOrderLine, GoodsReceipt
-from apps.inventory.models import LotTaka, StockBalance, StockMovement
-from apps.inventory import qc as qc_service
+from apps.inventory.models import LotTaka, Sample, StockBalance, StockMovement
+from apps.inventory import qc as qc_service, sampling_services, stock_position_services
 
 class StrictQuantityAndDuplicateValidationTests(TestCase):
     def setUp(self):
@@ -286,6 +287,74 @@ class StrictQuantityAndDuplicateValidationTests(TestCase):
         ).first()
         self.assertIsNotNone(godown_balance)
         self.assertEqual(godown_balance.on_hand, Decimal("180.0000"))
+
+    def test_sample_quantity_at_qc_lands_in_sample_stock(self):
+        po, po_line = self._create_approved_po(qty=500)
+        grn_res = self.api.post(
+            "/api/v1/purchase/receipts/",
+            {
+                "vendorId": str(self.supplier.id),
+                "purchaseOrderId": str(po.id),
+                "locationId": str(self.godown.id),
+                "receiptDate": "2026-10-20",
+                "supplierChallanNo": f"CH-SMP-{uuid.uuid4().hex[:4]}",
+                "lines": [{"itemId": str(self.item.id), "poLineId": str(po_line.id), "receivedQty": 100}],
+            },
+            format="json",
+        )
+        self.assertEqual(grn_res.status_code, 201)
+        grn_id = grn_res.json()["id"]
+        lot_res = self.api.post(
+            "/api/v1/inventory/lot-register/",
+            {"grnId": grn_id, "itemId": str(self.item.id), "lotNo": "LOT-SMP-1",
+             "takas": [{"takaRoll": "1", "qty": 100}]},
+            format="json",
+        )
+        self.assertIn(lot_res.status_code, (200, 201), lot_res.content)
+        receipt = GoodsReceipt.objects.get(pk=grn_id)
+        line = receipt.lines.get()
+
+        qc_res = self.api.post(
+            "/api/v1/inventory/qc/complete/",
+            {
+                "receiptId": grn_id,
+                "goodQty": 70,
+                "sampleQty": 10,
+                "rejectQty": 20,
+                "lines": [{"lineId": str(line.id), "goodQty": 70, "sampleQty": 10, "rejectQty": 20}],
+            },
+            format="json",
+        )
+        self.assertEqual(qc_res.status_code, 200, qc_res.content)
+        self.assertEqual(qc_res.json()["sampleQty"], 10.0)
+
+        sample = Sample.objects.get(client=self.tenant)
+        self.assertEqual(sample.quantity, Decimal("10.0000"))
+        self.assertEqual(sample.status, "Issued")
+        self.assertEqual(sample.uom, sample.source_lot_taka.uom)
+        self.assertEqual(sample.source_lot_taka.available_quantity, Decimal("0.0000"))
+        self.assertEqual(str(sample.source_lot_taka.location_id), str(self.godown.id))
+
+        screen = stock_position_services.samples(self.tenant.id, {})
+        self.assertEqual(screen["count"], 1)
+        self.assertEqual(screen["results"][0]["outstanding"], "10.0000")
+
+        self.assertFalse(StockMovement.objects.filter(
+            client=self.tenant, type="QC_SECOND_QUALITY",
+        ).exists())
+        godown_balance = StockBalance.objects.get(client=self.tenant, item=self.item, location=self.godown)
+        self.assertEqual(godown_balance.on_hand, Decimal("70.0000"))
+
+        receipt.refresh_from_db()
+        meta = json.loads(receipt.qc_note)
+        self.assertEqual(meta["goodQty"], 80.0)
+        self.assertEqual(meta["sampleQty"], 10.0)
+        self.assertEqual(receipt.qc_status, "Approved")
+
+        sampling_services.return_sample(sample, 4, user=self.user)
+        sample.refresh_from_db()
+        self.assertEqual(sample.status, "Partially Returned")
+        self.assertEqual(sample.source_lot_taka.available_quantity, Decimal("4.0000"))
 
     def test_duplicate_qc_posting_prevented(self):
         po, po_line = self._create_approved_po(qty=300)

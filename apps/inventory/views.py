@@ -3200,6 +3200,10 @@ class QCCompleteInspectionView(APIView):
             receipt = GoodsReceipt.objects.filter(
                 client_id=client_id, id=receipt_id, deleted_at__isnull=True
             ).first() if receipt_id else None
+            if receipt is None and receipt_id:
+                receipt = GoodsReceipt.objects.filter(
+                    client_id=client_id, grn_number__iexact=str(receipt_id), deleted_at__isnull=True
+                ).first()
             inward = None
             if receipt is None and receipt_id:
                 inward = JWOInward.objects.filter(client_id=client_id, id=receipt_id).first()
@@ -3225,6 +3229,7 @@ class QCCompleteInspectionView(APIView):
                     remarks=request.data.get("remarks") or None,
                     job_work_order=jwo,
                     require_job_work_order=bool(jwo_id),
+                    from_reprocess=bool(request.data.get("isReprocess") or request.data.get("is_reprocess")),
                 )
 
                 return Response({

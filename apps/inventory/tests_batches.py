@@ -459,6 +459,44 @@ class BatchRegistryGroupingTests(BatchTestBase):
             {code: row["qcStatus"] for code, row in rows.items()},
         )
 
+    def test_partially_approved_receipt_reads_per_batch_on_po_linked_batches(self):
+        """A batch on a partly approved receipt is judged on its own takas: one
+        that passed whole reads Passed, one with rejected takas stays partial."""
+        from apps.purchase.models import GoodsReceipt, PurchaseOrder
+
+        po = PurchaseOrder.objects.create(
+            client=self.tenant, party=self.vendor, po_number="PO-QC-PARTIAL", doc_date=date(2026, 9, 1),
+        )
+        receipt = GoodsReceipt.objects.create(
+            client=self.tenant, party=self.vendor, purchase_order=po,
+            grn_number="GRN-QC-PARTIAL", receipt_date=date(2026, 9, 1),
+            location=self.godown, qc_status="Partially Approved",
+        )
+        codes = {}
+        for lot, statuses in (("PARTIAL-MIXED", ("Passed", "Rejected")), ("PARTIAL-CLEAN", ("Passed",))):
+            for number, qc_status in enumerate(statuses, start=1):
+                taka = LotTaka.objects.create(
+                    client=self.tenant, item=self.item, location=self.godown,
+                    lot_number=lot, taka_number=str(number), taka_id=f"TAK-{uuid.uuid4().hex[:6]}",
+                    received_quantity=Decimal("50"), received_date=date(2026, 9, 1),
+                    source_document_type="GRN", source_document_id=receipt.id,
+                    source_document_number=receipt.grn_number, qc_status=qc_status,
+                )
+            batch = taka.batch
+            batch.source_document_type = "GRN"
+            batch.source_document_id = receipt.id
+            batch.source_document_number = receipt.grn_number
+            batch.save()
+            codes[lot] = batch.batch_code
+
+        response = self.api.get("/api/v1/inventory/batches/groups/", {
+            "groupBy": "po", "poId": str(po.id), "includePendingQc": "1",
+        })
+        self.assertEqual(response.status_code, 200, response.content)
+        rows = {row["batchCode"]: row for row in response.json()["groups"][0]["batches"]}
+        self.assertEqual(rows[codes["PARTIAL-MIXED"]]["qcStatus"], "Partially Approved")
+        self.assertEqual(rows[codes["PARTIAL-CLEAN"]]["qcStatus"], "Passed")
+
     def test_qc_through_the_api_closes_only_that_batch_and_cannot_repeat(self):
         """QC done on one linked batch: it reads Passed (no QC action) from the
         backend, a second submission is refused, and its sibling stays open."""

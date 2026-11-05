@@ -37,6 +37,7 @@ from apps.sales.services import (
 )
 
 from .models import (
+    FABRIC_FLOW_FACTORY_TO_MILL,
     PURCHASE_TYPE_GREY_STOCK,
     PURCHASE_TYPE_VENDOR_A,
     PURCHASE_TYPE_FINAL_JOB_WORK,
@@ -106,6 +107,23 @@ def receive_bill_goods(bill, *, lines_payload, qc_status=None, user=None, locati
         raise Conflict(
             "Goods have already been received against this bill.",
             code=Codes.ALREADY_DONE,
+        )
+    # A GRN raised on the PO already stocked these goods; receiving them from
+    # the bill would post them a second time. A GRN of another bill on the same
+    # PO is that bill's share, so it does not count.
+    if bill.purchase_order_id and GoodsReceipt.objects.filter(
+        client_id=bill.client_id, purchase_order_id=bill.purchase_order_id,
+        purchase_bill__isnull=True, deleted_at__isnull=True,
+    ).exists():
+        raise Conflict(
+            "These goods were already received through a GRN on the purchase order.",
+            code=Codes.ALREADY_DONE,
+        )
+    # The bill path opens Grey batches; a dyeing-mill order is dyed fabric.
+    if bill.purchase_order_id and bill.purchase_order.fabric_flow == FABRIC_FLOW_FACTORY_TO_MILL:
+        raise Conflict(
+            "Receive this dyed fabric with a GRN on the purchase order.",
+            code="WRONG_FABRIC_TYPE",
         )
 
     lines = list(bill.line_items.select_related("item").order_by("line_no"))
@@ -915,6 +933,14 @@ def record_payment_out(
                 "Cannot record payment against a cancelled bill.",
                 code=Codes.PAYMENT_ON_CANCELLED,
             )
+        # An unposted bill never credited Creditors, so paying it would leave
+        # the vendor's ledger one-sided.
+        if target.posted_at is None or target.status == "Draft":
+            raise BusinessRuleViolation(
+                "Cannot record payment against a draft bill. "
+                "Pay it through Pay Vendor Bill on the purchase order.",
+                code=Codes.PAYMENT_ON_DRAFT,
+            )
 
         already = round2(allocated_to(client.id, "PurchaseBill", target.id))
         balance = round2(D(target.total) - already)
@@ -1035,6 +1061,417 @@ def cancel_bill(bill, *, reason=None, user=None):
         deleted_at=timezone.now()
     )
     return bill
+
+
+# ---------------------------------------------------------------------------
+# Vendor-bill workflow (status, payable, PO workspace)
+# ---------------------------------------------------------------------------
+#: "Partially Paid" / "Paid" are only on rows written before payment progress
+#: moved to the payable; such a bill was approved.
+VENDOR_BILL_APPROVED_STATUSES = ("Approved", "Partially Paid", "Paid")
+VENDOR_BILL_MISMATCH_APPROVAL = "vendor_bill_mismatch"
+
+
+def vendor_bill_payment_summary(bill):
+    """Paid / outstanding from the payable -- the only record payments touch."""
+    payable = bill.purchase_bill
+    total = D(payable.total) if payable is not None else D(bill.total)
+    paid = round2(payable.amount_paid) if payable is not None else ZERO
+    outstanding = max(round2(total - paid), ZERO)
+    if paid <= ZERO:
+        payment_status = "Unpaid"
+    elif outstanding <= ROUNDING_TOLERANCE:
+        payment_status = "Paid"
+    else:
+        payment_status = "Partially Paid"
+    return {"paid": paid, "outstanding": outstanding, "paymentStatus": payment_status}
+
+
+def vendor_bill_workflow(bill, *, approval_pending=False):
+    """Where a vendor bill stands and what may be done with it next.
+
+    The workspace renders ``actions`` as they are and ``pay`` enforces the
+    same list, so the screen and the server cannot disagree.
+    """
+    payment = vendor_bill_payment_summary(bill)
+    payable = bill.purchase_bill
+    actions = ["view"]
+    if payable is not None and payable.status == "Cancelled":
+        stage, label = "cancelled", "Cancelled"
+    elif bill.status == "Rejected":
+        stage, label = "rejected", "Rejected"
+    elif bill.status == "Draft":
+        stage, label = "draft", "Draft"
+    elif bill.status in VENDOR_BILL_APPROVED_STATUSES:
+        if payment["paymentStatus"] == "Paid":
+            stage, label = "paid", "Paid"
+        elif payment["paymentStatus"] == "Partially Paid":
+            stage, label = "partially_paid", "Partially Paid"
+        else:
+            stage, label = "approved", "Approved"
+        if payment["outstanding"] > ROUNDING_TOLERANCE:
+            actions.append("pay")
+    elif bill.match_status == "Matched":
+        stage, label = "matched", "Matched"
+        actions += ["review", "approve", "reject"]
+    elif bill.match_status == "Mismatch":
+        actions.append("review")
+        if approval_pending:
+            stage, label = "approval_pending", "Mismatch — Approval Pending"
+        else:
+            stage, label = "mismatch", "Mismatch — Approval Required"
+            actions += ["approve", "reject"]
+    else:
+        stage, label = "matching_required", "Vendor Bill Created — Matching Required"
+        actions.append("review")
+    return {"stage": stage, "label": label, "actions": actions}
+
+
+def ensure_vendor_bill_payable(bill, *, matching=None, remarks=None, user=None):
+    """The posted ``PurchaseBill`` behind an approved vendor bill.
+
+    A payment debits Creditors, so the payable has to have credited it first.
+    Reuses the bill's payable when it has one and finishes a Draft left by
+    ``send-for-matching``; saving the link on ``bill`` is the caller's job.
+    """
+    payable = bill.purchase_bill
+    if payable is not None and (payable.posted_at is not None or payable.status == "Cancelled"):
+        return payable
+
+    if matching is None:
+        matching = compute_vendor_bill_matching(bill.client_id, bill)
+    final_po_id = (matching.get("finalJobWorkPo") or {}).get("id")
+    effective_po = (
+        PurchaseOrder.objects.filter(pk=final_po_id, client_id=bill.client_id).first()
+        if final_po_id else bill.purchase_order
+    )
+
+    if payable is None:
+        payable = PurchaseBill.objects.create(
+            client=bill.client,
+            party=bill.party,
+            purchase_order=effective_po,
+            doc_date=bill.bill_date,
+            status="Unpaid",
+            bill_number=allocate_number(bill.client, "BILL", bill.bill_date),
+            vendor_bill_number=bill.vendor_bill_number,
+            location_id=getattr(effective_po, "location_id", None),
+            notes=remarks or bill.remarks or f"Recorded from Vendor Bill {bill.vendor_bill_number}",
+        )
+        for line in bill.line_items.filter(deleted_at__isnull=True).order_by("line_no"):
+            PurchaseBillLine.objects.create(
+                client=bill.client,
+                purchase_bill=payable,
+                line_no=line.line_no,
+                item=line.item,
+                batch_number=line.batch_number,
+                description=line.item_name or (line.item.name if line.item else "Fabric"),
+                qty=line.qty,
+                rate=line.rate,
+                tax_pct=bill.gst_pct,
+                uom=line.uom or "Meter",
+            )
+        payable.freeze_party_snapshot()
+    payable.other_charges = bill.other_charges
+    recalculate_document(payable)
+
+    payable.status = "Unpaid"
+    payable.posted_at = timezone.now()
+    payable.posted_by = user if getattr(user, "is_authenticated", False) else None
+    # Job-work fabric is stocked at production verification and GRN-linked
+    # goods are already in stock; "Receive goods" on this bill would post them
+    # a second time.
+    goods_in_stock = (
+        bill.goods_receipt_id is not None
+        or getattr(effective_po, "purchase_type", None) == PURCHASE_TYPE_FINAL_JOB_WORK
+        or GoodsReceipt.objects.filter(
+            client_id=bill.client_id, purchase_order_id=bill.purchase_order_id, deleted_at__isnull=True
+        ).exists()
+    )
+    if goods_in_stock:
+        payable.goods_received = True
+        payable.received_date = timezone.localdate()
+    payable.save()
+
+    entry = ledger.post_purchase_bill(payable, user=user)
+    if entry is not None:
+        payable.journal_entry = entry
+        payable.save(update_fields=["journal_entry", "updated_at"])
+    ledger.recalculate_party_balance(bill.client_id, bill.party)
+    return payable
+
+
+def vendor_bill_po_snapshot(po):
+    """Everything the Pay Vendor Bill workspace shows for ``po``, read only.
+
+    Quantities come from goods receipts and the bills actually linked to the
+    PO: nothing is created here, and nothing received is assumed from what
+    was ordered. Vendor A / final job work POs have no GRN, so their PO
+    quantity is the billing baseline (as in ``compute_vendor_bill_matching``).
+    """
+    from apps.core.models import ApprovalRequest
+    from apps.inventory.models import Batch
+
+    po_lines = list(
+        po.line_items.filter(deleted_at__isnull=True).select_related("item").order_by("line_no")
+    )
+    first_line = po_lines[0] if po_lines else None
+    rate_by_item = {}
+    for po_line in po_lines:
+        rate_by_item.setdefault(po_line.item_id, D(po_line.rate or 0))
+    default_rate = D(first_line.rate or 0) if first_line else ZERO
+    receipt_based = po.purchase_type in GREY_STOCK_PURCHASE_TYPES
+
+    vendor_bills = list(
+        VendorBill.objects.filter(
+            client_id=po.client_id, purchase_order=po, deleted_at__isnull=True
+        )
+        .select_related("purchase_bill", "approved_by", "attachment")
+        .prefetch_related("line_items__batch", "line_items__goods_receipt", "line_items__item")
+        .order_by("-bill_date", "-created_at")
+    )
+    linked_payable_ids = [vb.purchase_bill_id for vb in vendor_bills if vb.purchase_bill_id]
+    # A header with no lines bills nothing: it is not a vendor invoice.
+    vendor_bills = [
+        vb for vb in vendor_bills
+        if any(line.deleted_at is None for line in vb.line_items.all())
+    ]
+
+    def _is_live(vendor_bill):
+        payable = vendor_bill.purchase_bill
+        return vendor_bill.status != "Rejected" and not (payable and payable.status == "Cancelled")
+
+    # A payable made from a vendor bill repeats that bill's lines; only a bill
+    # raised directly on the PO adds to what is billed.
+    billed = []
+    for vendor_bill in vendor_bills:
+        if _is_live(vendor_bill):
+            billed.extend(
+                {"batchId": line.batch_id, "batchNumber": line.batch_number,
+                 "itemId": line.item_id, "qty": D(line.qty or 0)}
+                for line in vendor_bill.line_items.all() if line.deleted_at is None
+            )
+    direct_lines = (
+        PurchaseBillLine.objects.filter(
+            purchase_bill__purchase_order=po, purchase_bill__deleted_at__isnull=True,
+            deleted_at__isnull=True,
+        )
+        .exclude(purchase_bill__status="Cancelled")
+        .exclude(purchase_bill_id__in=linked_payable_ids)
+    )
+    billed.extend(
+        {"batchId": None, "batchNumber": line.batch_number, "itemId": line.item_id, "qty": D(line.qty or 0)}
+        for line in direct_lines
+    )
+
+    # One row per thing that can be billed: a batch, else a GRN line that has
+    # no batch yet, else (no-GRN flows) a PO line.
+    rows = []
+    covered_grn_lines = set()
+    batches = (
+        Batch.objects.filter(purchase_order=po, deleted_at__isnull=True)
+        .select_related("goods_receipt", "goods_receipt_line__item", "item")
+        .order_by("created_at")
+    )
+    for batch in batches:
+        grn_line = batch.goods_receipt_line
+        if grn_line is None or grn_line.id in covered_grn_lines or grn_line.deleted_at is not None:
+            continue
+        covered_grn_lines.add(grn_line.id)
+        grn = batch.goods_receipt
+        rows.append({
+            "batchId": str(batch.id),
+            "batchCode": batch.batch_code,
+            "lotNumber": grn_line.batch_number or "",
+            "grnId": str(grn.id) if grn else None,
+            "grnNumber": grn.grn_number if grn else (batch.source_document_number or "—"),
+            "receiptDate": str(grn.receipt_date) if grn and grn.receipt_date else "",
+            "itemId": batch.item_id or grn_line.item_id,
+            "itemName": (batch.item or grn_line.item).name,
+            "sku": (batch.item or grn_line.item).sku,
+            "uom": batch.uom or grn_line.uom or "Meter",
+            "receivedQty": D(grn_line.received_qty or 0),
+        })
+    grn_lines = list(
+        GoodsReceiptLine.objects.filter(
+            goods_receipt__purchase_order=po, goods_receipt__deleted_at__isnull=True,
+            deleted_at__isnull=True,
+        ).select_related("goods_receipt", "item")
+    )
+    for grn_line in grn_lines:
+        if grn_line.id in covered_grn_lines:
+            continue
+        grn = grn_line.goods_receipt
+        rows.append({
+            "batchId": None,
+            "batchCode": grn_line.batch_number or "",
+            "lotNumber": grn_line.batch_number or "",
+            "grnId": str(grn.id),
+            "grnNumber": grn.grn_number,
+            "receiptDate": str(grn.receipt_date or ""),
+            "itemId": grn_line.item_id,
+            "itemName": grn_line.item.name,
+            "sku": grn_line.item.sku,
+            "uom": grn_line.uom or "Meter",
+            "receivedQty": D(grn_line.received_qty or 0),
+        })
+    if not receipt_based and not rows:
+        for po_line in po_lines:
+            rows.append({
+                "batchId": None,
+                "batchCode": "",
+                "lotNumber": "",
+                "grnId": None,
+                "grnNumber": "",
+                "receiptDate": "",
+                "itemId": po_line.item_id,
+                "itemName": po_line.item_name or (po_line.item.name if po_line.item else "—"),
+                "sku": po_line.sku or (po_line.item.sku if po_line.item else ""),
+                "uom": po_line.uom or "Meter",
+                "receivedQty": D(po_line.qty or 0),
+            })
+    rows = [row for row in rows if row["receivedQty"] > ZERO]
+
+    # Bills name their batch when they can; the rest are taken oldest-first
+    # from the same fabric so a batch-less bill still uses up billable qty.
+    for row in rows:
+        row["billedQty"] = ZERO
+    for entry in billed:
+        remaining = entry["qty"]
+        exact = [
+            row for row in rows
+            if (entry["batchId"] and row["batchId"] == str(entry["batchId"]))
+            or (entry["batchNumber"] and entry["batchNumber"] in (row["batchCode"], row["lotNumber"]))
+        ]
+        same_item = [row for row in rows if row["itemId"] == entry["itemId"] and row not in exact]
+        for row in exact + same_item:
+            take = min(remaining, max(row["receivedQty"] - row["billedQty"], ZERO))
+            row["billedQty"] += take
+            remaining -= take
+            if remaining <= ZERO:
+                break
+
+    batch_list = []
+    for row in rows:
+        rate = rate_by_item.get(row["itemId"], default_rate)
+        available = max(row["receivedQty"] - row["billedQty"], ZERO)
+        batch_list.append({
+            **{key: value for key, value in row.items() if key != "billedQty"},
+            "itemId": str(row["itemId"]) if row["itemId"] else None,
+            "receivedQty": float(row["receivedQty"]),
+            "previouslyBilledQty": float(row["billedQty"]),
+            "remainingBillableQty": float(available),
+            "originalPoRate": float(rate),
+            "isFullyBilled": available <= ZERO,
+        })
+
+    received = sum((row["receivedQty"] for row in rows), ZERO)
+    total_billed = sum((entry["qty"] for entry in billed), ZERO)
+    remaining_billable = max(received - total_billed, ZERO)
+
+    pending_ids = set(
+        ApprovalRequest.objects.filter(
+            client_id=po.client_id,
+            document_type=VENDOR_BILL_MISMATCH_APPROVAL,
+            document_id__in=[str(vb.id) for vb in vendor_bills],
+            status="Pending",
+        ).values_list("document_id", flat=True)
+    )
+
+    bills = []
+    total_billed_amount = total_paid = total_outstanding = ZERO
+    for vendor_bill in vendor_bills:
+        lines = [line for line in vendor_bill.line_items.all() if line.deleted_at is None]
+        lines.sort(key=lambda line: line.line_no)
+        payment = vendor_bill_payment_summary(vendor_bill)
+        workflow = vendor_bill_workflow(
+            vendor_bill, approval_pending=str(vendor_bill.id) in pending_ids
+        )
+        if _is_live(vendor_bill):
+            total_billed_amount += D(vendor_bill.total or 0)
+            total_paid += payment["paid"]
+            total_outstanding += payment["outstanding"]
+        payable = vendor_bill.purchase_bill
+        bills.append({
+            "id": str(vendor_bill.id),
+            "vendorBillNumber": vendor_bill.vendor_bill_number,
+            "vendorName": vendor_bill.party_name or po.party_name,
+            "billDate": str(vendor_bill.bill_date),
+            "billQuantity": float(sum((D(line.qty or 0) for line in lines), ZERO)),
+            "subtotal": float(vendor_bill.subtotal or 0),
+            "gstPct": float(vendor_bill.gst_pct or 0),
+            "gstAmount": float(vendor_bill.gst_amount or 0),
+            "otherCharges": float(vendor_bill.other_charges or 0),
+            "billAmount": float(vendor_bill.total or 0),
+            "poNumber": po.po_number,
+            "matchingStatus": vendor_bill.match_status,
+            "approvalStatus": (
+                "Approved" if vendor_bill.status in VENDOR_BILL_APPROVED_STATUSES else vendor_bill.status
+            ),
+            "amountPaid": float(payment["paid"]),
+            "outstandingAmount": float(payment["outstanding"]),
+            "paymentStatus": payment["paymentStatus"],
+            "workflow": workflow,
+            "purchaseBillId": str(payable.id) if payable else None,
+            "purchaseBillNumber": payable.bill_number if payable else None,
+            "attachmentName": vendor_bill.attachment.file_name if vendor_bill.attachment else None,
+            "remarks": vendor_bill.remarks,
+            "approvalRemarks": vendor_bill.approval_remarks,
+            "approvedByName": getattr(vendor_bill.approved_by, "name", None),
+            "approvedAt": vendor_bill.approved_at.isoformat() if vendor_bill.approved_at else None,
+            "matchResult": vendor_bill.match_result,
+            "lines": [
+                {
+                    "lineNo": line.line_no,
+                    "batchCode": line.batch_number or (line.batch.batch_code if line.batch else ""),
+                    "grnNumber": line.goods_receipt.grn_number if line.goods_receipt else "",
+                    "itemName": line.item_name or (line.item.name if line.item else ""),
+                    "qty": float(line.qty or 0),
+                    "poRate": float(rate_by_item.get(line.item_id, default_rate)),
+                    "rate": float(line.rate or 0),
+                    "amount": float(line.amount or 0),
+                }
+                for line in lines
+            ],
+        })
+
+    fabric_quality = "—"
+    if first_line is not None:
+        quality = getattr(first_line, "fabric_quality", None)
+        fabric_quality = (
+            getattr(quality, "name", None) or (str(quality) if quality else None)
+            or first_line.item_name or (first_line.item.name if first_line.item else "—")
+        )
+
+    create_blocked_reason = None
+    if received <= ZERO:
+        create_blocked_reason = "No goods have been received against this purchase order yet."
+    elif remaining_billable <= ZERO:
+        create_blocked_reason = "The full received quantity has already been billed."
+
+    return {
+        "poSummary": {
+            "poId": str(po.id),
+            "poNumber": po.po_number,
+            "poDate": str(po.doc_date),
+            "vendorName": po.party_name or (po.party.name if po.party else "—"),
+            "fabricQuality": fabric_quality,
+            "orderedQty": float(sum((D(line.qty or 0) for line in po_lines), ZERO)),
+            "receivedQty": float(received),
+            "previouslyBilledQty": float(total_billed),
+            "remainingBillableQty": float(remaining_billable),
+            "originalPoRate": float(default_rate),
+            "originalPoAmount": float(D(po.total or 0)),
+            "totalBills": len(bills),
+            "totalBilledAmount": float(total_billed_amount),
+            "totalPaidAmount": float(total_paid),
+            "totalOutstandingAmount": float(total_outstanding),
+            "canCreateBill": create_blocked_reason is None,
+            "createBlockedReason": create_blocked_reason,
+        },
+        "batches": batch_list,
+        "bills": bills,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1319,7 +1756,11 @@ def compute_vendor_bill_matching(client_id, bill):
 
     # Header totals: the bill's GST and grand total must follow from its lines.
     expected_gst = round2(total_bill_amount * bill_tax_pct / Decimal("100"))
-    expected_total = round2(total_bill_amount + expected_gst)
+    other_charges = D(bill.other_charges or 0)
+    expected_total = round2(total_bill_amount + expected_gst + other_charges)
+    if other_charges != ZERO:
+        all_match = False
+        reasons.append(f"Other charges {other_charges} on the invoice are not on the purchase order.")
     total_match = (
         abs(D(bill.gst_amount or 0) - expected_gst) <= ROUNDING_TOLERANCE
         and abs(D(bill.total or 0) - expected_total) <= ROUNDING_TOLERANCE
@@ -1328,7 +1769,7 @@ def compute_vendor_bill_matching(client_id, bill):
         all_match = False
         reasons.append(
             f"Invoice total {D(bill.total or 0)} (GST {D(bill.gst_amount or 0)}) does not equal "
-            f"lines {total_bill_amount} + GST {expected_gst} = {expected_total}."
+            f"lines {total_bill_amount} + GST {expected_gst} + charges {other_charges} = {expected_total}."
         )
 
     overall = "Match" if all_match else "Mismatch"
@@ -1596,11 +2037,15 @@ def create_standalone_grn(
     lines_payload=None,
     lines_data=None,
     user=None,
+    fabric_type=None,
 ):
     """Create a standalone Goods Receipt Note (GRN) against a PO or directly from a vendor.
 
     Captures taka/roll entries per line, calculates shortage/excess vs PO,
     posts stock movement into QC Hold, and provisions LotTaka entries.
+
+    The PO's delivery type decides Grey or Dyed Fabric; ``fabric_type`` (also
+    accepted per line) is only checked against it, never obeyed.
     """
     party_id = party_id or (getattr(party, "id", party) if party else None)
     purchase_order_id = purchase_order_id or (getattr(purchase_order, "id", purchase_order) if purchase_order else None)
@@ -1608,6 +2053,8 @@ def create_standalone_grn(
     from apps.core.numbering import allocate_number
     from apps.inventory.models import LotTaka
     from apps.masters.models import Item, Location, Party
+
+    from .fabric_flow import check_receipt_fabric_type
 
     party = Party.objects.filter(pk=party_id, client_id=client.id, deleted_at__isnull=True).first()
     if not party:
@@ -1634,6 +2081,9 @@ def create_standalone_grn(
                 field_errors={"purchaseOrderId": ["Not found."]},
             )
         _assert_po_receivable(po, party)
+
+    for requested in [fabric_type, *[row.get("fabricType") for row in lines_payload or []]]:
+        check_receipt_fabric_type(po, requested)
 
     if supplier_challan_no:
         duplicate = GoodsReceipt.objects.filter(
@@ -1701,6 +2151,12 @@ def create_standalone_grn(
             po_line = PurchaseOrderLine.objects.select_for_update().filter(
                 purchase_order=po, item_id=item_id, deleted_at__isnull=True
             ).first()
+        # A line off the PO would escape the remaining-quantity check below.
+        if po is not None and po.fabric_flow and po_line is None:
+            raise ValidationFailed(
+                f"Line {idx + 1}: that fabric is not on {po.po_number}.",
+                field_errors={"lines": [f"Line {idx + 1}: pick a fabric line of {po.po_number}."]},
+            )
 
         item = Item.objects.filter(pk=item_id, client_id=client.id, deleted_at__isnull=True).first()
         if not item:
@@ -1726,7 +2182,10 @@ def create_standalone_grn(
                     field_errors={"lines": [f"Line {idx + 1}: cannot receive {received_qty} m; only {remaining_po_qty} m remaining on {po.po_number}."]},
                 )
 
+        total_batch_cost = line_data.get("total_cost") or line_data.get("totalCost") or line_data.get("batch_cost") or line_data.get("batchCost")
         unit_cost = round4(D(line_data.get("unit_cost") or line_data.get("unitCost") or line_data.get("rate") or (po_line.rate if po_line else item.cost_price) or 0))
+        if unit_cost <= ZERO and total_batch_cost and received_qty > ZERO:
+            unit_cost = round4(D(str(total_batch_cost)) / received_qty)
         fabric_width = line_data.get("fabric_width") or line_data.get("fabricWidth")
         remarks = line_data.get("remarks")
         batch_number = line_data.get("batch_number") or line_data.get("batchNumber") or allocate_number(client, "LOT", receipt_date)
@@ -1824,6 +2283,11 @@ def create_standalone_grn(
             ).first() or Shade.objects.filter(
                 client_id=client.id, code=resolved_shade, deleted_at__isnull=True
             ).first()
+        if po is not None and po.fabric_flow == FABRIC_FLOW_FACTORY_TO_MILL:
+            # The item may be the grey quality; what arrived is the PO's colour.
+            resolved_shade = Shade.objects.filter(
+                client_id=client.id, name__iexact=po.dyeing_colour_name or "", deleted_at__isnull=True
+            ).first()
 
         for t_idx, t_spec in enumerate(takas_spec):
             taka_qty = round4(D(t_spec.get("qty") or t_spec.get("actual_meter") or t_spec.get("quantity") or 0))
@@ -1874,6 +2338,33 @@ def create_standalone_grn(
             )
             taka_obj.stock_movement = movement
             taka_obj.save(update_fields=["stock_movement", "updated_at"])
+
+        # A factory fabric order's value reaches the batch through
+        # ``fabric_flow.allocate_costs``; booking it here too would double it.
+        if unit_cost > ZERO and not (po is not None and po.fabric_flow):
+            from apps.inventory import costing_services
+            from apps.inventory.models import LotCostEntry
+            cost_exists = LotCostEntry.objects.filter(
+                client_id=client.id,
+                lot_number=batch_number,
+                source_document_type="GRN",
+                source_document_id=receipt.id,
+                deleted_at__isnull=True,
+            ).exists()
+            if not cost_exists:
+                costing_services.post_lot_cost(
+                    client_id=client.id,
+                    lot_number=batch_number,
+                    cost_type="Grey purchase",
+                    amount=round4(unit_cost * received_qty),
+                    quantity=received_qty,
+                    source_document_type="GRN",
+                    source_document_id=receipt.id,
+                    source_document_number=receipt.grn_number,
+                    user=user,
+                    is_approved=True,
+                    remarks=f"Batch intake cost @ ₹{unit_cost}/m against GRN {receipt.grn_number}",
+                )
 
     if po is not None:
         refresh_po_receipt_status(po)

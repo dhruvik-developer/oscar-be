@@ -58,6 +58,8 @@ class FabricFlowTestBase(TestCase):
             "lineItems": [{"itemId": str(self.fabric.id), "qty": qty, "rate": rate, "tax": 5, "uom": "Mtr"}],
             "yarnLines": [{"itemId": str(self.yarn.id), "requiredQty": 120, "uom": "Kg", "rate": 300}],
         }
+        if flow == "FACTORY_TO_MILL":
+            body.update({"dyeingColourName": "Navy Blue", "dyeingColourHex": "#1F3A5F"})
         body.update(extra or {})
         res = self.api.post("/api/v1/purchase/orders/", body, format="json")
         self.assertEqual(res.status_code, 201, res.content)
@@ -240,6 +242,18 @@ class FlowBFactoryToMillTests(FabricFlowTestBase):
         self.post(po, "dispatches/", {"dispatchedQty": 100, "dispatchDate": "2026-10-21"})
         self.post(po, "mill-processes/", {"millReceiptDate": "2026-10-22", "qtyReceived": 101}, expect=400)
         self.post(po, "dispatches/", {"dispatchedQty": 901, "dispatchDate": "2026-10-21"}, expect=400)
+
+
+class MenuDispatchOnMillPoTests(FabricFlowTestBase):
+    def test_dispatch_from_po_menu_counts_as_sent_to_the_mill(self):
+        po = self.create_po("FACTORY_TO_MILL", extra={"dyeingMillId": str(self.mill.id)})
+        res = self.api.post("/api/v1/purchase/deliveries/", {
+            "purchaseOrderId": str(po.id), "dispatchDate": "2026-10-21", "dispatchedQty": 100,
+        }, format="json")
+        self.assertEqual(res.status_code, 201, res.content)
+        delivery = SupplierDelivery.objects.get(purchase_order=po)
+        self.assertEqual((delivery.destination, delivery.mill_id), ("MILL", self.mill.id))
+        self.receive(po, 100)
 
 
 class CostTests(FabricFlowTestBase):
