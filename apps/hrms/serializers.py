@@ -1,5 +1,8 @@
 """HRMS serializers (api.md §11)."""
+from datetime import date, datetime
+from decimal import Decimal
 import re
+from django.utils import timezone
 
 from rest_framework import serializers
 
@@ -29,6 +32,8 @@ from .models import (
     AssetCategory,
     AssetRequest,
     Attendance,
+    AttendanceBreak,
+    AttendancePunch,
     AttendanceRegularization,
     CalendarEvent,
     Candidate,
@@ -162,6 +167,7 @@ class EmployeeSerializer(BaseModelSerializer):
         source="salary_structure", model="hrms.SalaryStructure",
         required=False, allow_null=True,
     )
+    standardSalary = MoneyField(source="standard_salary", required=False)
     avatar = serializers.CharField(source="avatar_url", required=False, allow_null=True)
 
     class Meta:
@@ -170,13 +176,33 @@ class EmployeeSerializer(BaseModelSerializer):
             "id", "employeeCode", "name", "email", "phone", "avatar",
             "designation", "designationId", "department", "departmentId",
             "manager", "managerId", "location", "locationId", "joining", "joiningDate",
-            "employmentType", "shift", "salaryStructureId", "standard_salary",
+            "employmentType", "shift", "salaryStructureId", "standard_salary", "standardSalary",
             "status", "date_of_birth", "gender", "blood_group", "personal_email",
             "emergency_contact", "address", "bank_account_number", "ifsc_code",
             "pan", "uan", "aadhaar_last4", "last_working_day",
             "termination_reason", "created_at", "updated_at",
         ]
         read_only_fields = ["employeeCode", "created_at", "updated_at"]
+
+    def to_internal_value(self, data):
+        if isinstance(data, dict) and "status" in data and data["status"]:
+            st = str(data["status"]).strip()
+            mapping = {
+                "active": "Active",
+                "inactive": "Inactive",
+                "on leave": "On Leave",
+                "on-leave": "On Leave",
+                "on_leave": "On Leave",
+                "probation": "Probation",
+                "resigned": "Resigned",
+                "notice period": "Notice Period",
+                "notice-period": "Notice Period",
+                "notice_period": "Notice Period",
+                "terminated": "Terminated",
+            }
+            if st.lower() in mapping:
+                data = {**data, "status": mapping[st.lower()]}
+        return super().to_internal_value(data)
 
     def validate(self, attrs):
         from django.utils import timezone as dj_timezone
@@ -200,22 +226,85 @@ class AttendanceSerializer(BaseModelSerializer):
         source="employee", model="hrms.Employee", required=False, allow_null=True
     )
     employeeName = serializers.CharField(source="employee.name", read_only=True)
+    name = serializers.CharField(source="employee.name", read_only=True)
     employeeCode = serializers.CharField(source="employee.employee_code", read_only=True)
+    empId = serializers.CharField(source="employee.employee_code", read_only=True)
     department = serializers.CharField(source="employee.department.name", read_only=True)
+    dept = serializers.CharField(source="employee.department.name", read_only=True)
+    shift = serializers.CharField(source="employee.shift", read_only=True)
     date = serializers.DateField(source="work_date")
     checkIn = serializers.DateTimeField(source="check_in", required=False, allow_null=True)
     checkOut = serializers.DateTimeField(source="check_out", required=False, allow_null=True)
+    firstPunch = serializers.DateTimeField(source="first_punch", required=False, allow_null=True)
+    lastPunch = serializers.SerializerMethodField()
+    workingHours = serializers.DecimalField(source="working_hours", max_digits=6, decimal_places=2, required=False, allow_null=True)
+    totalBreakMinutes = serializers.IntegerField(source="total_break_minutes", required=False)
+    totalAttendanceHours = serializers.DecimalField(source="total_attendance_hours", max_digits=6, decimal_places=2, required=False, allow_null=True)
+    lateMinutes = serializers.IntegerField(source="late_minutes", required=False)
+    earlyLeavingMinutes = serializers.IntegerField(source="early_leaving_minutes", required=False)
+    overtimeHours = serializers.DecimalField(source="overtime_hours", max_digits=6, decimal_places=2, required=False)
+    punches = serializers.SerializerMethodField()
+    breaks = serializers.SerializerMethodField()
+    formattedWorkingHours = serializers.SerializerMethodField()
 
     class Meta:
         model = Attendance
         fields = [
-            "id", "employeeId", "employeeName", "employeeCode", "department",
-            "date", "checkIn", "checkOut", "hours", "status", "source",
-            "remark", "leave_request", "created_at", "updated_at",
+            "id", "employeeId", "employeeName", "name", "employeeCode", "empId", "department", "dept", "shift",
+            "date", "checkIn", "checkOut", "firstPunch", "lastPunch", "hours", "workingHours",
+            "totalBreakMinutes", "totalAttendanceHours", "lateMinutes", "earlyLeavingMinutes", "overtimeHours",
+            "punches", "breaks", "formattedWorkingHours",
+            "status", "source", "remark", "leave_request", "created_at", "updated_at",
         ]
-        # `hours` and the Late / Half Day verdict come from the flexibility
-        # policy, applied server-side (api.md §11.2).
-        read_only_fields = ["hours", "source", "leave_request", "created_at", "updated_at"]
+        read_only_fields = ["hours", "workingHours", "totalBreakMinutes", "totalAttendanceHours", "lateMinutes", "earlyLeavingMinutes", "overtimeHours", "source", "leave_request", "created_at", "updated_at"]
+
+    def get_lastPunch(self, obj):
+        val = obj.last_punch or obj.check_out
+        if not val:
+            return None
+        local_dt = timezone.localtime(val) if timezone.is_aware(val) else val
+        return local_dt.strftime("%I:%M %p")
+
+    def get_formattedWorkingHours(self, obj):
+        wh = obj.working_hours if obj.working_hours is not None else obj.hours
+        if wh is None:
+            return "00h 00m"
+        total_m = int(float(wh) * 60)
+        h = total_m // 60
+        m = total_m % 60
+        return f"{h:02d}h {m:02d}m"
+
+    def get_punches(self, obj):
+        punches = obj.punches.all().order_by("punch_time")
+        return [
+            {
+                "id": str(p.id),
+                "punchType": p.punch_type,
+                "punchTime": p.punch_time.isoformat(),
+                "timeDisplay": (timezone.localtime(p.punch_time) if timezone.is_aware(p.punch_time) else p.punch_time).strftime("%I:%M %p"),
+                "source": p.source,
+                "remark": p.remark,
+            }
+            for p in punches
+        ]
+
+    def get_breaks(self, obj):
+        breaks = obj.breaks.all().order_by("break_in_time")
+        return [
+            {
+                "id": str(b.id),
+                "breakIn": b.break_in_time.isoformat(),
+                "breakOut": b.break_out_time.isoformat() if b.break_out_time else None,
+                "breakInTime": (timezone.localtime(b.break_in_time) if timezone.is_aware(b.break_in_time) else b.break_in_time).strftime("%I:%M %p"),
+                "breakOutTime": (timezone.localtime(b.break_out_time) if timezone.is_aware(b.break_out_time) else b.break_out_time).strftime("%I:%M %p") if b.break_out_time else None,
+                "duration": f"{(b.duration_seconds // 3600):02d}h {((b.duration_seconds % 3600) // 60):02d}m" if b.break_out_time else "In Progress",
+                "durationSeconds": b.duration_seconds,
+                "durationMinutes": b.duration_minutes,
+                "breakType": b.break_type,
+                "remark": b.remark,
+            }
+            for b in breaks
+        ]
 
     def to_internal_value(self, data):
         data = data.copy() if hasattr(data, "copy") else dict(data)
@@ -253,6 +342,64 @@ class BulkAttendanceSerializer(BaseSerializer):
     records = serializers.ListField(child=serializers.DictField(), required=False, default=list)
     ids = serializers.ListField(child=serializers.CharField(), required=False, default=list)
     status = serializers.CharField(required=False, allow_null=True)
+
+
+class AttendancePunchSerializer(BaseModelSerializer):
+    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee", read_only=True)
+    employeeName = serializers.CharField(source="employee.name", read_only=True)
+    employeeCode = serializers.CharField(source="employee.employee_code", read_only=True)
+    punchType = serializers.CharField(source="punch_type")
+    punchTime = serializers.DateTimeField(source="punch_time")
+    timeDisplay = serializers.SerializerMethodField()
+    date = serializers.DateField(source="work_date", read_only=True)
+
+    class Meta:
+        model = AttendancePunch
+        fields = [
+            "id", "employeeId", "employeeName", "employeeCode", "date",
+            "punchType", "punchTime", "timeDisplay", "source", "remark", "created_at"
+        ]
+        read_only_fields = ["id", "employeeId", "date", "created_at"]
+
+    def get_timeDisplay(self, obj):
+        local_dt = timezone.localtime(obj.punch_time) if timezone.is_aware(obj.punch_time) else obj.punch_time
+        return local_dt.strftime("%I:%M %p")
+
+
+class AttendanceBreakSerializer(BaseModelSerializer):
+    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee", read_only=True)
+    breakIn = serializers.DateTimeField(source="break_in_time")
+    breakOut = serializers.DateTimeField(source="break_out_time", allow_null=True)
+    breakInTime = serializers.SerializerMethodField()
+    breakOutTime = serializers.SerializerMethodField()
+    duration = serializers.SerializerMethodField()
+    durationSeconds = serializers.IntegerField(source="duration_seconds", read_only=True)
+    durationMinutes = serializers.IntegerField(source="duration_minutes", read_only=True)
+    breakType = serializers.CharField(source="break_type")
+
+    class Meta:
+        model = AttendanceBreak
+        fields = [
+            "id", "employeeId", "breakIn", "breakOut", "breakInTime", "breakOutTime",
+            "duration", "durationSeconds", "durationMinutes", "breakType", "remark",
+        ]
+
+    def get_breakInTime(self, obj):
+        local_dt = timezone.localtime(obj.break_in_time) if timezone.is_aware(obj.break_in_time) else obj.break_in_time
+        return local_dt.strftime("%I:%M %p")
+
+    def get_breakOutTime(self, obj):
+        if not obj.break_out_time:
+            return None
+        local_dt = timezone.localtime(obj.break_out_time) if timezone.is_aware(obj.break_out_time) else obj.break_out_time
+        return local_dt.strftime("%I:%M %p")
+
+    def get_duration(self, obj):
+        if not obj.break_out_time:
+            return "In Progress"
+        h = obj.duration_seconds // 3600
+        m = (obj.duration_seconds % 3600) // 60
+        return f"{h:02d}h {m:02d}m"
 
 
 class RegularizationSerializer(BaseModelSerializer):
@@ -400,14 +547,19 @@ class CompOffSerializer(BaseModelSerializer):
     employeeId = TenantPrimaryKeyRelatedField(
         source="employee", model="hrms.Employee", required=False, allow_null=True
     )
+    employeeName = serializers.CharField(source="employee.name", read_only=True)
+    employee = serializers.CharField(source="employee.name", read_only=True)
     workedDate = serializers.DateField(source="worked_date")
     workType = serializers.CharField(source="work_type", required=False, allow_null=True)
+    creditDays = serializers.DecimalField(source="days", max_digits=4, decimal_places=2, required=False)
     expiryDate = serializers.DateField(source="expiry_date", required=False, allow_null=True)
+    rejectReason = serializers.CharField(source="reject_reason", required=False, allow_null=True)
 
     class Meta:
         model = CompOff
         fields = [
-            "id", "employeeId", "workedDate", "workType", "days", "expiryDate",
+            "id", "employeeId", "employeeName", "employee", "workedDate", "workType",
+            "days", "creditDays", "expiryDate", "status", "rejectReason",
             "used", "created_at",
         ]
 
@@ -416,18 +568,52 @@ class LeaveEncashmentSerializer(BaseModelSerializer):
     employeeId = TenantPrimaryKeyRelatedField(
         source="employee", model="hrms.Employee", required=False, allow_null=True
     )
-    leaveTypeId = TenantPrimaryKeyRelatedField(source="leave_type", model="hrms.LeaveType")
-    perDayRate = MoneyField(source="per_day_rate")
+    employeeName = serializers.CharField(source="employee.name", read_only=True)
+    leaveTypeId = TenantPrimaryKeyRelatedField(
+        source="leave_type", model="hrms.LeaveType", required=False, allow_null=True
+    )
+    leaveTypeName = serializers.CharField(source="leave_type.name", read_only=True)
+    perDayRate = MoneyField(source="per_day_rate", required=False)
     # GeneratedField (days * per_day_rate) -- see LeaveBalanceSerializer.balance.
     amount = MoneyField(read_only=True)
 
     class Meta:
         model = LeaveEncashment
         fields = [
-            "id", "employeeId", "leaveTypeId", "days", "perDayRate", "amount",
-            "status", "created_at",
+            "id", "employeeId", "employeeName", "leaveTypeId", "leaveTypeName",
+            "days", "perDayRate", "amount", "status", "created_at",
         ]
         read_only_fields = ["amount"]
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        client = getattr(self.context.get("request"), "client", None)
+        client_id = getattr(self.context.get("request"), "client_id", None) or (client.id if client else None)
+
+        # Allow flexible employee resolution: employeeId, or matching by employee name
+        if not attrs.get("employee"):
+            emp_name = self.initial_data.get("employee") or self.initial_data.get("employeeName")
+            if emp_name and client_id:
+                emp = Employee.objects.filter(client_id=client_id, name__iexact=str(emp_name).strip()).first()
+                if emp:
+                    attrs["employee"] = emp
+
+        # Allow fallback perDayRate from ratePerDay or default
+        if not attrs.get("per_day_rate"):
+            rate = self.initial_data.get("ratePerDay") or self.initial_data.get("perDayRate") or 2083
+            attrs["per_day_rate"] = Decimal(str(rate))
+
+        # Allow fallback leaveTypeId to first active leave type if not provided
+        if not attrs.get("leave_type"):
+            lt_id = self.initial_data.get("leaveTypeId") or self.initial_data.get("leaveType")
+            if lt_id:
+                lt = LeaveType.objects.filter(id=lt_id).first()
+                if lt:
+                    attrs["leave_type"] = lt
+            if not attrs.get("leave_type") and client_id:
+                attrs["leave_type"] = LeaveType.objects.filter(client_id=client_id).first()
+
+        return attrs
 
 
 # ---------------------------------------------------------------------------
@@ -685,12 +871,70 @@ class ScreeningQuestionSerializer(BaseModelSerializer):
 # Performance (api.md §11.6)
 # ---------------------------------------------------------------------------
 class AppraisalCycleSerializer(BaseModelSerializer):
+    startDate = serializers.DateField(source="period_start", required=False)
+    endDate = serializers.DateField(source="period_end", required=False)
+    periodStart = serializers.DateField(source="period_start", required=False)
+    periodEnd = serializers.DateField(source="period_end", required=False)
+    reviewPeriod = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    reviewFrequency = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    description = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+
     class Meta:
         model = AppraisalCycle
         fields = [
-            "id", "name", "period_start", "period_end", "status",
-            "participants_scope", "created_at",
+            "id", "name", "period_start", "period_end", "startDate", "endDate",
+            "periodStart", "periodEnd", "status", "participants_scope",
+            "reviewPeriod", "reviewFrequency", "description", "created_at",
         ]
+
+    def to_internal_value(self, data):
+        if isinstance(data, dict):
+            data = data.copy()
+            start = data.get("period_start") or data.get("startDate") or data.get("periodStart")
+            if start:
+                data["period_start"] = str(start)[:10]
+            end = data.get("period_end") or data.get("endDate") or data.get("periodEnd")
+            if end:
+                data["period_end"] = str(end)[:10]
+
+            if not data.get("period_start"):
+                import datetime
+                data["period_start"] = str(datetime.date.today())
+            if not data.get("period_end"):
+                import datetime
+                data["period_end"] = str(datetime.date.today())
+
+            raw_id = data.get("id")
+            if raw_id:
+                try:
+                    import uuid
+                    uuid.UUID(str(raw_id))
+                except Exception:
+                    data.pop("id", None)
+        return super().to_internal_value(data)
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret["startDate"] = str(instance.period_start) if instance.period_start else ""
+        ret["endDate"] = str(instance.period_end) if instance.period_end else ""
+        ret["periodStart"] = str(instance.period_start) if instance.period_start else ""
+        ret["periodEnd"] = str(instance.period_end) if instance.period_end else ""
+        if instance.period_start and instance.period_end:
+            ret["reviewPeriod"] = f"{instance.period_start.strftime('%d %b %Y')} – {instance.period_end.strftime('%d %b %Y')}"
+        scope = instance.participants_scope if isinstance(instance.participants_scope, dict) else {}
+        ret["reviewFrequency"] = scope.get("reviewFrequency", "Quarterly")
+        ret["description"] = scope.get("description", "")
+        return ret
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        scope = dict(attrs.get("participants_scope") or {})
+        for field in ("reviewPeriod", "reviewFrequency", "description"):
+            val = attrs.pop(field, None) or self.initial_data.get(field)
+            if val:
+                scope[field] = val
+        attrs["participants_scope"] = scope
+        return attrs
 
 
 class PerformanceIndicatorSerializer(BaseModelSerializer):
@@ -708,10 +952,70 @@ class KpiSerializer(BaseModelSerializer):
         source="indicator", model="hrms.PerformanceIndicator",
         required=False, allow_null=True,
     )
+    # Target can be a formatted string (e.g. ">= 90%") or decimal number from frontend
+    target = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    # Extra fields used by frontend KPI Data feature
+    targetDisplay = serializers.CharField(source="target", required=False, allow_null=True)
+    department = serializers.CharField(source="applies_to", required=False, allow_null=True)
+    designation = serializers.CharField(required=False, allow_null=True, write_only=True)
+    assignedEmployee = serializers.CharField(required=False, allow_null=True, write_only=True)
+    measurementType = serializers.CharField(source="unit", required=False, allow_null=True)
+    weight = serializers.DecimalField(max_digits=6, decimal_places=2, required=False, allow_null=True, write_only=True)
+    status = serializers.CharField(required=False, allow_null=True, write_only=True)
 
     class Meta:
         model = Kpi
-        fields = ["id", "indicatorId", "name", "target", "unit", "applies_to", "created_at"]
+        fields = [
+            "id", "indicatorId", "name", "target", "unit", "applies_to", "created_at",
+            "targetDisplay", "department", "designation", "assignedEmployee", "measurementType",
+            "weight", "status",
+        ]
+
+    def to_internal_value(self, data):
+        # Clean target string before model field validation
+        if isinstance(data, dict) and "target" in data:
+            data = data.copy()
+            raw_target = data.get("target")
+            if raw_target is not None and not isinstance(raw_target, (int, float, Decimal)):
+                import re
+                cleaned_str = str(raw_target).strip()
+                match = re.search(r"[-+]?\d*\.?\d+", cleaned_str)
+                if match:
+                    data["target"] = match.group()
+                    if not data.get("unit") and "%" in cleaned_str:
+                        data["unit"] = "%"
+                elif cleaned_str == "":
+                    data["target"] = None
+                else:
+                    data["target"] = None
+        return super().to_internal_value(data)
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        # Pass fields expected by frontend
+        ret["target"] = str(instance.target) if instance.target is not None else ""
+        if instance.unit and "%" in instance.unit and ret["target"] and not ret["target"].endswith("%"):
+            ret["target"] = f"{ret['target']}%"
+        ret["department"] = instance.applies_to or ""
+        ret["measurementType"] = instance.unit or "Percentage"
+        return ret
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        # Ensure target is converted to Decimal if it's a string
+        if "target" in attrs and attrs["target"] is not None:
+            try:
+                attrs["target"] = Decimal(str(attrs["target"]))
+            except Exception:
+                attrs["target"] = None
+
+        # Map department or designation into applies_to if applies_to not explicitly provided
+        if not attrs.get("applies_to"):
+            dept = self.initial_data.get("department") or self.initial_data.get("designation")
+            if dept:
+                attrs["applies_to"] = str(dept)
+
+        return attrs
 
 
 class AppraisalKpiScoreSerializer(BaseModelSerializer):
@@ -739,18 +1043,93 @@ class AppraisalSerializer(BaseModelSerializer):
         source="employee", model="hrms.Employee", required=False, allow_null=True
     )
     employeeName = serializers.CharField(source="employee.name", read_only=True)
+    employee = serializers.CharField(source="employee.name", read_only=True)
     managerId = TenantPrimaryKeyRelatedField(
         source="manager", model="hrms.Employee", required=False, allow_null=True
     )
-    cycleId = TenantPrimaryKeyRelatedField(source="cycle", model="hrms.AppraisalCycle")
+    cycleId = TenantPrimaryKeyRelatedField(source="cycle", model="hrms.AppraisalCycle", required=False, allow_null=True)
     kpiScores = AppraisalKpiScoreSerializer(source="kpi_scores", many=True, read_only=True)
     history = AppraisalHistorySerializer(many=True, read_only=True)
+    selfRating = serializers.DecimalField(source="self_rating", max_digits=3, decimal_places=2, required=False, allow_null=True)
+    managerRating = serializers.DecimalField(source="manager_rating", max_digits=3, decimal_places=2, required=False, allow_null=True)
+    finalRating = serializers.DecimalField(source="final_rating", max_digits=3, decimal_places=2, required=False, allow_null=True)
+    rating = serializers.SerializerMethodField()
+
+    def get_rating(self, obj):
+        val = obj.final_rating or obj.manager_rating or obj.self_rating or 0.0
+        return float(val)
+
+    def to_internal_value(self, data):
+        if isinstance(data, dict):
+            data = data.copy()
+            # Strip client temporary non-UUID id like 'APR-001'
+            raw_id = data.get("id")
+            if raw_id:
+                try:
+                    import uuid
+                    uuid.UUID(str(raw_id))
+                except Exception:
+                    data.pop("id", None)
+
+            # Cycle ID resolution
+            raw_cycle = data.get("cycleId") or data.get("cycle")
+            is_valid_cycle_uuid = False
+            if raw_cycle:
+                try:
+                    import uuid
+                    uuid.UUID(str(raw_cycle))
+                    is_valid_cycle_uuid = True
+                except Exception:
+                    is_valid_cycle_uuid = False
+
+            client_id = self.context.get("client_id")
+            if not is_valid_cycle_uuid and client_id:
+                active_cycle = AppraisalCycle.objects.filter(client_id=client_id).order_by("-period_start").first()
+                if not active_cycle:
+                    import datetime
+                    year = datetime.date.today().year
+                    active_cycle = AppraisalCycle.objects.create(
+                        client_id=client_id,
+                        name=f"Annual Review {year}",
+                        period_start=datetime.date(year, 1, 1),
+                        period_end=datetime.date(year, 12, 31),
+                        status="Active",
+                    )
+                data["cycleId"] = str(active_cycle.id)
+
+            # Employee resolution if name sent without UUID employeeId
+            raw_emp = data.get("employeeId") or data.get("employee")
+            is_valid_emp_uuid = False
+            if raw_emp:
+                try:
+                    import uuid
+                    uuid.UUID(str(raw_emp))
+                    is_valid_emp_uuid = True
+                except Exception:
+                    is_valid_emp_uuid = False
+
+            if not is_valid_emp_uuid and client_id:
+                emp_name = str(data.get("employee") or raw_emp)
+                matched_emp = Employee.objects.filter(client_id=client_id, name__iexact=emp_name).first()
+                if not matched_emp:
+                    matched_emp = Employee.objects.filter(client_id=client_id).first()
+                if matched_emp:
+                    data["employeeId"] = str(matched_emp.id)
+
+            if "rating" in data and not data.get("final_rating"):
+                try:
+                    data["final_rating"] = float(data["rating"])
+                except Exception:
+                    pass
+
+        return super().to_internal_value(data)
 
     class Meta:
         model = Appraisal
         fields = [
-            "id", "cycleId", "employeeId", "employeeName", "managerId", "stage",
+            "id", "cycleId", "employeeId", "employeeName", "employee", "managerId", "stage",
             "status", "self_rating", "manager_rating", "final_rating",
+            "selfRating", "managerRating", "finalRating", "rating",
             "strengths", "areas_for_improvement", "development_feedback",
             "hr_comments", "self_comments", "kpiScores", "history",
             "created_at", "updated_at",
@@ -762,12 +1141,52 @@ class GoalSerializer(BaseModelSerializer):
     employeeId = TenantPrimaryKeyRelatedField(
         source="employee", model="hrms.Employee", required=False, allow_null=True
     )
+    employeeName = serializers.CharField(source="employee.name", read_only=True)
+    employee = serializers.CharField(source="employee.name", read_only=True)
+    cycleId = TenantPrimaryKeyRelatedField(
+        source="cycle", model="hrms.AppraisalCycle", required=False, allow_null=True
+    )
+    dueDate = serializers.DateField(source="target_date", required=False, allow_null=True)
+    progress = serializers.IntegerField(source="progress_pct", required=False)
+    progressPct = serializers.IntegerField(source="progress_pct", required=False)
+
+    def to_internal_value(self, data):
+        if isinstance(data, dict):
+            data = data.copy()
+            raw_id = data.get("id")
+            if raw_id:
+                try:
+                    import uuid
+                    uuid.UUID(str(raw_id))
+                except Exception:
+                    data.pop("id", None)
+
+            raw_cycle = data.get("cycleId") or data.get("cycle")
+            is_valid_cycle_uuid = False
+            if raw_cycle:
+                try:
+                    import uuid
+                    uuid.UUID(str(raw_cycle))
+                    is_valid_cycle_uuid = True
+                except Exception:
+                    is_valid_cycle_uuid = False
+
+            client_id = self.context.get("client_id")
+            if not is_valid_cycle_uuid and client_id:
+                active_cycle = AppraisalCycle.objects.filter(client_id=client_id).order_by("-period_start").first()
+                if active_cycle:
+                    data["cycleId"] = str(active_cycle.id)
+                else:
+                    data.pop("cycleId", None)
+                    data.pop("cycle", None)
+        return super().to_internal_value(data)
 
     class Meta:
         model = Goal
         fields = [
-            "id", "employeeId", "cycle", "title", "description", "target_date",
-            "progress_pct", "status", "created_at",
+            "id", "employeeId", "employeeName", "employee", "cycle", "cycleId",
+            "title", "description", "target_date", "dueDate", "progress_pct",
+            "progress", "progressPct", "status", "created_at",
         ]
 
 
@@ -1010,6 +1429,7 @@ class HrDocumentSerializer(BaseModelSerializer):
     fileSize = serializers.IntegerField(source="file.file_size", read_only=True)
     fileType = serializers.CharField(source="file.content_type", read_only=True)
     fileName = serializers.CharField(source="file.file_name", read_only=True)
+    hasFile = serializers.SerializerMethodField()
     expiry = serializers.DateField(source="valid_until", required=False, allow_null=True)
     #: DERIVED from ``valid_until`` at read time (api.md §11.8).
     status = serializers.SerializerMethodField()
@@ -1020,10 +1440,36 @@ class HrDocumentSerializer(BaseModelSerializer):
         model = HrDocument
         fields = [
             "id", "title", "category", "employee", "employeeId", "version",
-            "expiry", "status", "fileId", "fileSize", "fileType", "fileName", "uploadedBy",
+            "expiry", "status", "fileId", "hasFile", "fileSize", "fileType", "fileName", "uploadedBy",
             "updatedOn", "tags", "description", "valid_from", "is_confidential",
             "created_at",
         ]
+
+    def to_internal_value(self, data):
+        # Resolve employeeId whether passed as UUID, employee code, or employee name
+        if isinstance(data, dict) and "employeeId" in data and data["employeeId"]:
+            val = str(data["employeeId"]).strip()
+            import uuid
+            is_valid_uuid = False
+            try:
+                uuid.UUID(val)
+                is_valid_uuid = True
+            except ValueError:
+                pass
+
+            if not is_valid_uuid:
+                from apps.hrms.models import Employee
+                client_id = getattr(self.context.get("request"), "client_id", None) or getattr(getattr(self.context.get("request"), "user", None), "client_id", None)
+                qs = Employee.objects.all()
+                if client_id:
+                    qs = qs.filter(client_id=client_id)
+                emp = qs.filter(models.Q(employee_code=val) | models.Q(name__iexact=val)).first()
+                if emp:
+                    data = {**data, "employeeId": str(emp.id)}
+        return super().to_internal_value(data)
+
+    def get_hasFile(self, document):
+        return document.file_id is not None
 
     def get_status(self, document):
         return services.document_status(document)
@@ -1100,9 +1546,10 @@ class PolicyCategorySerializer(BaseModelSerializer):
 
 
 class CalendarEventSerializer(BaseModelSerializer):
-    startDate = serializers.DateTimeField(source="starts_at")
-    endDate = serializers.DateTimeField(source="ends_at", required=False, allow_null=True)
-    date = serializers.SerializerMethodField()
+    startDate = serializers.CharField(source="starts_at", required=False)
+    endDate = serializers.CharField(source="ends_at", required=False, allow_null=True)
+    date = serializers.CharField(source="starts_at", required=False)
+    category = serializers.CharField(source="type", required=False)
     dept = serializers.CharField(source="department.name", read_only=True)
     departmentId = TenantPrimaryKeyRelatedField(
         source="department", model="hrms.Department", required=False, allow_null=True
@@ -1110,20 +1557,103 @@ class CalendarEventSerializer(BaseModelSerializer):
     virtualLink = serializers.CharField(
         source="virtual_link", required=False, allow_null=True, allow_blank=True
     )
-    #: ``time`` is a display string the server derives (api.md §11.8).
     time = serializers.SerializerMethodField()
 
     class Meta:
         model = CalendarEvent
         fields = [
-            "id", "title", "date", "startDate", "endDate", "type", "time",
+            "id", "title", "date", "startDate", "endDate", "type", "category", "time",
             "location", "dept", "departmentId", "organizer", "description",
             "virtualLink", "all_day", "source_type", "source_id", "created_at",
         ]
         read_only_fields = ["source_type", "source_id", "created_at"]
 
-    def get_date(self, event):
-        return event.starts_at.date() if event.starts_at else None
+    def to_internal_value(self, data):
+        if isinstance(data, dict):
+            data = data.copy()
+            raw_id = data.get("id")
+            if raw_id:
+                try:
+                    import uuid
+                    uuid.UUID(str(raw_id))
+                except Exception:
+                    data.pop("id", None)
+
+            if not data.get("type") and data.get("category"):
+                data["type"] = data["category"]
+
+            start = data.get("startDate") or data.get("date") or data.get("starts_at")
+            if start:
+                import datetime
+                from django.utils import timezone as dj_timezone
+                start_str = str(start)[:10]
+                try:
+                    d = datetime.date.fromisoformat(start_str)
+                    data["starts_at"] = dj_timezone.make_aware(datetime.datetime.combine(d, datetime.time(0, 0)))
+                except Exception:
+                    pass
+
+            end = data.get("endDate") or data.get("ends_at") or start
+            if end:
+                import datetime
+                from django.utils import timezone as dj_timezone
+                end_str = str(end)[:10]
+                try:
+                    d = datetime.date.fromisoformat(end_str)
+                    data["ends_at"] = dj_timezone.make_aware(datetime.datetime.combine(d, datetime.time(23, 59, 59)))
+                except Exception:
+                    pass
+
+        return super().to_internal_value(data)
+
+    def to_representation(self, event):
+        ret = super().to_representation(event)
+        from django.utils import timezone as dj_timezone
+        if event.starts_at:
+            local_starts = dj_timezone.localtime(event.starts_at)
+            ret["date"] = local_starts.strftime("%Y-%m-%d")
+            ret["startDate"] = local_starts.strftime("%Y-%m-%d")
+        if event.ends_at:
+            local_ends = dj_timezone.localtime(event.ends_at)
+            ret["endDate"] = local_ends.strftime("%Y-%m-%d")
+        else:
+            ret["endDate"] = ret.get("startDate")
+        ret["category"] = event.type
+        ret["isMandatory"] = (event.type == "Holiday")
+        return ret
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        import datetime
+        from django.utils import timezone as dj_timezone
+        starts = attrs.get("starts_at")
+        if isinstance(starts, str):
+            try:
+                if "T" in starts or " " in starts:
+                    dt = datetime.datetime.fromisoformat(starts)
+                    attrs["starts_at"] = dj_timezone.make_aware(dt) if dj_timezone.is_naive(dt) else dt
+                else:
+                    d = datetime.date.fromisoformat(starts[:10])
+                    attrs["starts_at"] = dj_timezone.make_aware(datetime.datetime.combine(d, datetime.time(0, 0)))
+            except Exception:
+                pass
+
+        ends = attrs.get("ends_at")
+        if isinstance(ends, str):
+            try:
+                if "T" in ends or " " in ends:
+                    dt = datetime.datetime.fromisoformat(ends)
+                    attrs["ends_at"] = dj_timezone.make_aware(dt) if dj_timezone.is_naive(dt) else dt
+                else:
+                    d = datetime.date.fromisoformat(ends[:10])
+                    attrs["ends_at"] = dj_timezone.make_aware(datetime.datetime.combine(d, datetime.time(23, 59, 59)))
+            except Exception:
+                pass
+
+        if not attrs.get("ends_at") and attrs.get("starts_at"):
+            attrs["ends_at"] = attrs["starts_at"]
+
+        return attrs
 
     def get_time(self, event):
         return services.calendar_time_label(event)
@@ -1133,13 +1663,47 @@ class HolidaySerializer(BaseModelSerializer):
     locationId = TenantPrimaryKeyRelatedField(
         source="location", model="hrms.Location", required=False, allow_null=True
     )
+    title = serializers.CharField(source="name", required=False)
+    type = serializers.CharField(source="holiday_type", required=False, allow_blank=True, allow_null=True)
+    appliesTo = serializers.CharField(source="applies_to", required=False, allow_blank=True, allow_null=True)
+    day = serializers.CharField(required=False, allow_blank=True, allow_null=True)
 
     class Meta:
         model = Holiday
         fields = [
-            "id", "date", "name", "locationId", "is_optional", "applies_to",
-            "holiday_type", "status", "created_at",
+            "id", "date", "name", "title", "locationId", "is_optional", "applies_to",
+            "appliesTo", "holiday_type", "type", "day", "status", "created_at",
         ]
+
+    def to_internal_value(self, data):
+        if isinstance(data, dict):
+            data = data.copy()
+            raw_id = data.get("id")
+            if raw_id:
+                try:
+                    import uuid
+                    uuid.UUID(str(raw_id))
+                except Exception:
+                    data.pop("id", None)
+            if not data.get("name") and data.get("title"):
+                data["name"] = data["title"]
+            if not data.get("holiday_type") and data.get("type"):
+                data["holiday_type"] = data["type"]
+            if not data.get("applies_to") and data.get("appliesTo"):
+                data["applies_to"] = data["appliesTo"]
+            if data.get("date"):
+                data["date"] = str(data["date"])[:10]
+        return super().to_internal_value(data)
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret["title"] = instance.name
+        ret["type"] = instance.holiday_type or "National Gazetted"
+        ret["appliesTo"] = instance.applies_to or "All Locations"
+        if instance.date:
+            ret["day"] = instance.date.strftime("%A")
+            ret["date"] = str(instance.date)
+        return ret
 
 
 class WorkingDaySerializer(BaseModelSerializer):
@@ -1168,9 +1732,93 @@ class TeamSerializer(BaseModelSerializer):
 
 
 class ApprovalChainSerializer(BaseModelSerializer):
+    module = serializers.CharField(source="name", required=False)
+    name = serializers.CharField(required=False)
+    applies_to = serializers.CharField(required=False)
+    tier1 = serializers.CharField(required=False, write_only=True)
+    tier2 = serializers.CharField(required=False, write_only=True)
+    tier3 = serializers.CharField(required=False, write_only=True)
+    autoEscalateDays = serializers.CharField(required=False, write_only=True)
+
     class Meta:
         model = ApprovalChain
-        fields = ["id", "name", "applies_to", "steps", "status", "created_at"]
+        fields = [
+            "id", "name", "module", "applies_to", "steps", "status", "created_at",
+            "tier1", "tier2", "tier3", "autoEscalateDays",
+        ]
+        read_only_fields = ["id", "created_at"]
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret["module"] = instance.name or instance.applies_to
+        steps = instance.steps if isinstance(instance.steps, list) else []
+        ret["tier1"] = steps[0].get("approver", "") if len(steps) > 0 and isinstance(steps[0], dict) else ""
+        ret["tier2"] = steps[1].get("approver", "") if len(steps) > 1 and isinstance(steps[1], dict) else ""
+        ret["tier3"] = steps[2].get("approver", "-") if len(steps) > 2 and isinstance(steps[2], dict) else "-"
+        ret["autoEscalateDays"] = steps[0].get("autoEscalateDays", 3) if steps and isinstance(steps[0], dict) else 3
+        return ret
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        # Always remove write_only helper fields from attrs to avoid TypeError in model create
+        tier1 = attrs.pop("tier1", None) or self.initial_data.get("tier1")
+        tier2 = attrs.pop("tier2", None) or self.initial_data.get("tier2")
+        tier3 = attrs.pop("tier3", None) or self.initial_data.get("tier3")
+        raw_escalate = attrs.pop("autoEscalateDays", None) or self.initial_data.get("autoEscalateDays", 3)
+
+        # Clean string escalation like "3 days" into integer
+        escalate = 3
+        if raw_escalate is not None:
+            try:
+                import re
+                m = re.search(r"\d+", str(raw_escalate))
+                escalate = int(m.group()) if m else 3
+            except Exception:
+                escalate = 3
+
+        # Support either module/tier frontend format or standard name/applies_to/steps format
+        name = attrs.get("name") or self.initial_data.get("module") or self.initial_data.get("name") or "Workflow"
+        attrs["name"] = name
+        if not attrs.get("applies_to"):
+            attrs["applies_to"] = self.initial_data.get("applies_to") or self.initial_data.get("module", "leave").lower().replace(" ", "_")
+
+        if tier1 or tier2 or tier3:
+            steps = []
+            if tier1:
+                steps.append({"level": 1, "approver": str(tier1), "approver_role": str(tier1), "autoEscalateDays": int(escalate)})
+            if tier2:
+                steps.append({"level": 2, "approver": str(tier2), "approver_role": str(tier2)})
+            if tier3 and tier3 != "-":
+                steps.append({"level": 3, "approver": str(tier3), "approver_role": str(tier3)})
+            attrs["steps"] = steps
+
+        # Strip client-generated non-UUID id (e.g. 'AC-01')
+        raw_id = attrs.get("id") or self.initial_data.get("id")
+        if raw_id:
+            try:
+                import uuid
+                uuid.UUID(str(raw_id))
+            except Exception:
+                attrs.pop("id", None)
+
+        return attrs
+
+    def create(self, validated_data):
+        for k in ("tier1", "tier2", "tier3", "autoEscalateDays"):
+            validated_data.pop(k, None)
+        raw_id = validated_data.get("id")
+        if raw_id:
+            try:
+                import uuid
+                uuid.UUID(str(raw_id))
+            except Exception:
+                validated_data.pop("id", None)
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        for k in ("tier1", "tier2", "tier3", "autoEscalateDays", "id"):
+            validated_data.pop(k, None)
+        return super().update(instance, validated_data)
 
 
 class TerminationSerializer(BaseModelSerializer):
@@ -1181,12 +1829,17 @@ class TerminationSerializer(BaseModelSerializer):
     lastWorkingDay = serializers.DateField(
         source="last_working_day", required=False, allow_null=True
     )
+    terminationDate = serializers.DateField(
+        source="last_working_day", required=False, allow_null=True
+    )
+    settlementAmount = MoneyField(source="settlement_amount", required=False, allow_null=True)
 
     class Meta:
         model = Termination
         fields = [
             "id", "employeeId", "employeeName", "reason", "lastWorkingDay",
-            "letter_file", "settlement_amount", "status", "created_at",
+            "terminationDate", "letter_file", "settlement_amount", "settlementAmount",
+            "status", "created_at",
         ]
 
 
@@ -1206,14 +1859,16 @@ class ResignationSerializer(BaseModelSerializer):
     lastWorkingDay = serializers.DateField(
         source="last_working_day", required=False, allow_null=True
     )
+    handoverTo = serializers.CharField(source="handover_to", required=False, allow_null=True)
+    exitInterviewAt = serializers.DateTimeField(source="exit_interview_at", required=False, allow_null=True)
     checklist = ResignationChecklistItemSerializer(many=True, read_only=True)
 
     class Meta:
         model = Resignation
         fields = [
             "id", "employeeId", "employeeName", "submittedOn", "noticePeriodDays",
-            "lastWorkingDay", "exit_interview_at", "reason", "handover_to", "status",
-            "checklist", "created_at",
+            "lastWorkingDay", "exit_interview_at", "exitInterviewAt", "reason",
+            "handover_to", "handoverTo", "status", "checklist", "created_at",
         ]
 
 
@@ -1222,6 +1877,7 @@ class ComplaintSerializer(BaseModelSerializer):
     including exports (db.md §11.8)."""
 
     raisedBy = serializers.SerializerMethodField()
+    complainant = serializers.SerializerMethodField()
     raisedByEmployeeId = TenantPrimaryKeyRelatedField(
         source="raised_by_employee", model="hrms.Employee",
         required=False, allow_null=True, write_only=True,
@@ -1231,24 +1887,129 @@ class ComplaintSerializer(BaseModelSerializer):
         required=False, allow_null=True,
     )
     againstName = serializers.SerializerMethodField()
+    against = serializers.SerializerMethodField()
+    description = serializers.CharField(required=False, allow_blank=True)
+    summary = serializers.CharField(source="description", required=False, allow_blank=True)
     isAnonymous = serializers.BooleanField(source="is_anonymous", required=False)
+    raisedDate = serializers.DateTimeField(source="created_at", read_only=True)
+    filedOn = serializers.DateTimeField(source="created_at", read_only=True)
+    priority = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    assignedInvestigator = serializers.CharField(required=False, allow_blank=True, allow_null=True)
 
     class Meta:
         model = Complaint
         fields = [
-            "id", "raisedBy", "raisedByEmployeeId", "againstEmployeeId",
-            "againstName", "category", "description", "isAnonymous", "status",
-            "assigned_to", "resolution", "resolved_at", "created_at",
+            "id", "raisedBy", "complainant", "raisedByEmployeeId", "againstEmployeeId",
+            "againstName", "against", "category", "description", "summary", "isAnonymous",
+            "status", "assigned_to", "resolution", "resolved_at", "created_at",
+            "raisedDate", "filedOn", "priority", "assignedInvestigator",
         ]
-        read_only_fields = ["resolved_at", "created_at"]
+        read_only_fields = ["resolved_at", "created_at", "raisedDate", "filedOn"]
+
+    def to_internal_value(self, data):
+        if isinstance(data, dict):
+            data = data.copy()
+            # Strip non-UUID id like 'GRV-304'
+            raw_id = data.get("id")
+            if raw_id:
+                try:
+                    import uuid
+                    uuid.UUID(str(raw_id))
+                except Exception:
+                    data.pop("id", None)
+
+            # Ensure description is populated from summary or fallback
+            if not data.get("description"):
+                data["description"] = data.get("summary") or "Grievance / Complaint filed"
+
+            # Resolve complainant to employee if name provided
+            client_id = self.context.get("client_id")
+            raw_complainant = data.get("complainant") or data.get("raisedBy")
+            if raw_complainant and not data.get("raisedByEmployeeId") and client_id:
+                emp = Employee.objects.filter(client_id=client_id, name__iexact=str(raw_complainant).strip()).first()
+                if emp:
+                    data["raisedByEmployeeId"] = str(emp.id)
+
+            # Resolve against to employee if name provided
+            raw_against = data.get("against") or data.get("againstName")
+            if raw_against and not data.get("againstEmployeeId") and client_id:
+                emp = Employee.objects.filter(client_id=client_id, name__iexact=str(raw_against).strip()).first()
+                if emp:
+                    data["againstEmployeeId"] = str(emp.id)
+
+        return super().to_internal_value(data)
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        import json
+        meta = {}
+        priority = attrs.pop("priority", None) or self.initial_data.get("priority")
+        if priority:
+            meta["priority"] = str(priority)
+        investigator = attrs.pop("assignedInvestigator", None) or self.initial_data.get("assignedInvestigator")
+        if investigator:
+            meta["assignedInvestigator"] = str(investigator)
+        complainant = self.initial_data.get("complainant")
+        if complainant and not attrs.get("raised_by_employee"):
+            meta["complainant"] = str(complainant)
+        against = self.initial_data.get("against")
+        if against and not attrs.get("against_employee"):
+            meta["against"] = str(against)
+
+        if meta and not attrs.get("resolution"):
+            attrs["resolution"] = json.dumps(meta)
+        return attrs
+
+    def create(self, validated_data):
+        for k in ("priority", "assignedInvestigator"):
+            validated_data.pop(k, None)
+        raw_id = validated_data.get("id")
+        if raw_id:
+            try:
+                import uuid
+                uuid.UUID(str(raw_id))
+            except Exception:
+                validated_data.pop("id", None)
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        for k in ("priority", "assignedInvestigator", "id"):
+            validated_data.pop(k, None)
+        return super().update(instance, validated_data)
 
     def get_raisedBy(self, complaint):
         if complaint.is_anonymous:
             return None
         return complaint.raised_by_employee.name if complaint.raised_by_employee_id else None
 
+    def get_complainant(self, complaint):
+        return self.get_raisedBy(complaint)
+
     def get_againstName(self, complaint):
         return complaint.against_employee.name if complaint.against_employee_id else None
+
+    def get_against(self, complaint):
+        return self.get_againstName(complaint)
+
+    def to_representation(self, complaint):
+        ret = super().to_representation(complaint)
+        import json
+        meta = {}
+        if complaint.resolution and complaint.resolution.strip().startswith("{"):
+            try:
+                meta = json.loads(complaint.resolution)
+            except Exception:
+                pass
+        ret["priority"] = meta.get("priority", "High")
+        ret["assignedInvestigator"] = meta.get("assignedInvestigator", "Ayesha Khan (HR Director)")
+        if not ret.get("complainant"):
+            ret["complainant"] = meta.get("complainant", "")
+            ret["raisedBy"] = ret["complainant"]
+        if not ret.get("against"):
+            ret["against"] = meta.get("against", "")
+            ret["againstName"] = ret["against"]
+        ret["filedOn"] = complaint.created_at.strftime("%Y-%m-%d") if complaint.created_at else ""
+        return ret
 
 
 # =============================================================================

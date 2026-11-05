@@ -27,7 +27,7 @@ from rest_framework.test import APIClient
 from apps.accounts.authentication import build_tokens
 from apps.accounts.models import Client, User
 from apps.accounting.models import Account, BankAccount, JournalEntry, JournalLine
-from apps.accounting import reports, services
+from apps.accounting import note_services, reports, services
 from apps.core.models import CompanyProfile
 from apps.inventory.models import LotTaka, Sample, StockMovement
 from apps.inventory import sampling_services
@@ -418,3 +418,59 @@ class AccountingPostingAndReportsTests(TestCase):
         self.assertGreaterEqual(buckets["0-30"], Decimal("10000.00"))
         self.assertGreaterEqual(buckets["31-60"], Decimal("20000.00"))
         self.assertGreaterEqual(buckets["120+"], Decimal("30000.00"))
+
+    def test_13_standalone_credit_note_gst_postings(self):
+        """Customer Credit note debits Sales Returns & GST Output, credits Debtors."""
+        cn = note_services.create_standalone_note(
+            client=self.client_obj,
+            party=self.customer,
+            note_type="CREDIT_NOTE",
+            taxable_amount=Decimal("10000.00"),
+            cgst=Decimal("250.00"),
+            sgst=Decimal("250.00"),
+            status="Approved",
+            user=self.user,
+        )
+        cn = note_services.post_standalone_note(cn, user=self.user)
+        self._assert_entry_balanced(cn.journal_entry)
+
+        lines = cn.journal_entry.lines.all()
+        sales_ret = services.system_account(self.client_obj.id, "sales_return")
+        gst_out = services.system_account(self.client_obj.id, "gst_output")
+        debtors = services.system_account(self.client_obj.id, "debtors")
+
+        self.assertEqual(lines.filter(account=sales_ret).first().debit, Decimal("10000.00"))
+        self.assertEqual(lines.filter(account=gst_out).first().debit, Decimal("500.00"))
+        self.assertEqual(lines.filter(account=debtors).first().credit, Decimal("10500.00"))
+
+    def test_14_vendor_debit_note_symmetry(self):
+        """Vendor Debit Note debits Creditors and credits Purchase Returns & GST Input."""
+        dn = note_services.create_standalone_note(
+            client=self.client_obj,
+            party=self.supplier,
+            note_type="DEBIT_NOTE",
+            taxable_amount=Decimal("5000.00"),
+            cgst=Decimal("125.00"),
+            sgst=Decimal("125.00"),
+            status="Approved",
+            user=self.user,
+        )
+        dn = note_services.post_standalone_note(dn, user=self.user)
+        self._assert_entry_balanced(dn.journal_entry)
+
+        lines = dn.journal_entry.lines.all()
+        creditors = services.system_account(self.client_obj.id, "creditors")
+        purch_ret = services.system_account(self.client_obj.id, "purchase_return")
+        gst_in = services.system_account(self.client_obj.id, "gst_input")
+
+        self.assertEqual(lines.filter(account=creditors).first().debit, Decimal("5250.00"))
+        self.assertEqual(lines.filter(account=purch_ret).first().credit, Decimal("5000.00"))
+        self.assertEqual(lines.filter(account=gst_in).first().credit, Decimal("250.00"))
+
+    def test_15_day_book_cash_bank_includes_opening_balance(self):
+        """Day book cash & bank balance reflects bank opening balance matching Treasury."""
+        self.bank_account.opening_balance = Decimal("25000.00")
+        self.bank_account.save(update_fields=["opening_balance"])
+
+        db = reports.day_book(self.client_obj.id, as_of_date=date.today())
+        self.assertGreaterEqual(db["summary"]["cashBankBalance"], Decimal("25000.00"))

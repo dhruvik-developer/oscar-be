@@ -818,3 +818,22 @@ class IncentiveCalculation(TenantModel):
 
     def __str__(self):
         return self.calc_number or f"Incentive {self.id}"
+
+
+# ---------------------------------------------------------------------------
+# Loom & Weaving Manufacturing Subsystem (Prototype v0.4 Recreation)
+# ---------------------------------------------------------------------------
+from .models_loom import (  # noqa: F401, E402
+    LoomCoordinator,
+    LoomFactory,
+    LoomMachine,
+    YarnMaster,
+    LoomQuality,
+    LoomBeam,
+    DailyLoomProduction,
+    FactoryDayLog,
+    YarnBooking,
+    YarnDelivery,
+    ProductionProgram,
+    FabricDispatch,
+)
