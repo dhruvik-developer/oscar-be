@@ -4,9 +4,10 @@ from datetime import datetime, timedelta
 
 
 
-from django.db import transaction
+from django.db import models, transaction
 
 from django.db.models import Count, Q
+from django.db.models.functions import ExtractMonth
 
 from django.utils import timezone
 
@@ -629,16 +630,6 @@ class EmployeeViewSet(TenantModelViewSet):
 
     def get_queryset(self):
 
-        try:
-
-            from apps.hrms.services import sync_all_users_and_employees
-
-            sync_all_users_and_employees(self.get_client_id())
-
-        except Exception:
-
-            pass
-
         queryset = super().get_queryset()
 
         # The directory lists the workforce; administrator logins (which are
@@ -895,7 +886,8 @@ class EmployeeViewSet(TenantModelViewSet):
                         except Exception:
                             pass
                     elif slip.standard_salary == 0 and new_std > 0:
-                        # Slip was generated prior to salary being set
+                        # Slip was generated prior to salary being set.
+                        # Never touch paid_amount on a Paid slip -- it is frozen.
                         slip.standard_salary = new_std
                         res = compute_salary(
                             standard_salary=new_std,
@@ -909,9 +901,6 @@ class EmployeeViewSet(TenantModelViewSet):
                         slip.earned_salary = res["earnedSalary"]
                         slip.net_payable = res["netPayable"]
                         update_flds = ["standard_salary", "earned_salary", "net_payable", "updated_at"]
-                        if slip.paid_amount == 0 and slip.status == "Paid":
-                            slip.paid_amount = res["netPayable"]
-                            update_flds.append("paid_amount")
                         slip.save(update_fields=update_flds)
             except Exception:
                 pass
@@ -953,6 +942,20 @@ class EmployeeViewSet(TenantModelViewSet):
                     revoked_at=timezone.now(), revoked_reason="employee_deleted"
 
                 )
+
+            # Also clean up any logins linked to this employee even if employee_id
+
+            # was not set on the User row (e.g. matched by email/name at login time).
+
+            User.objects.filter(
+
+                client_id=instance.client_id, deleted_at__isnull=True,
+
+            ).filter(
+
+                models.Q(email__iexact=instance.email) if instance.email else models.Q(pk__isnull=True)
+
+            ).exclude(employee_id=instance.id).update(status="Inactive", is_active=False)
 
         except Exception:
 
@@ -1244,92 +1247,186 @@ class HrmsDashboardView(APIView):
 
         top_depts = (dept_names[:3] if len(dept_names) >= 3 else (dept_names + ["General", "Operations", "Sales"])[:3])
 
-        year_att = list(Attendance.objects.filter(client_id=client_id, work_date__year=current_year, deleted_at__isnull=True).values("work_date", "status", "employee__department__name"))
-        year_leaves = list(LeaveRequest.objects.filter(client_id=client_id, from_date__year=current_year, deleted_at__isnull=True).values("from_date", "leave_type__is_paid", "status", "employee__department__name"))
-        year_payslips = list(Payslip.objects.filter(client_id=client_id, period_month__year=current_year, deleted_at__isnull=True).values("period_month", "standard_salary", "earned_salary", "allowances", "additional_earnings", "employee__department__name"))
-        year_assets = list(Asset.objects.filter(client_id=client_id, deleted_at__isnull=True).values("created_at", "status", "category__name", "assigned_employee__department__name"))
-        year_candidates = list(Candidate.objects.filter(client_id=client_id, deleted_at__isnull=True).values("created_at", "stage"))
-        year_appraisals = list(Appraisal.objects.filter(client_id=client_id, deleted_at__isnull=True).values("created_at", "final_rating", "status"))
-
         emp_months = []
-        att_months = []
-        leave_months = []
-        pay_months = []
-        perf_months = []
-        rec_months = []
-        asset_months = []
         dept_months = []
-
-        import datetime as _dt
         for m_idx, m_name in enumerate(months_abbr, 1):
+            m_start = date(current_year, m_idx, 1)
             if m_idx == 12:
-                m_end = _dt.date(current_year, 12, 31)
+                m_end = date(current_year, 12, 31)
             else:
-                m_end = _dt.date(current_year, m_idx + 1, 1) - _dt.timedelta(days=1)
+                m_end = date(current_year, m_idx + 1, 1) - timedelta(days=1)
 
-            ft, ct, intern = 0, 0, 0
-            dept_counts = {d: 0 for d in top_depts}
-            for e in emp_list:
-                j_date = e.joining_date or (e.created_at.date() if e.created_at else None)
-                if j_date and j_date <= m_end:
-                    lwd = e.last_working_day
-                    if lwd and lwd < _dt.date(current_year, m_idx, 1):
-                        continue
-                    et = (e.employment_type or "Full Time").lower()
-                    if "contract" in et:
-                        ct += 1
-                    elif "intern" in et:
-                        intern += 1
-                    else:
-                        ft += 1
-                    ed = getattr(e.department, "name", None) or "General"
-                    if ed in dept_counts:
-                        dept_counts[ed] += 1
-
+            ft = employees.filter(
+                employment_type__in=["Full-time", "Part-time"],
+                joining_date__lte=m_end,
+            ).filter(
+                models.Q(last_working_day__isnull=True) | models.Q(last_working_day__gte=m_start)
+            ).count()
+            ct = employees.filter(
+                employment_type__icontains="contract",
+                joining_date__lte=m_end,
+            ).filter(
+                models.Q(last_working_day__isnull=True) | models.Q(last_working_day__gte=m_start)
+            ).count()
+            intern = employees.filter(
+                employment_type__icontains="intern",
+                joining_date__lte=m_end,
+            ).filter(
+                models.Q(last_working_day__isnull=True) | models.Q(last_working_day__gte=m_start)
+            ).count()
             emp_months.append({"month": m_name, "s1": ft, "s2": ct, "s3": intern, "total": ft + ct + intern})
+
+            dept_counts = {}
+            for d in top_depts:
+                dept_counts[d] = employees.filter(
+                    department__name=d,
+                    joining_date__lte=m_end,
+                ).filter(
+                    models.Q(last_working_day__isnull=True) | models.Q(last_working_day__gte=m_start)
+                ).count()
             dept_months.append({
                 "month": m_name,
                 "s1": dept_counts.get(top_depts[0], 0),
                 "s2": dept_counts.get(top_depts[1], 0),
                 "s3": dept_counts.get(top_depts[2], 0),
-                "total": sum(dept_counts.values())
+                "total": sum(dept_counts.values()),
             })
 
-            m_att = [a for a in year_att if a["work_date"].month == m_idx]
-            att_s1 = sum(1 for a in m_att if a["status"] == "Present")
-            att_s2 = sum(1 for a in m_att if a["status"] in ("On Leave", "WFH"))
-            att_s3 = sum(1 for a in m_att if a["status"] in ("Half Day", "Late", "Grace"))
-            att_months.append({"month": m_name, "s1": att_s1, "s2": att_s2, "s3": att_s3, "total": att_s1 + att_s2 + att_s3})
+        # Attendance by month
+        att_rows = (
+            Attendance.objects.filter(
+                client_id=client_id, work_date__year=current_year, deleted_at__isnull=True,
+            )
+            .annotate(month=ExtractMonth("work_date"))
+            .values("month", "status")
+            .annotate(count=Count("id"))
+        )
+        att_map = {}
+        for r in att_rows:
+            att_map.setdefault(r["month"], {})[r["status"]] = r["count"]
+        att_months = []
+        for m_idx, m_name in enumerate(months_abbr, 1):
+            row = att_map.get(m_idx, {})
+            att_s1 = row.get("Present", 0) + row.get("Late", 0)
+            att_s2 = row.get("On Leave", 0) + row.get("WFH", 0)
+            att_s3 = row.get("Half Day", 0)
+            att_months.append({"month": m_name, "s1": att_s1, "s2": att_s2, "s3": att_s3,
+                               "total": att_s1 + att_s2 + att_s3})
 
-            m_l = [l for l in year_leaves if l["from_date"].month == m_idx]
-            l_s1 = sum(1 for l in m_l if l.get("leave_type__is_paid") is True)
-            l_s2 = sum(1 for l in m_l if l.get("leave_type__is_paid") is False)
-            l_s3 = sum(1 for l in m_l if l.get("leave_type__is_paid") is None)
-            leave_months.append({"month": m_name, "s1": l_s1, "s2": l_s2, "s3": l_s3, "total": l_s1 + l_s2 + l_s3})
+        # Leave by month
+        leave_rows = (
+            LeaveRequest.objects.filter(
+                client_id=client_id, from_date__year=current_year, deleted_at__isnull=True,
+            )
+            .annotate(month=ExtractMonth("from_date"))
+            .values("month", "leave_type__is_paid")
+            .annotate(count=Count("id"))
+        )
+        leave_map = {}
+        for r in leave_rows:
+            leave_map.setdefault(r["month"], {})[r["leave_type__is_paid"]] = r["count"]
+        leave_months = []
+        for m_idx, m_name in enumerate(months_abbr, 1):
+            row = leave_map.get(m_idx, {})
+            l_s1 = row.get(True, 0)
+            l_s2 = row.get(False, 0)
+            l_s3 = row.get(None, 0)
+            leave_months.append({"month": m_name, "s1": l_s1, "s2": l_s2, "s3": l_s3,
+                                 "total": l_s1 + l_s2 + l_s3})
 
-            m_p = [p for p in year_payslips if p["period_month"].month == m_idx]
-            p_s1 = round(sum(float(p["earned_salary"] or p["standard_salary"] or 0) for p in m_p) / 1000)
-            p_s2 = round(sum(float(p["allowances"] or 0) for p in m_p) / 1000)
-            p_s3 = round(sum(float(p["additional_earnings"] or 0) for p in m_p) / 1000)
-            pay_months.append({"month": m_name, "s1": p_s1, "s2": p_s2, "s3": p_s3, "total": p_s1 + p_s2 + p_s3})
+        # Payroll by month
+        pay_rows = (
+            Payslip.objects.filter(
+                client_id=client_id, period_month__year=current_year, deleted_at__isnull=True,
+            )
+            .annotate(month=ExtractMonth("period_month"))
+            .values("month")
+            .annotate(
+                earned=Coalesce(Sum("earned_salary"), Value(Decimal("0.00"))),
+                allowances=Coalesce(Sum("allowances"), Value(Decimal("0.00"))),
+                additional=Coalesce(Sum("additional_earnings"), Value(Decimal("0.00"))),
+            )
+        )
+        pay_map = {}
+        for r in pay_rows:
+            pay_map[r["month"]] = {
+                "earned": r["earned"],
+                "allowances": r["allowances"],
+                "additional": r["additional"],
+            }
+        pay_months = []
+        for m_idx, m_name in enumerate(months_abbr, 1):
+            row = pay_map.get(m_idx, {"earned": Decimal("0.00"), "allowances": Decimal("0.00"), "additional": Decimal("0.00")})
+            p_s1 = round(float(row["earned"]) / 1000)
+            p_s2 = round(float(row["allowances"]) / 1000)
+            p_s3 = round(float(row["additional"]) / 1000)
+            pay_months.append({"month": m_name, "s1": p_s1, "s2": p_s2, "s3": p_s3,
+                               "total": p_s1 + p_s2 + p_s3})
 
-            m_perf = [pf for pf in year_appraisals if pf["created_at"] and pf["created_at"].month == m_idx]
-            perf_s1 = sum(1 for pf in m_perf if (pf.get("final_rating") or 0) >= 4)
-            perf_s2 = sum(1 for pf in m_perf if 3 <= (pf.get("final_rating") or 0) < 4)
-            perf_s3 = sum(1 for pf in m_perf if (pf.get("final_rating") or 0) < 3)
-            perf_months.append({"month": m_name, "s1": perf_s1, "s2": perf_s2, "s3": perf_s3, "total": perf_s1 + perf_s2 + perf_s3})
+        # Performance (appraisals) by month
+        perf_rows = (
+            Appraisal.objects.filter(
+                client_id=client_id, deleted_at__isnull=True,
+            )
+            .annotate(month=ExtractMonth("created_at"))
+            .values("month", "final_rating")
+            .annotate(count=Count("id"))
+        )
+        perf_map = {}
+        for r in perf_rows:
+            perf_map.setdefault(r["month"], {})[r["final_rating"]] = r["count"]
+        perf_months = []
+        for m_idx, m_name in enumerate(months_abbr, 1):
+            row = perf_map.get(m_idx, {})
+            perf_s1 = sum(v for k, v in row.items() if k and k >= 4)
+            perf_s2 = sum(v for k, v in row.items() if k and 3 <= k < 4)
+            perf_s3 = sum(v for k, v in row.items() if k and k < 3)
+            perf_months.append({"month": m_name, "s1": perf_s1, "s2": perf_s2, "s3": perf_s3,
+                                "total": perf_s1 + perf_s2 + perf_s3})
 
-            m_rec = [c for c in year_candidates if c["created_at"] and c["created_at"].month == m_idx]
-            rec_s1 = sum(1 for c in m_rec if c.get("stage") in ("Applied", "Screening", None))
-            rec_s2 = sum(1 for c in m_rec if c.get("stage") in ("Interview", "Technical Round"))
-            rec_s3 = sum(1 for c in m_rec if c.get("stage") in ("Offered", "Hired"))
-            rec_months.append({"month": m_name, "s1": rec_s1, "s2": rec_s2, "s3": rec_s3, "total": rec_s1 + rec_s2 + rec_s3})
+        # Recruitment by month
+        rec_rows = (
+            Candidate.objects.filter(
+                client_id=client_id, deleted_at__isnull=True,
+            )
+            .annotate(month=ExtractMonth("created_at"))
+            .values("month", "stage")
+            .annotate(count=Count("id"))
+        )
+        rec_map = {}
+        for r in rec_rows:
+            rec_map.setdefault(r["month"], {})[r["stage"]] = r["count"]
+        rec_months = []
+        for m_idx, m_name in enumerate(months_abbr, 1):
+            row = rec_map.get(m_idx, {})
+            rec_s1 = sum(v for k, v in row.items() if k in ("Applied", "Screening") or k is None)
+            rec_s2 = sum(v for k, v in row.items() if k in ("Interview", "Technical Round"))
+            rec_s3 = sum(v for k, v in row.items() if k in ("Offered", "Hired"))
+            rec_months.append({"month": m_name, "s1": rec_s1, "s2": rec_s2, "s3": rec_s3,
+                               "total": rec_s1 + rec_s2 + rec_s3})
 
-            m_ass = [a for a in year_assets if a["created_at"] and a["created_at"].date() <= m_end and a["status"] != "Disposed"]
-            ass_s1 = sum(1 for a in m_ass if "laptop" in (a.get("category__name") or "").lower())
-            ass_s2 = sum(1 for a in m_ass if "monitor" in (a.get("category__name") or "").lower() or "periph" in (a.get("category__name") or "").lower())
-            ass_s3 = max(0, len(m_ass) - ass_s1 - ass_s2)
-            asset_months.append({"month": m_name, "s1": ass_s1, "s2": ass_s2, "s3": ass_s3, "total": len(m_ass)})
+        # Asset by month
+        ass_rows = (
+            Asset.objects.filter(
+                client_id=client_id, deleted_at__isnull=True,
+            )
+            .annotate(month=ExtractMonth("created_at"))
+            .values("month", "category__name", "status")
+            .annotate(count=Count("id"))
+        )
+        ass_map = {}
+        for r in ass_rows:
+            ass_map.setdefault(r["month"], []).append(r)
+        asset_months = []
+        for m_idx, m_name in enumerate(months_abbr, 1):
+            rows = ass_map.get(m_idx, [])
+            m_end = date(current_year, 12, 31) if m_idx == 12 else date(current_year, m_idx + 1, 1) - timedelta(days=1)
+            m_ass = [a for a in rows if a["created_at"] and a["created_at"].date() <= m_end and a["status"] != "Disposed"]
+            ass_s1 = sum(a["count"] for a in m_ass if a["category__name"] and "laptop" in a["category__name"].lower())
+            ass_s2 = sum(a["count"] for a in m_ass if a["category__name"] and ("monitor" in a["category__name"].lower() or "periph" in a["category__name"].lower()))
+            ass_s3 = max(0, sum(a["count"] for a in m_ass) - ass_s1 - ass_s2)
+            asset_months.append({"month": m_name, "s1": ass_s1, "s2": ass_s2, "s3": ass_s3,
+                                 "total": sum(a["count"] for a in m_ass)})
 
         return Response(
 
@@ -1603,13 +1700,21 @@ class AttendanceViewSet(TenantModelViewSet):
 
         instance = serializer.instance
 
+        # If the work_date is changing, soft-delete the old row first so the
+        # one-row-per-employee-per-day constraint is not violated and the old
+        # date is not left orphaned.
+        new_work_date = data.get("work_date", instance.work_date)
+        if new_work_date and new_work_date != instance.work_date:
+            instance.deleted_at = timezone.now()
+            instance.save(update_fields=["deleted_at", "updated_at"])
+
         row = services.mark_attendance(
 
             client=self.request.user.client,
 
             employee=data.get("employee", instance.employee),
 
-            work_date=data.get("work_date", instance.work_date),
+            work_date=new_work_date,
 
             check_in=data.get("check_in", instance.check_in),
 
@@ -2039,6 +2144,20 @@ class AttendanceViewSet(TenantModelViewSet):
 
                 code="NO_EMPLOYEE",
 
+            )
+
+        # Tenant boundary: the employee must belong to the same client as the request.
+        request_client_id = (
+            self.get_client_id()
+            or getattr(request, "client_id", None)
+            or getattr(request.user, "client_id", None)
+            or getattr(getattr(request.user, "client", None), "id", None)
+        )
+        if getattr(employee, "client_id", None) and request_client_id \
+                and str(employee.client_id) != str(request_client_id):
+            raise ValidationFailed(
+                "Employee does not belong to this workspace.",
+                code="TENANT_MISMATCH",
             )
 
 
@@ -2660,15 +2779,12 @@ class LeaveRequestViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
 
             require_permission(self.request.user, "approve_leave")
 
-            instance.status = "Rejected"
+            serializer.validated_data["status"] = "Rejected"
+            serializer.validated_data["approver"] = self.request.user
+            serializer.validated_data["decided_at"] = timezone.now()
+            serializer.validated_data["remark"] = self.request.data.get("remark")
 
-            instance.approver = self.request.user
-
-            instance.decided_at = timezone.now()
-
-            instance.remark = self.request.data.get("remark")
-
-            instance.save()
+            instance = super().perform_update(serializer)
 
             self._concurrency_instance = instance
 
@@ -2800,13 +2916,77 @@ class CompOffViewSet(TenantModelViewSet):
 
     @action(detail=True, methods=["post"])
 
+    @transaction.atomic
+
     def approve(self, request, pk=None):
 
         instance = self.get_object()
 
+        if instance.status == "Approved":
+
+            raise Conflict("This comp-off is already approved.", code=Codes.ALREADY_DONE)
+
         instance.status = "Approved"
 
-        instance.save()
+        instance.approver = request.user if getattr(request.user, "is_authenticated", False) else None
+
+        instance.decided_at = timezone.now()
+
+        instance.save(update_fields=["status", "approver", "decided_at", "updated_at"])
+
+        # Create an attendance row for the worked date so the comp-off day counts as attended.
+
+        services.mark_attendance(
+
+            client=instance.client,
+
+            employee=instance.employee,
+
+            work_date=instance.worked_date,
+
+            status="Present",
+
+            remark=f"Comp-off approved: {instance.work_type or ''}".strip(),
+
+            source="comp_off",
+
+            user=request.user if getattr(request.user, "is_authenticated", False) else None,
+
+        )
+
+        # Increment comp-off used balance if a comp-off leave type exists.
+
+        try:
+
+            comp_type = LeaveType.objects.filter(
+
+                client_id=instance.client_id, name__iexact="comp off", deleted_at__isnull=True
+
+            ).first()
+
+            if comp_type:
+
+                balance, _ = LeaveBalance.objects.get_or_create(
+
+                    client_id=instance.client_id,
+
+                    employee=instance.employee,
+
+                    leave_type=comp_type,
+
+                    period_year=instance.worked_date.year,
+
+                    defaults={"entitlement": 0, "carried_forward": 0, "used": 0},
+
+                )
+
+                balance.used = D(balance.used or 0) + D(instance.days or 1)
+
+                balance.save(update_fields=["used", "updated_at"])
+
+        except Exception:
+
+            pass
 
         self.write_audit("approve", instance, description="Comp-off approved")
 
@@ -2860,19 +3040,22 @@ class LeaveEncashmentViewSet(TenantModelViewSet):
 
         instance = serializer.instance
 
-        if target_status == "Approved" and instance.status != "Approved":
+        # Apply any regular field updates first.
+        row = super().perform_update(serializer)
+
+        if target_status == "Approved" and row.status != "Approved":
 
             from apps.core.permissions import require_permission
 
             require_permission(self.request.user, "approve_leave")
 
-            row = services.approve_leave_encashment(instance, user=self.request.user)
+            row = services.approve_leave_encashment(row, user=self.request.user)
 
             self.write_audit("approve", row, description="Leave encashment approved")
 
             return row
 
-        return super().perform_update(serializer)
+        return row
 
 
 
@@ -3012,7 +3195,7 @@ class PayslipViewSet(TenantModelViewSet):
 
         payslip = super().perform_update(serializer)
 
-        override = self.request.data.get("earnedSalary")
+        override = serializer.validated_data.get("earnedSalaryOverride")
 
         services.recompute_payslip(
 

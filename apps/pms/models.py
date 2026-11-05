@@ -15,6 +15,7 @@ most in exactly this module.
 from django.db import models
 
 from apps.core.models import LegacyIdMixin, TenantModel
+from apps.core.numbering import allocate_number
 
 PRIORITIES = [("Low", "Low"), ("Medium", "Medium"), ("High", "High"), ("Urgent", "Urgent")]
 
@@ -491,6 +492,13 @@ class Delay(TenantModel):
     class Meta:
         db_table = "pms_delays"
         ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["stage"],
+                condition=models.Q(resolved_at__isnull=True, deleted_at__isnull=True),
+                name="uq_pms_delay_one_open_per_stage",
+            ),
+        ]
         indexes = [
             models.Index(
                 fields=["client", "stage"],
@@ -815,6 +823,11 @@ class IncentiveCalculation(TenantModel):
                 name="ix_incentive_calcs_emp",
             ),
         ]
+
+    def save(self, *args, **kwargs):
+        if not self.calc_number:
+            self.calc_number = allocate_number(self.client, "INC")
+        return super().save(*args, **kwargs)
 
     def __str__(self):
         return self.calc_number or f"Incentive {self.id}"

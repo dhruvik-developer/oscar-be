@@ -69,7 +69,9 @@ def instruction_progress(instruction):
     cumulative = (
         DailyProductionEntry.objects.filter(
             instruction=instruction, deleted_at__isnull=True
-        ).aggregate(value=Sum("meters"))["value"]
+        )
+        .exclude(status="Draft")
+        .aggregate(value=Sum("meters"))["value"]
         or ZERO
     )
     order_meter = D(instruction.order_meter)

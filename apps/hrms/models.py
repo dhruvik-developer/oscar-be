@@ -14,10 +14,13 @@ interesting constraints are in attendance, leave and payroll, which interlock:
 from django.contrib.postgres.constraints import ExclusionConstraint
 from django.contrib.postgres.fields import DateTimeRangeField, RangeOperators
 from django.db import models
-from django.db.models import Func, Q, F, Value
+from django.db.models import Func, Q, F, Value, Sum
+from django.db.models.signals import post_save, post_delete
+from django.dispatch import receiver
 
 from django.utils import timezone
 from apps.core.models import LegacyIdMixin, TenantModel
+from apps.core.money import D
 
 EMPLOYEE_STATUSES = [
     ("Active", "Active"),
@@ -457,6 +460,34 @@ class LeaveBalance(TenantModel):
         ]
 
 
+@receiver(post_save, sender="hrms.LeaveRequest")
+@receiver(post_delete, sender="hrms.LeaveRequest")
+def _recompute_leave_balance_used(sender, instance, **kwargs):
+    """Keep LeaveBalance.used in sync with approved LeaveRequest rows so the
+    GeneratedField balance never drifts from the source of truth."""
+    if not instance.pk or not instance.from_date:
+        return
+    try:
+        from .services import leave_balance_for
+        balance = leave_balance_for(
+            instance.client_id, instance.employee_id, instance.leave_type_id,
+            instance.from_date.year,
+        )
+        approved_used = (
+            LeaveRequest.objects.filter(
+                client_id=instance.client_id, employee=instance.employee,
+                leave_type=instance.leave_type, status="Approved",
+                deleted_at__isnull=True, from_date__year=instance.from_date.year,
+            ).aggregate(total=Sum("days"))["total"] or 0
+        )
+        if D(balance.used) != D(approved_used):
+            balance.used = D(approved_used)
+            balance.save(update_fields=["used", "updated_at"])
+    except Exception:
+        # Never let a balance recompute break a leave request save/delete.
+        pass
+
+
 class CompOff(TenantModel):
     employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name="comp_offs")
     worked_date = models.DateField()
@@ -628,6 +659,42 @@ class SalaryAdvance(TenantModel):
     @property
     def outstanding(self):
         return (self.amount or 0) - (self.recovered_amount or 0)
+
+
+@receiver(post_save, sender="hrms.Payslip")
+@receiver(post_delete, sender="hrms.Payslip")
+def _recompute_salary_advance_recovered(sender, instance, **kwargs):
+    """Keep SalaryAdvance.recovered_amount derived from payslip advance_recovery
+    rows so it never drifts from the source of truth."""
+    if not instance.employee_id or not instance.period_month:
+        return
+    try:
+        from .models import SalaryAdvance
+        advances = SalaryAdvance.objects.filter(
+            employee_id=instance.employee_id,
+            deleted_at__isnull=True,
+            issued_on__lte=instance.period_month.replace(day=28),
+        ).exclude(status="Written Off").order_by("issued_on")
+
+        for advance in advances:
+            adv_start = advance.issued_on.replace(day=1)
+            total_recovered = (
+                Payslip.objects.filter(
+                    employee_id=instance.employee_id,
+                    period_month__gte=adv_start,
+                    status__in=["Approved", "Paid"],
+                    deleted_at__isnull=True,
+                ).aggregate(total=Sum("advance_recovery"))["total"]
+                or 0
+            )
+            adv_recovered = min(D(total_recovered), D(advance.amount))
+            new_status = "Recovered" if adv_recovered >= D(advance.amount) else "Active"
+            if D(advance.recovered_amount) != adv_recovered or advance.status != new_status:
+                advance.recovered_amount = adv_recovered
+                advance.status = new_status
+                advance.save(update_fields=["recovered_amount", "status", "updated_at"])
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------

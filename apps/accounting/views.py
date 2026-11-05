@@ -49,26 +49,22 @@ class AccountViewSet(TenantModelViewSet):
 
     def get_queryset(self):
         # Current balance = opening + debit - credit (same as the ledger view),
-        # skipping reversed entries and their reversals.
-        lines = JournalLine.objects.filter(
-            account_id=OuterRef("pk"), deleted_at__isnull=True
-        ).exclude(journal_entry__status="Reversed").exclude(
-            journal_entry__reversal_of__isnull=False
-        )
+        # skipping reversed entries and their reversals. Uses conditional
+        # aggregation (one scan of journal_lines) instead of two correlated
+        # subqueries for better performance on large ledgers.
         money = DecimalField(max_digits=18, decimal_places=2)
-
-        def total(column):
-            return Coalesce(
-                Subquery(
-                    lines.values("account_id").annotate(t=Sum(column)).values("t")[:1],
-                    output_field=money,
-                ),
-                Value(Decimal("0.00")),
-                output_field=money,
-            )
-
+        live_lines = Q(journal_lines__deleted_at__isnull=True) & \
+            ~Q(journal_lines__journal_entry__status="Reversed") & \
+            ~Q(journal_lines__journal_entry__reversal_of__isnull=False)
         return super().get_queryset().annotate(
-            total_debit=total("debit"), total_credit=total("credit")
+            total_debit=Coalesce(
+                Sum("journal_lines__debit", filter=live_lines),
+                Value(Decimal("0.00")), output_field=money,
+            ),
+            total_credit=Coalesce(
+                Sum("journal_lines__credit", filter=live_lines),
+                Value(Decimal("0.00")), output_field=money,
+            ),
         )
 
     def perform_destroy(self, instance):
@@ -80,6 +76,11 @@ class AccountViewSet(TenantModelViewSet):
         if JournalLine.objects.filter(account=instance, deleted_at__isnull=True).exists():
             raise Conflict(
                 "This account has ledger entries and cannot be deleted.",
+                code=Codes.IN_USE,
+            )
+        if Account.objects.filter(parent=instance, deleted_at__isnull=True).exists():
+            raise Conflict(
+                "This account has child accounts and cannot be deleted.",
                 code=Codes.IN_USE,
             )
         super().perform_destroy(instance)
@@ -124,6 +125,15 @@ class BankAccountViewSet(TenantModelViewSet):
     @transaction.atomic
     def perform_create(self, serializer):
         bank = super().perform_create(serializer)
+        if bank.is_default:
+            BankAccount.objects.filter(
+                client_id=self.get_client_id(), is_default=True
+            ).exclude(pk=bank.pk).update(is_default=False)
+        return bank
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        bank = super().perform_update(serializer)
         if bank.is_default:
             BankAccount.objects.filter(
                 client_id=self.get_client_id(), is_default=True
@@ -334,20 +344,37 @@ class BudgetViewSet(TenantModelViewSet):
 
     def list(self, request, *args, **kwargs):
         queryset = self.filter_queryset(self.get_queryset())
-        page = self.paginate_queryset(queryset)
-        for budget in page:
-            rows = JournalLine.objects.filter(
+        # Compute all budget actuals in one correlated subquery instead of
+        # one query per budget row (N+1).
+        actual_subquery = (
+            JournalLine.objects.filter(
                 client_id=request.client_id,
-                account=budget.account,
+                account_id=OuterRef("account_id"),
                 deleted_at__isnull=True,
-                journal_entry__entry_date__gte=budget.period_start,
-                journal_entry__entry_date__lte=budget.period_end,
-            ).exclude(journal_entry__status="Reversed").exclude(journal_entry__reversal_of__isnull=False).aggregate(
-                debit=Coalesce(Sum("debit"), Value(Decimal("0.00")), output_field=MONEY),
-                credit=Coalesce(Sum("credit"), Value(Decimal("0.00")), output_field=MONEY),
+                journal_entry__entry_date__gte=OuterRef("period_start"),
+                journal_entry__entry_date__lte=OuterRef("period_end"),
             )
-            budget.actual_amount = round2(rows["debit"] - rows["credit"])
-        return self.get_paginated_response(self.get_serializer(page, many=True).data)
+            .exclude(journal_entry__status="Reversed")
+            .exclude(journal_entry__reversal_of__isnull=False)
+            .values("account_id")
+            .annotate(
+                net=Coalesce(Sum("debit"), Value(Decimal("0.00")))
+                - Coalesce(Sum("credit"), Value(Decimal("0.00")))
+            )
+            .values("net")[:1]
+        )
+        queryset = queryset.annotate(
+            _actual=Coalesce(Subquery(actual_subquery), Value(Decimal("0.00")),
+                             output_field=DecimalField(max_digits=18, decimal_places=2))
+        )
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            for budget in page:
+                budget.actual_amount = round2(budget._actual or Decimal("0.00"))
+            return self.get_paginated_response(self.get_serializer(page, many=True).data)
+        for budget in queryset:
+            budget.actual_amount = round2(budget._actual or Decimal("0.00"))
+        return Response(self.get_serializer(queryset, many=True).data)
 
 
 class ExpenseCategoryViewSet(TenantModelViewSet):
@@ -419,9 +446,11 @@ class StandaloneNoteViewSet(TenantModelViewSet):
 
     @action(detail=True, methods=["post"])
     def approve(self, request, pk=None):
-        """Kept for older clients: now the same as ``submit``. The decision
-        itself is taken in /approvals/requests/."""
-        return self._submit(request)
+        """Approve the standalone note (Draft/Pending Approval → Approved)."""
+        from . import note_services
+
+        note = note_services.approve_standalone_note(self.get_object(), user=request.user)
+        return Response(self.get_serializer(note).data)
 
     @action(detail=True, methods=["post"])
     def post(self, request, pk=None):
