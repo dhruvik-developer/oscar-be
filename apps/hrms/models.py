@@ -21,9 +21,11 @@ from apps.core.models import LegacyIdMixin, TenantModel
 
 EMPLOYEE_STATUSES = [
     ("Active", "Active"),
+    ("Inactive", "Inactive"),
     ("On Leave", "On Leave"),
     ("Probation", "Probation"),
     ("Resigned", "Resigned"),
+    ("Notice Period", "Notice Period"),
     ("Terminated", "Terminated"),
 ]
 EMPLOYMENT_TYPES = [

@@ -2262,18 +2262,38 @@ class RegularizationViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
 
 
     @transaction.atomic
-
     def perform_update(self, serializer):
-
         """``{ approved, remark, status }`` -- an approval rewrites the attendance row."""
-
         instance = self.get_object()
 
-        # Approved requests are locked and cannot be edited or modified
-        if instance.status == "Approved":
+        approved = self.request.data.get("approved")
+        status_val = self.request.data.get("status")
+
+        if approved is True or (status_val and str(status_val).lower() == "approved"):
+            is_approved = True
+        elif approved is False or (status_val and str(status_val).lower() == "rejected"):
+            is_approved = False
+        else:
+            is_approved = None
+
+        # Check if caller is attempting to edit core request content (times, date, status, reason)
+        content_fields = {"requested_check_in", "requested_check_out", "requested_status", "reason", "work_date"}
+        is_modifying_content = bool(set(serializer.validated_data.keys()) & content_fields)
+
+        # An approved request cannot have its content details modified
+        if instance.status == "Approved" and is_modifying_content:
             raise ValidationFailed(
                 "Approved attendance requests cannot be edited or modified."
             )
+
+        # If it is already approved and caller requests approval again, handle idempotently
+        if instance.status == "Approved" and is_approved is True:
+            remark = self.request.data.get("remark")
+            if remark and remark != instance.remark:
+                instance.remark = remark
+                instance.save(update_fields=["remark", "updated_at"])
+            serializer.instance = instance
+            return instance
 
         new_date = serializer.validated_data.get("work_date")
         if new_date and new_date != instance.work_date:
@@ -2284,24 +2304,6 @@ class RegularizationViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
                 raise ValidationFailed(
                     "An attendance request for the new date has already been approved and cannot be modified."
                 )
-
-        approved = self.request.data.get("approved")
-
-        status_val = self.request.data.get("status")
-
-        if approved is True or (status_val and str(status_val).lower() == "approved"):
-
-            is_approved = True
-
-        elif approved is False or (status_val and str(status_val).lower() == "rejected"):
-
-            is_approved = False
-
-        else:
-
-            is_approved = None
-
-
 
         row = super().perform_update(serializer)
 
@@ -5386,24 +5388,59 @@ class CalendarEventViewSet(TenantModelViewSet):
 
 
 
+    def perform_create(self, serializer):
+        super().perform_create(serializer)
+        event = serializer.instance
+        if event.type == "Holiday" and event.source_type != "Holiday":
+            self._sync_holiday_record(event)
+
+    def perform_update(self, serializer):
+        super().perform_update(serializer)
+        event = serializer.instance
+        if event.type == "Holiday":
+            self._sync_holiday_record(event)
+
     def perform_destroy(self, instance):
-
         if instance.source_type == "LeaveRequest":
-
             raise Conflict(
-
                 "Leave events are generated from the leave request.",
-
                 code="GENERATED_EVENT",
-
                 detail="Cancel the leave request instead.",
-
             )
-
+        if instance.source_type == "Holiday" and instance.source_id:
+            Holiday.objects.filter(client_id=instance.client_id, id=instance.source_id).delete()
+        elif instance.type == "Holiday" and instance.starts_at:
+            Holiday.objects.filter(client_id=instance.client_id, name=instance.title, date=instance.starts_at.date()).delete()
         super().perform_destroy(instance)
 
+    def _sync_holiday_record(self, event):
+        if not event.starts_at:
+            return
+        from django.utils import timezone as dj_timezone
+        import datetime
+        if isinstance(event.starts_at, str):
+            try:
+                h_date = datetime.date.fromisoformat(event.starts_at[:10])
+            except Exception:
+                h_date = dj_timezone.localdate()
+        elif hasattr(event.starts_at, "date"):
+            h_date = dj_timezone.localtime(event.starts_at).date() if dj_timezone.is_aware(event.starts_at) else event.starts_at.date()
+        else:
+            h_date = dj_timezone.localdate()
 
-
+        holiday, _ = Holiday.objects.update_or_create(
+            client_id=event.client_id,
+            date=h_date,
+            name=event.title,
+            defaults={
+                "holiday_type": "National Gazetted",
+                "applies_to": event.location or "All Locations",
+            },
+        )
+        if event.source_type != "Holiday" or event.source_id != holiday.id:
+            event.source_type = "Holiday"
+            event.source_id = holiday.id
+            event.save(update_fields=["source_type", "source_id"])
 
 
 class HolidayViewSet(TenantModelViewSet):
@@ -5423,6 +5460,42 @@ class HolidayViewSet(TenantModelViewSet):
     ordering = ["date"]
 
     permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+    def perform_create(self, serializer):
+        super().perform_create(serializer)
+        holiday = serializer.instance
+        self._sync_calendar_event(holiday)
+
+    def perform_update(self, serializer):
+        super().perform_update(serializer)
+        holiday = serializer.instance
+        self._sync_calendar_event(holiday)
+
+    def perform_destroy(self, instance):
+        CalendarEvent.objects.filter(
+            client_id=instance.client_id, source_type="Holiday", source_id=instance.id
+        ).delete()
+        super().perform_destroy(instance)
+
+    def _sync_calendar_event(self, holiday):
+        import datetime
+        from django.utils import timezone as dj_timezone
+        starts = dj_timezone.make_aware(datetime.datetime.combine(holiday.date, datetime.time(0, 0)))
+        ends = dj_timezone.make_aware(datetime.datetime.combine(holiday.date, datetime.time(23, 59, 59)))
+        CalendarEvent.objects.update_or_create(
+            client_id=holiday.client_id,
+            source_type="Holiday",
+            source_id=holiday.id,
+            defaults={
+                "title": holiday.name,
+                "type": "Holiday",
+                "starts_at": starts,
+                "ends_at": ends,
+                "all_day": True,
+                "location": holiday.applies_to or "All Locations",
+                "description": f"{holiday.holiday_type or 'Official'} Holiday: {holiday.name}",
+            },
+        )
 
 
 
