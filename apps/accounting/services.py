@@ -1017,14 +1017,18 @@ def _sum(queryset, field):
 
 
 def recalculate_party_balance(client_id, party):
-    """db.md §12 -- ``parties.balance`` is derived from ``journal_lines``.
+    """db.md §12 -- ``parties.balance`` is derived from ``opening_balance`` + ``journal_lines``.
 
-    Recomputed on every posting that touches the party and stored only for
-    list-view performance; never accepted as a write.
+    Recomputed on party create/update and on every posting that touches the party.
+    Stored on Party for list-view performance.
     """
     from apps.masters.models import Party
 
     party_id = getattr(party, "id", party)
+    party_obj = Party.objects.filter(pk=party_id).first()
+    if not party_obj:
+        return ZERO
+
     rows = JournalLine.objects.filter(
         client_id=client_id, party_id=party_id, deleted_at__isnull=True
     ).exclude(journal_entry__status="Reversed").exclude(journal_entry__reversal_of__isnull=False).aggregate(
@@ -1033,11 +1037,12 @@ def recalculate_party_balance(client_id, party):
         credit=Coalesce(Sum("credit"), Value(Decimal("0.00")),
                         output_field=DecimalField(max_digits=18, decimal_places=2)),
     )
-    opening = (
-        Party.objects.filter(pk=party_id).values_list("opening_balance", flat=True).first()
-        or ZERO
-    )
-    balance = round2(opening + rows["debit"] - rows["credit"])
+    opening = Decimal(str(party_obj.opening_balance or 0))
+    if party_obj.type in ("Vendor", "Processor"):
+        balance = round2(opening + rows["credit"] - rows["debit"])
+    else:
+        balance = round2(opening + rows["debit"] - rows["credit"])
+
     Party.objects.filter(pk=party_id).update(balance=balance)
     return balance
 

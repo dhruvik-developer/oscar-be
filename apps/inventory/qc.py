@@ -6,6 +6,7 @@ system location. Nothing is available for sale until a QC disposition moves it
 out, taka by taka, with real movements:
 
     good           -> QC_PASS            -> the receipt's own (godown) location
+    sample         -> QC_PASS, then issued as a Sample from that godown
     second quality -> QC_SECOND_QUALITY  -> Second Quality Stock
     reprocess      -> QC_REPROCESS       -> Reprocess Stock
     reject         -> QC_REJECT          -> Reject / Scrap
@@ -29,10 +30,11 @@ from .models import LotTaka, StockMovement
 
 #: Allocation order: a taka is filled category by category in this order, so
 #: ``hold`` (which does not move) always takes whatever is left at QC Hold.
-CATEGORIES = ("good", "second", "reprocess", "reject", "hold")
+CATEGORIES = ("good", "sample", "second", "reprocess", "reject", "hold")
 
 CATEGORY_CONDITION = {
     "good": "Good",
+    "sample": "Good",
     "second": "Second Quality",
     "reprocess": "Reprocess",
     "reject": "Reject",
@@ -41,6 +43,7 @@ CATEGORY_CONDITION = {
 
 CATEGORY_MOVEMENT = {
     "good": "QC_PASS",
+    "sample": "QC_PASS",
     "second": "QC_SECOND_QUALITY",
     "reprocess": "QC_REPROCESS",
     "reject": "QC_REJECT",
@@ -50,6 +53,7 @@ CATEGORY_MOVEMENT = {
 #: Request keys accepted for each category.
 CATEGORY_KEYS = {
     "good": ("goodQty",),
+    "sample": ("sampleQty",),
     "second": ("secondQualityQty", "secondQty"),
     "reprocess": ("reprocessQty",),
     "reject": ("rejectedQty", "rejectQty"),
@@ -95,11 +99,7 @@ def verdict_for(cumulative, hold_now):
     passed = cumulative.get("good", ZERO) + cumulative.get("second", ZERO)
     if passed <= ZERO:
         return "Rework" if cumulative.get("reprocess", ZERO) > ZERO else "Rejected"
-    if (
-        cumulative.get("reprocess", ZERO)
-        + cumulative.get("reject", ZERO)
-        + cumulative.get("second", ZERO)
-    ) > ZERO:
+    if cumulative.get("reprocess", ZERO) > ZERO:
         return "Partially Approved"
     return "Approved"
 
@@ -119,13 +119,27 @@ def receipt_has_stock(receipt):
     ).exists()
 
 
-def receipt_pool(receipt):
+def receipt_pool(receipt, source_location=None, from_reprocess=False):
     """The stock of ``receipt`` still awaiting QC, as a list of units.
 
     A unit is one taka (``lot`` set) or, for items not held on takas, the
-    item's quantity held at QC Hold for this receipt.
+    item's quantity held at QC Hold or Reprocess for this receipt.
     """
-    qc_location = stock.system_location(receipt.client_id, "QC_HOLD")
+    if source_location is not None:
+        qc_location = source_location
+    elif from_reprocess or receipt.qc_status in ("Partially Approved", "Reprocess", "Rework"):
+        reprocess_loc = stock.system_location(receipt.client_id, "REPROCESS")
+        reprocess_held = StockMovement.objects.filter(
+            client_id=receipt.client_id,
+            source_document_id=receipt.id,
+            location_id=reprocess_loc.id,
+        ).aggregate(total=Sum("quantity"))["total"] or ZERO
+        if reprocess_held > ZERO or from_reprocess:
+            qc_location = reprocess_loc
+        else:
+            qc_location = stock.system_location(receipt.client_id, "QC_HOLD")
+    else:
+        qc_location = stock.system_location(receipt.client_id, "QC_HOLD")
     lines = list(receipt.lines.filter(deleted_at__isnull=True).select_related("item"))
     line_by_id = {line.id: line for line in lines}
 
@@ -221,6 +235,7 @@ def dispose_receipt(
     job_work_order=None,
     require_job_work_order=True,
     movement_date=None,
+    from_reprocess=False,
 ):
     from apps.purchase.models import GoodsReceipt, PurchaseBill
 
@@ -229,13 +244,29 @@ def dispose_receipt(
         .select_related("purchase_bill", "party")
         .get(pk=receipt.pk)
     )
-    if receipt.qc_status not in ("Pending", "Draft", "On Hold"):
-        raise Conflict(
-            f"QC inspection for {receipt.grn_number} has already been completed with status '{receipt.qc_status}'.",
-            code="QC_ALREADY_DONE",
-        )
+    reprocess_loc = stock.system_location(receipt.client_id, "REPROCESS")
+    reprocess_held = StockMovement.objects.filter(
+        client_id=receipt.client_id,
+        source_document_id=receipt.id,
+        location_id=reprocess_loc.id,
+    ).aggregate(total=Sum("quantity"))["total"] or ZERO
 
-    units, qc_location = receipt_pool(receipt)
+    is_reprocess_inspection = from_reprocess or (
+        receipt.qc_status in ("Partially Approved", "Reprocess", "Rework")
+    )
+
+    if not is_reprocess_inspection:
+        if receipt.qc_status not in ("Pending", "Draft", "On Hold"):
+            raise Conflict(
+                f"QC inspection for {receipt.grn_number} has already been completed with status '{receipt.qc_status}'.",
+                code="QC_ALREADY_DONE",
+            )
+
+    units, qc_location = receipt_pool(
+        receipt,
+        source_location=reprocess_loc if is_reprocess_inspection else None,
+        from_reprocess=is_reprocess_inspection,
+    )
     pool_total = round4(sum((unit["qty"] for unit in units), ZERO))
     record_only = False
 
@@ -386,6 +417,14 @@ def dispose_receipt(
     on_date = movement_date or timezone.localdate()
     note = f"QC {receipt.grn_number}" + (f": {remarks}" if remarks else "")
 
+    if quantities["sample"] > ZERO and (
+        record_only or any(unit["lot"] is None for unit, category, _ in plan if category == "sample")
+    ):
+        raise ValidationFailed(
+            "A sample is cut from a taka, and this receipt has no takas to cut it from.",
+            field_errors={"sampleQty": ["Only fabric held on takas can go to samples."]},
+        )
+
     reject_by_line = {}
     moved = 0
     for unit, category, qty in plan:
@@ -422,6 +461,17 @@ def dispose_receipt(
             )
             if remarks:
                 LotTaka.objects.filter(pk=target.pk).update(qc_notes=remarks)
+            if category == "sample":
+                from .sampling_services import issue_sample
+
+                issue_sample(
+                    client_id=receipt.client_id,
+                    source_lot_taka_id=target.pk,
+                    quantity=qty,
+                    uom=target.uom or "MTR",
+                    remarks=note,
+                    user=user,
+                )
         else:
             line = unit["line"]
             unit_cost = D(line.unit_cost) if line is not None and line.unit_cost else None
@@ -465,6 +515,7 @@ def dispose_receipt(
     verdict = record_receipt_verdict(
         receipt, quantities, user=user, remarks=remarks, measurements=measurements,
         stock_posted=not record_only, reprocess_order=reprocess_order,
+        is_reprocess=is_reprocess_inspection,
     )
     return {
         "verdict": verdict,
@@ -477,7 +528,7 @@ def dispose_receipt(
 
 
 def record_receipt_verdict(receipt, quantities, *, user=None, remarks=None, measurements=None,
-                           stock_posted=True, reprocess_order=None):
+                           stock_posted=True, reprocess_order=None, is_reprocess=False):
     """Add a QC result to the receipt's running totals and set its verdict,
     bill QC status and audit trail. Shared by the quantity disposition and
     the roll-by-roll QC entry. Returns the verdict."""
@@ -488,13 +539,26 @@ def record_receipt_verdict(receipt, quantities, *, user=None, remarks=None, meas
         category: D(str(meta.get("cumulative", {}).get(category, 0)))
         for category in ("good", "second", "reprocess", "reject")
     }
-    for category in ("good", "second", "reprocess", "reject"):
-        cumulative[category] += quantities[category]
+    # A sample passed QC before it was issued, so it counts as good here and
+    # is kept apart only in ``sampleQty``.
+    sample_now = quantities.get("sample", ZERO)
+    sample_total = D(str(meta.get("sampleQty", 0))) + sample_now
+    quantities = {**quantities, "good": quantities.get("good", ZERO) + sample_now}
+    if is_reprocess:
+        dispositioned_from_reprocess = quantities.get("good", ZERO) + quantities.get("second", ZERO) + quantities.get("reject", ZERO)
+        cumulative["reprocess"] = max(ZERO, cumulative.get("reprocess", ZERO) - dispositioned_from_reprocess)
+        cumulative["good"] = cumulative.get("good", ZERO) + quantities.get("good", ZERO)
+        cumulative["second"] = cumulative.get("second", ZERO) + quantities.get("second", ZERO)
+        cumulative["reject"] = cumulative.get("reject", ZERO) + quantities.get("reject", ZERO)
+    else:
+        for category in ("good", "second", "reprocess", "reject"):
+            cumulative[category] += quantities[category]
     verdict = verdict_for(cumulative, quantities["hold"])
 
     previous_status = receipt.qc_status
     meta = {
         "goodQty": float(cumulative["good"]),
+        "sampleQty": float(sample_total),
         "secondQualityQty": float(cumulative["second"]),
         "reprocessQty": float(cumulative["reprocess"]),
         "rejectedQty": float(cumulative["reject"]),
@@ -518,6 +582,34 @@ def record_receipt_verdict(receipt, quantities, *, user=None, remarks=None, meas
             qc_note=remarks or None,
             updated_at=timezone.now(),
         )
+
+    if verdict in ("Approved", "Passed"):
+        from apps.inventory.models import Batch
+        Batch.objects.filter(goods_receipt=receipt).update(updated_at=timezone.now())
+
+    # Update any linked ReprocessReturn and its ReprocessRecord
+    try:
+        from apps.inventory.models import ReprocessReturn, ReprocessRecord
+        returns = list(ReprocessReturn.objects.filter(goods_receipt=receipt))
+        if returns:
+            rep_status = "Approved" if verdict in ("Approved", "Passed") else verdict
+            ReprocessReturn.objects.filter(goods_receipt=receipt).update(
+                qc_status=rep_status,
+                qc_notes=remarks or "",
+                updated_at=timezone.now(),
+            )
+            record_ids = {r.reprocess_record_id for r in returns if r.reprocess_record_id}
+            for rec in ReprocessRecord.objects.filter(id__in=record_ids):
+                all_rets = list(rec.returns.all())
+                any_pending = any(r.qc_status in ("Pending", "Draft") for r in all_rets)
+                if not any_pending:
+                    rec.reprocess_qc_status = "Passed"
+                    if rec.outstanding_quantity <= ZERO:
+                        rec.status = "Completed"
+                    rec.save(update_fields=["reprocess_qc_status", "status", "updated_at"])
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("Error updating reprocess return status: %s", e)
 
     from apps.core.audit import record_audit
 

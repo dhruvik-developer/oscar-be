@@ -4,13 +4,13 @@ from datetime import timedelta
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import Count, DecimalField, F, Q, Sum, Value
+from django.db.models import Count, DecimalField, ExpressionWrapper, F, Q, Sum, Value
 from django.db.models.functions import Coalesce
+from django.utils.dateparse import parse_date
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.views import APIView
 
 from apps.core.exceptions import (
     BusinessRuleViolation,
@@ -22,9 +22,9 @@ from apps.core.exceptions import (
 from apps.core.money import ZERO, D, round2, round4
 from apps.core.numbering import allocate_number
 from apps.core.pagination import envelope
-from apps.core.permissions import HasModulePermission
 from apps.core.printing import PdfNotAvailable, print_payload, send_payload
-from apps.core.viewsets import TenantModelViewSet
+from apps.core.models import AuditLog
+from apps.core.viewsets import ReadOnlyTenantViewSet, TenantModelViewSet
 from apps.inventory import services as stock
 from apps.masters import uom
 
@@ -53,10 +53,17 @@ from .models import (
 from .serializers import (
     AllocateSerializer,
     BrokerCommissionSerializer,
+    DiscountDecisionSerializer,
+    DiscountProposeSerializer,
+    DiscountReviewSerializer,
     ConvertLinesSerializer,
     DeliveryChallanSerializer,
-    EarlyPaymentDiscountRequestSerializer,
     InvoiceOutstandingSerializer,
+    EarlyPaymentDiscountCreateSerializer,
+    EarlyPaymentDiscountRequestSerializer,
+    EarlyPaymentDiscountUpdateSerializer,
+    PaymentTermsChangeSerializer,
+    ReceivableRowSerializer,
     PaymentInSerializer,
     ProformaInvoiceSerializer,
     QuotationActivitySerializer,
@@ -111,13 +118,14 @@ class SalesDocumentViewSet(TenantModelViewSet):
         return (
             super()
             .get_queryset()
-            .select_related("party")
+            .select_related("party", "broker_fk")
             .prefetch_related("line_items__item")
         )
 
     def after_create(self, instance):
         super().after_create(instance)
         services.fill_salesperson(instance)
+        services.fill_broker(instance)
 
     def get_aggregates(self, queryset):
         rows = queryset.aggregate(
@@ -225,6 +233,12 @@ def _clone_document(source, target_model, overrides, *, number_field, series,
         "broker", "broker_fk_id", "salesperson", "salesperson_fk_id",
     ]
     payload = {field: getattr(source, field) for field in copied_fields}
+    if hasattr(target_model, "crm_lead") and "crm_lead" not in overrides:
+        source_lead = getattr(source, "crm_lead", None) or (
+            getattr(source, "crm_deal", None).lead if getattr(source, "crm_deal", None) else None
+        )
+        if source_lead:
+            payload["crm_lead"] = source_lead
     payload["doc_date"] = timezone.localdate()
     payload.update(overrides)
 
@@ -232,6 +246,7 @@ def _clone_document(source, target_model, overrides, *, number_field, series,
     setattr(target, number_field, allocate_number(source.client, series, target.doc_date))
     target.save()
     services.fill_salesperson(target)
+    services.fill_broker(target)
 
     module = importlib.import_module(target_model.__module__)
     line_model = getattr(module, line_model_name)
@@ -517,9 +532,6 @@ class QuotationViewSet(SalesDocumentViewSet):
             quotation.crm_lead = conversion["lead"]
 
         party = conversion["party"]
-        if party is None and quotation.party_id is None and quotation.crm_lead_id is None:
-            # Manual quotation (typed name, no lead): its customer is made now.
-            party = services.party_from_manual_quotation(quotation, user=request.user)
         # The approved quotation stays linked to the customer: point it at the
         # converted (or matched) party so the follow-up Sales Order is raised
         # on the right customer. The frozen address snapshot is only filled
@@ -531,6 +543,7 @@ class QuotationViewSet(SalesDocumentViewSet):
         # The deal owner is who earns the incentive on this sale; carry them
         # onto the quotation so the order and invoice inherit it.
         services.fill_salesperson(quotation)
+        services.fill_broker(quotation)
         # An approval wins the linked deal: same transaction, so a failed
         # deal move rolls the approval back too.
         crm_services.advance_deal_for_quotation(
@@ -696,8 +709,7 @@ class SalesOrderViewSet(SalesDocumentViewSet):
         )
         serializer.validated_data.setdefault("stage", "Confirmed")
         order = super().perform_create(serializer)
-        if not self._gate_discount(order, previous_stage=None) and order.stage == "Confirmed":
-            services.reserve_order_takas(order)
+        self._gate_discount(order, previous_stage=None)
         return order
 
     def perform_update(self, serializer):
@@ -812,6 +824,7 @@ class SalesOrderViewSet(SalesDocumentViewSet):
     @transaction.atomic
     def convert_to_challan(self, request, pk=None):
         order = self.get_object()
+        order = SalesOrder.objects.select_for_update().get(pk=order.pk)
         serializer = ConvertLinesSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         return self._convert(order, serializer.validated_data, target="challan")
@@ -819,10 +832,164 @@ class SalesOrderViewSet(SalesDocumentViewSet):
     @action(detail=True, methods=["post"], url_path="convert-to-invoice")
     @transaction.atomic
     def convert_to_invoice(self, request, pk=None):
-        order = self.get_object()
+        order = SalesOrder.objects.select_for_update().get(pk=pk)
+        self.check_object_permissions(request, order)
         serializer = ConvertLinesSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         return self._convert(order, serializer.validated_data, target="invoice")
+
+    @action(detail=True, methods=["post"], url_path="convert-to-challan-and-invoice")
+    @transaction.atomic
+    def convert_to_challan_and_invoice(self, request, pk=None):
+        order = SalesOrder.objects.select_for_update().get(pk=pk)
+        self.check_object_permissions(request, order)
+
+        if order.stage == "Cancelled":
+            raise Conflict("This order is cancelled.", code=Codes.ALREADY_CANCELLED)
+        if order.stage == "Pending Approval":
+            raise Conflict(
+                f"Order {order.order_number} is waiting for discount approval and cannot be processed yet.",
+                code="APPROVAL_PENDING",
+            )
+
+        data = request.data or {}
+
+        # 1. Delivery Challan: Reuse existing active or create ONE
+        existing_challan = services.active_order_challan(order)
+        if existing_challan:
+            challan = existing_challan
+        else:
+            challan = DeliveryChallan.objects.create(
+                client_id=order.client_id,
+                party=order.party,
+                party_name=order.party_name,
+                party_gstin=order.party_gstin,
+                billing_address=order.billing_address,
+                shipping_address=order.shipping_address,
+                place_of_supply=order.place_of_supply,
+                doc_date=data.get("date") or timezone.localdate(),
+                sales_order=order,
+                status="Draft",
+                location_id=data.get("locationId"),
+                notes=data.get("notes") or order.notes,
+                created_by=request.user if getattr(request.user, "is_authenticated", False) else None,
+            )
+            challan.challan_number = allocate_number(order.client, "DC", challan.doc_date)
+            challan.save(update_fields=["challan_number", "updated_at"])
+            services.fill_broker(challan)
+
+            source_lines = list(
+                order.line_items.filter(deleted_at__isnull=True).order_by("line_no")
+            )
+            for idx, source in enumerate(source_lines, start=1):
+                effective_takas = getattr(source, "taka_allocations", []) or []
+                DeliveryChallanLine.objects.create(
+                    client_id=order.client_id,
+                    delivery_challan=challan,
+                    line_no=idx,
+                    item_id=source.item_id,
+                    sku=source.sku,
+                    item_name=source.item_name,
+                    description=source.description,
+                    hsn_code=source.hsn_code,
+                    uom=source.uom,
+                    uom_factor=source.uom_factor,
+                    qty=source.qty,
+                    rate=source.rate,
+                    discount_pct=source.discount_pct,
+                    tax_pct=source.tax_pct,
+                    sales_order_line=source,
+                    is_bom_generated=source.is_bom_generated,
+                    bom_source_item_id=source.bom_source_item_id,
+                    parent_sku=source.parent_sku,
+                    taka_allocations=[
+                        {"lotTakaId": str(t.get("lotTakaId") or t.get("lot_taka_id")),
+                         "qty": str(t.get("qty"))}
+                        for t in effective_takas if (t.get("lotTakaId") or t.get("lot_taka_id"))
+                    ],
+                )
+            services.recalculate_document(challan)
+
+        # 2. Sales Invoice: Reuse existing active or create ONE
+        existing_invoice = services.active_order_invoice(order)
+        if existing_invoice:
+            invoice = existing_invoice
+            if not invoice.delivery_challan_id and challan:
+                invoice.delivery_challan = challan
+                invoice.save(update_fields=["delivery_challan", "updated_at"])
+        else:
+            invoice = SalesInvoice.objects.create(
+                client_id=order.client_id,
+                party=order.party,
+                party_name=order.party_name,
+                party_gstin=order.party_gstin,
+                billing_address=order.billing_address,
+                shipping_address=order.shipping_address,
+                place_of_supply=order.place_of_supply,
+                doc_date=data.get("date") or timezone.localdate(),
+                sales_order=order,
+                delivery_challan=challan,
+                broker=order.broker or (challan.broker if challan else None),
+                broker_fk=order.broker_fk or (challan.broker_fk if challan else None),
+                salesperson=order.salesperson or (challan.salesperson if challan else None),
+                salesperson_fk=order.salesperson_fk or (challan.salesperson_fk if challan else None),
+                status="Draft",
+                location_id=data.get("locationId"),
+                notes=data.get("notes") or order.notes,
+                created_by=request.user if getattr(request.user, "is_authenticated", False) else None,
+            )
+            services.fill_salesperson(invoice)
+            services.fill_broker(invoice)
+            source_lines = list(
+                order.line_items.filter(deleted_at__isnull=True).order_by("line_no")
+            )
+            challan_lines_by_sol = {
+                cl.sales_order_line_id: cl
+                for cl in challan.line_items.filter(deleted_at__isnull=True)
+            }
+            for idx, source in enumerate(source_lines, start=1):
+                effective_takas = getattr(source, "taka_allocations", []) or []
+                matched_cl = challan_lines_by_sol.get(source.id)
+                SalesInvoiceLine.objects.create(
+                    client_id=order.client_id,
+                    sales_invoice=invoice,
+                    line_no=idx,
+                    item_id=source.item_id,
+                    sku=source.sku,
+                    item_name=source.item_name,
+                    description=source.description,
+                    hsn_code=source.hsn_code,
+                    uom=source.uom,
+                    uom_factor=source.uom_factor,
+                    qty=source.qty,
+                    rate=source.rate,
+                    discount_pct=source.discount_pct,
+                    tax_pct=source.tax_pct,
+                    sales_order_line=source,
+                    delivery_challan_line=matched_cl,
+                    is_bom_generated=source.is_bom_generated,
+                    bom_source_item_id=source.bom_source_item_id,
+                    parent_sku=source.parent_sku,
+                    taka_allocations=[
+                        {"lotTakaId": str(t.get("lotTakaId") or t.get("lot_taka_id")),
+                         "qty": str(t.get("qty"))}
+                        for t in effective_takas if (t.get("lotTakaId") or t.get("lot_taka_id"))
+                    ],
+                )
+            services.recalculate_document(invoice)
+            services.fill_broker(invoice)
+
+        # 3. Advance order stage
+        if order.stage not in ("Invoiced", "Closed", "Cancelled"):
+            order.stage = "Invoiced"
+            order.save(update_fields=["stage", "updated_at"])
+
+        return Response({
+            "challan": DeliveryChallanSerializer(challan).data,
+            "invoice": SalesInvoiceSerializer(invoice).data,
+            "order": SalesOrderSerializer(order).data,
+        }, status=status.HTTP_200_OK)
+
 
     def _convert(self, order, data, *, target):
         """Partial conversion (api.md §5.4): ``{ lines: [{ lineId, qty, serials[] }] }``."""
@@ -835,14 +1002,43 @@ class SalesOrderViewSet(SalesDocumentViewSet):
                 code="APPROVAL_PENDING",
             )
 
+        # One invoice and one challan per order, partial lines or not.
+        if target == "invoice":
+            services.assert_order_has_no_invoice(order)
+
+        if target == "challan":
+            existing = services.active_order_challan(order)
+            if existing is not None and not data.get("lines"):
+                return Response(DeliveryChallanSerializer(existing).data, status=status.HTTP_200_OK)
+            services.assert_order_has_no_challan(order)
+
         requested = {
             str(row.get("lineId") or row.get("line_id")): row for row in data.get("lines") or []
         }
-        source_lines = list(
-            order.line_items.filter(deleted_at__isnull=True)
-            .select_related("item")
-            .order_by("line_no")
-        )
+        source_line_query = order.line_items.filter(deleted_at__isnull=True).select_related(
+            "item"
+        ).order_by("line_no")
+        if target == "invoice":
+            source_line_query = source_line_query.select_for_update(of=("self",))
+        source_lines = list(source_line_query)
+
+        draft_invoice_qty = {}
+        if target == "invoice":
+            source_lines_by_id = {line.id: line for line in source_lines}
+            draft_lines = SalesInvoiceLine.objects.filter(
+                client_id=order.client_id,
+                sales_invoice__sales_order_id=order.id,
+                sales_invoice__deleted_at__isnull=True,
+                sales_invoice__status="Draft",
+                deleted_at__isnull=True,
+                sales_order_line_id__in=source_lines_by_id,
+            ).select_related("sales_order_line")
+            for draft_line in draft_lines:
+                order_line = source_lines_by_id[draft_line.sales_order_line_id]
+                draft_invoice_qty[order_line.id] = (
+                    draft_invoice_qty.get(order_line.id, ZERO)
+                    + uom.between_lines(draft_line.qty, draft_line, order_line)
+                )
 
         selected = []
         awaiting_dispatch = []
@@ -853,14 +1049,30 @@ class SalesOrderViewSet(SalesDocumentViewSet):
             if target == "challan":
                 remaining = D(line.qty) - D(line.dispatched_qty)
             elif line.item_id is not None and line.item.holds_stock:
-                # Stock lines are invoiced from what actually left the
-                # warehouse: dispatched minus already invoiced.
-                remaining = D(line.dispatched_qty) - D(line.invoiced_qty)
-                if D(line.qty) - D(line.dispatched_qty) > ZERO:
-                    awaiting_dispatch.append(line)
+                # If order is in Draft or directInvoice is requested, allow direct invoicing from order quantity:
+                if order.stage == "Draft" or data.get("directInvoice") or data.get("direct"):
+                    remaining = (
+                        D(line.qty)
+                        - D(line.invoiced_qty)
+                        - draft_invoice_qty.get(line.id, ZERO)
+                    )
+                else:
+                    # Stock lines are invoiced from what actually left the
+                    # warehouse: dispatched minus already invoiced.
+                    remaining = (
+                        D(line.dispatched_qty)
+                        - D(line.invoiced_qty)
+                        - draft_invoice_qty.get(line.id, ZERO)
+                    )
+                    if D(line.qty) - D(line.dispatched_qty) > ZERO:
+                        awaiting_dispatch.append(line)
             else:
                 # Non-stock lines (services, charges) never pass a challan.
-                remaining = D(line.qty) - D(line.invoiced_qty)
+                remaining = (
+                    D(line.qty)
+                    - D(line.invoiced_qty)
+                    - draft_invoice_qty.get(line.id, ZERO)
+                )
             remaining = remaining if remaining > ZERO else ZERO
             qty = D(row.get("qty")) if row and row.get("qty") is not None else remaining
             if qty <= ZERO:
@@ -928,6 +1140,7 @@ class SalesOrderViewSet(SalesDocumentViewSet):
                 created_by=self.request.user,
             )
         document.save()
+        services.fill_broker(document)
 
         line_model = DeliveryChallanLine if target == "challan" else SalesInvoiceLine
         line_fk = "delivery_challan" if target == "challan" else "sales_invoice"
@@ -936,6 +1149,7 @@ class SalesOrderViewSet(SalesDocumentViewSet):
         )
 
         for index, (source, qty, serials, takas) in enumerate(selected, start=1):
+            effective_takas = takas or getattr(source, "taka_allocations", []) or []
             new_line = line_model.objects.create(
                 client_id=order.client_id,
                 **{line_fk: document},
@@ -958,7 +1172,7 @@ class SalesOrderViewSet(SalesDocumentViewSet):
                 taka_allocations=[
                     {"lotTakaId": str(t.get("lotTakaId") or t.get("lot_taka_id")),
                      "qty": str(t.get("qty"))}
-                    for t in takas if (t.get("lotTakaId") or t.get("lot_taka_id"))
+                    for t in effective_takas if (t.get("lotTakaId") or t.get("lot_taka_id"))
                 ],
             )
             if serials:
@@ -966,6 +1180,16 @@ class SalesOrderViewSet(SalesDocumentViewSet):
                 stock.link_line_serials(order.client_id, line_table, new_line.id, resolved)
 
         services.recalculate_document(document)
+
+        if target == "invoice":
+            total_ordered = sum(D(l.qty) for l in source_lines)
+            total_invoiced_or_draft = sum(
+                D(l.invoiced_qty) + draft_invoice_qty.get(l.id, ZERO)
+                for l in source_lines
+            ) + sum(qty for _, qty, _, _ in selected)
+            if total_invoiced_or_draft >= total_ordered or not data.get("lines") or order.stage == "Draft":
+                order.stage = "Invoiced"
+                order.save(update_fields=["stage", "updated_at"])
 
         serializer_class = (
             DeliveryChallanSerializer if target == "challan" else SalesInvoiceSerializer
@@ -1045,6 +1269,8 @@ class ProformaInvoiceViewSet(SalesDocumentViewSet):
         # has been dispatched and not yet invoiced (no double depletion).
         order_line_for = {}
         if proforma.sales_order_id:
+            order = SalesOrder.objects.select_for_update().get(pk=proforma.sales_order_id)
+            services.assert_order_has_no_invoice(order)
             order_lines = list(
                 SalesOrderLine.objects.filter(
                     sales_order_id=proforma.sales_order_id, deleted_at__isnull=True
@@ -1115,14 +1341,25 @@ class DeliveryChallanViewSet(SalesDocumentViewSet):
     filter_map = {"customerId": "party_id", "salesOrderId": "sales_order_id"}
     permission_map = {"read": ["view_sales"], "write": ["create_sales_order"]}
 
+    @transaction.atomic
     def perform_create(self, serializer):
+        order = serializer.validated_data.get("sales_order")
+        if order:
+            order = SalesOrder.objects.select_for_update().get(pk=order.pk)
+            services.assert_order_has_no_challan(order)
         serializer.validated_data["challan_number"] = allocate_number(
             self.request.user.client, "DC", serializer.validated_data.get("doc_date")
         )
         return super().perform_create(serializer)
 
+    @transaction.atomic
     def perform_update(self, serializer):
         """A status change to ``Dispatched`` posts the stock movements."""
+        order = serializer.validated_data.get("sales_order")
+        current_order_id = serializer.instance.sales_order_id
+        if order and order.pk != current_order_id:
+            order = SalesOrder.objects.select_for_update().get(pk=order.pk)
+            services.assert_order_has_no_challan(order, exclude_id=serializer.instance.pk)
         previous = serializer.instance.status
         challan = super().perform_update(serializer)
         if previous == "Draft" and challan.status == "Dispatched":
@@ -1137,6 +1374,24 @@ class DeliveryChallanViewSet(SalesDocumentViewSet):
     def dispatch_action(self, request, pk=None):
         challan = services.dispatch_challan(self.get_object(), user=request.user)
         self.write_audit("dispatch", challan, description="Challan dispatched")
+        return Response(self.get_serializer(challan).data)
+
+    @action(detail=True, methods=["post"], url_path="confirm-pod")
+    @transaction.atomic
+    def confirm_pod(self, request, pk=None):
+        challan = DeliveryChallan.objects.select_for_update().get(pk=self.get_object().pk)
+        if challan.status == "Delivered":
+            return Response(self.get_serializer(challan).data)
+        if challan.status not in {"Dispatched", "In Transit"} or challan.posted_at is None:
+            raise Conflict(
+                "Only a dispatched challan can be confirmed as delivered.",
+                code=Codes.DRAFT_ONLY,
+            )
+
+        challan.status = "Delivered"
+        challan.delivered_at = timezone.now()
+        challan.save(update_fields=["status", "delivered_at", "updated_at"])
+        self.write_audit("confirm-pod", challan, description="Proof of delivery confirmed")
         return Response(self.get_serializer(challan).data)
 
     @action(detail=True, methods=["post"])
@@ -1188,6 +1443,9 @@ class DeliveryChallanViewSet(SalesDocumentViewSet):
                 f"An invoice ({existing_invoice.invoice_number or existing_invoice.id}) already exists for this challan.",
                 code=Codes.OVER_INVOICE,
             )
+        if challan.sales_order_id:
+            order = SalesOrder.objects.select_for_update().get(pk=challan.sales_order_id)
+            services.assert_order_has_no_invoice(order)
 
         invoice = SalesInvoice.objects.create(
             client_id=challan.client_id,
@@ -1200,12 +1458,18 @@ class DeliveryChallanViewSet(SalesDocumentViewSet):
             doc_date=timezone.localdate(),
             sales_order=challan.sales_order,
             delivery_challan=challan,
+            broker=challan.broker or (challan.sales_order.broker if challan.sales_order else None),
+            broker_fk=challan.broker_fk or (challan.sales_order.broker_fk if challan.sales_order else None),
+            salesperson=challan.salesperson or (challan.sales_order.salesperson if challan.sales_order else None),
+            salesperson_fk=challan.salesperson_fk or (challan.sales_order.salesperson_fk if challan.sales_order else None),
             location=challan.location,
             status="Draft",
             freight_charges=challan.freight_charges,
             other_charges=challan.other_charges,
             created_by=request.user,
         )
+        services.fill_salesperson(invoice)
+        services.fill_broker(invoice)
         for index, line in enumerate(
             challan.line_items.filter(deleted_at__isnull=True).order_by("line_no"), start=1
         ):
@@ -1231,6 +1495,7 @@ class DeliveryChallanViewSet(SalesDocumentViewSet):
                 parent_sku=line.parent_sku,
             )
         services.recalculate_document(invoice)
+        services.fill_broker(invoice)
         return Response(
             SalesInvoiceSerializer(invoice, context=self.get_serializer_context()).data,
             status=status.HTTP_201_CREATED,
@@ -1344,8 +1609,7 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
         "write": ["create_invoice"],
         "finalize": ["finalize_invoice"],
         "cancel": ["cancel_invoice"],
-        # Finer checks (draft vs finalized) live in early_payment.change_payment_terms.
-        "payment_terms": ["view_sales"],
+        "payment_terms": [],
     }
 
     def filter_queryset(self, queryset):
@@ -1353,7 +1617,7 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
         if self.request.query_params.get("overdue") == "true":
             queryset = queryset.filter(
                 due_date__lt=timezone.localdate(),
-                total__gt=F("amount_paid") + F("settlement_discount"),
+                total__gt=F("amount_paid"),
             ).exclude(status__in=["Cancelled", "Draft", "Paid"])
         return queryset
 
@@ -1362,71 +1626,15 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
             count=Count("id"),
             totalValue=money_sum("total"),
             paid=money_sum("amount_paid"),
-            approvedDiscount=money_sum("settlement_discount"),
             draft=Count("id", filter=Q(status="Draft")),
             overdue=Count(
                 "id",
-                filter=Q(
-                    due_date__lt=timezone.localdate(),
-                    total__gt=F("amount_paid") + F("settlement_discount"),
-                )
+                filter=Q(due_date__lt=timezone.localdate(), total__gt=F("amount_paid"))
                 & ~Q(status__in=["Cancelled", "Draft", "Paid"]),
             ),
         )
-        rows["outstanding"] = round2(rows["totalValue"] - rows["paid"] - rows["approvedDiscount"])
+        rows["outstanding"] = round2(rows["totalValue"] - rows["paid"])
         return rows
-
-    @action(detail=False, methods=["get"], url_path="payment-term-options")
-    def payment_term_options(self, request):
-        """The term choices for the invoice form (none is applied by default)."""
-        from .early_payment import PAYMENT_TERM_OPTIONS
-
-        return Response({"options": PAYMENT_TERM_OPTIONS})
-
-    @action(detail=True, methods=["post"], url_path="payment-terms")
-    def payment_terms(self, request, pk=None):
-        """``POST /sales/invoices/{id}/payment-terms/`` -- terms, due date and the reason."""
-        from datetime import date as date_cls
-
-        from .early_payment import change_payment_terms
-
-        data = request.data or {}
-        due = data.get("dueDate")
-        if due:
-            try:
-                due = date_cls.fromisoformat(str(due)[:10])
-            except ValueError:
-                raise ValidationFailed("Enter the due date as YYYY-MM-DD.", field_errors={"dueDate": ["Invalid date."]})
-        invoice = change_payment_terms(
-            self.get_object(),
-            credit_days=data.get("creditDays"),
-            label=data.get("paymentTerms"),
-            due_date=due or None,
-            reason=data.get("reason"),
-            user=request.user,
-        )
-        return Response(self.get_serializer(invoice).data)
-
-    @action(detail=True, methods=["get"], url_path="terms-history")
-    def terms_history(self, request, pk=None):
-        """Who changed this invoice's terms or due date, when, from what, and why."""
-        from apps.core.models import AuditLog
-
-        invoice = self.get_object()
-        rows = AuditLog.objects.filter(
-            client_id=invoice.client_id, entity_type="SalesInvoice", entity_id=invoice.id,
-            action="payment_terms_change",
-        ).order_by("-created_at", "-id")
-        return Response({"results": [
-            {
-                "actorName": row.actor_name,
-                "at": row.created_at.isoformat(),
-                "before": row.before,
-                "after": row.after,
-                "reason": row.comments or row.description,
-            }
-            for row in rows
-        ]})
 
     def _discount_gate(self, invoice):
         from . import discount_control
@@ -1444,7 +1652,12 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
         A discount that needs an approver keeps the invoice in Draft; the
         approval request is opened and the invoice is finalized after it.
         """
-        invoice = super().perform_create(serializer)
+        with transaction.atomic():
+            order = serializer.validated_data.get("sales_order")
+            if order:
+                order = SalesOrder.objects.select_for_update().get(pk=order.pk)
+                services.assert_order_has_no_invoice(order)
+            invoice = super().perform_create(serializer)
         if self.request.data.get("finalize"):
             _, req, _ = self._discount_gate(invoice)
             if req is not None:
@@ -1456,6 +1669,14 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
             )
             invoice.refresh_from_db()
         return invoice
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        order = serializer.validated_data.get("sales_order")
+        if order and order.pk != serializer.instance.sales_order_id:
+            order = SalesOrder.objects.select_for_update().get(pk=order.pk)
+            services.assert_order_has_no_invoice(order, exclude_id=serializer.instance.pk)
+        return super().perform_update(serializer)
 
     @action(detail=True, methods=["get"], url_path="discount-check")
     def discount_check(self, request, pk=None):
@@ -1471,15 +1692,61 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
             evaluation, req, number = self._discount_gate(draft)
             if req is not None:
                 return _approval_required_response("Sales Invoice", number, evaluation, req)
+        auto_dispatch = request.data.get("autoDispatchChallan")
+        if auto_dispatch is None:
+            auto_dispatch = True
+        else:
+            auto_dispatch = bool(auto_dispatch)
         invoice = services.finalize_invoice(
             draft,
             user=request.user,
             override_credit_limit=bool(request.data.get("overrideCreditLimit")),
+            auto_dispatch_challan=auto_dispatch,
         )
         self.write_audit(
             "finalize", invoice, description=f"Finalized as {invoice.invoice_number}"
         )
         return Response(self.get_serializer(invoice).data)
+
+    @action(detail=True, methods=["post"], url_path="request-credit-override")
+    def request_credit_override(self, request, pk=None):
+        """Ask an Owner to let this Draft through the credit limit. The approval
+        handler (approval_handlers.on_credit_limit_override) finalizes it."""
+        from apps.core.approval_services import raise_approval
+
+        invoice = self.get_object()
+        reason = str(request.data.get("reason") or "").strip()
+        if not reason:
+            raise ValidationFailed(
+                "Enter a business reason for the credit-limit approval.",
+                field_errors={"reason": ["This field is required."]},
+            )
+        if invoice.status != "Draft" or invoice.posted_at is not None:
+            raise Conflict("Only a Draft invoice can be sent for credit-limit approval.")
+        if invoice.party_id is None:
+            raise Conflict("The invoice has no customer to check a credit limit for.")
+        snapshot = services.credit_limit_snapshot(invoice.party, invoice.total)
+        label = invoice.invoice_number or f"Draft {str(invoice.id)[:8]}"
+        req = raise_approval(
+            client_id=invoice.client_id,
+            document_type="credit_limit_exceeded",
+            document_id=invoice.id,
+            document_number=label,
+            requested_by=request.user,
+            reason=reason,
+            approver_role_code="OWNER",
+            new_values={**snapshot, "invoiceId": str(invoice.id)},
+            variance_amount=D(snapshot["excess"]),
+            urgency="High",
+        )
+        self.write_audit(
+            "request_credit_override", invoice,
+            description=f"Credit-limit approval requested: {reason}",
+        )
+        return Response(
+            {"approvalRequestId": str(req.id), "status": req.status, **snapshot},
+            status=status.HTTP_202_ACCEPTED,
+        )
 
     @action(detail=True, methods=["post"])
     def cancel(self, request, pk=None):
@@ -1496,6 +1763,55 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
     @action(detail=True, methods=["get"])
     def outstanding(self, request, pk=None):
         return Response(services.invoice_outstanding(self.get_object()))
+
+    @action(detail=False, methods=["get"], url_path="payment-term-options")
+    def payment_term_options(self, request):
+        from .early_payment import PAYMENT_TERM_OPTIONS
+
+        return Response({"options": PAYMENT_TERM_OPTIONS})
+
+    @action(detail=True, methods=["post"], url_path="payment-terms")
+    def payment_terms(self, request, pk=None):
+        serializer = PaymentTermsChangeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        from .early_payment import change_payment_terms
+
+        invoice = change_payment_terms(
+            self.get_object(),
+            credit_days=data["credit_days"],
+            label=data.get("payment_terms"),
+            due_date=data.get("due_date"),
+            reason=data.get("reason"),
+            user=request.user,
+        )
+        return Response(self.get_serializer(invoice).data)
+
+    @action(detail=True, methods=["get"], url_path="terms-history")
+    def terms_history(self, request, pk=None):
+        invoice = self.get_object()
+        rows = AuditLog.objects.filter(
+            client_id=invoice.client_id,
+            entity_type="SalesInvoice",
+            entity_id=invoice.id,
+            action="payment_terms_change",
+        ).order_by("created_at", "id")
+        return Response(
+            envelope(
+                [
+                    {
+                        "action": row.action,
+                        "description": row.description,
+                        "actorName": row.actor_name,
+                        "before": row.before,
+                        "after": row.after,
+                        "reason": row.comments or row.description,
+                        "at": row.created_at.isoformat(),
+                    }
+                    for row in rows
+                ]
+            )
+        )
 
     @action(detail=True, methods=["post"], url_path="generate-irn")
     def generate_irn(self, request, pk=None):
@@ -1550,6 +1866,16 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
     def convert_to_challan(self, request, pk=None):
         """Direct convert invoice into delivery challan."""
         invoice = self.get_object()
+        if invoice.sales_order_id:
+            order = SalesOrder.objects.select_for_update().get(pk=invoice.sales_order_id)
+            existing = services.active_order_challan(order)
+            if existing is not None:
+                if invoice.delivery_challan_id == existing.id:
+                    return Response(
+                        DeliveryChallanSerializer(existing, context=self.get_serializer_context()).data,
+                        status=status.HTTP_200_OK,
+                    )
+                services.assert_order_has_no_challan(order)
         overrides = {"status": "Draft"}
         if invoice.sales_order_id:
             overrides["sales_order"] = invoice.sales_order
@@ -1575,6 +1901,297 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
     def e_invoice(self, request, pk=None):
         """IRN generator compatibility endpoint."""
         return self.generate_irn(request, pk=pk)
+
+
+# ---------------------------------------------------------------------------
+# Customer receivables and early-payment discounts
+# ---------------------------------------------------------------------------
+class ReceivablesViewSet(ReadOnlyTenantViewSet):
+    queryset = SalesInvoice.objects.select_related("party")
+    serializer_class = ReceivableRowSerializer
+    required_permissions = ["view_sales"]
+
+    def get_queryset(self):
+        return super().get_queryset().exclude(status__in=["Draft", "Cancelled"])
+
+    def filter_queryset(self, queryset):
+        params = self.request.query_params
+        customer_id = params.get("customerId")
+        status_filter = params.get("status")
+        search = (params.get("search") or "").strip()
+        if customer_id:
+            queryset = queryset.filter(party_id=customer_id)
+        if search:
+            queryset = queryset.filter(
+                Q(invoice_number__icontains=search) | Q(party__name__icontains=search)
+            )
+        for key, lookup in (("date_from", "gte"), ("date_to", "lte")):
+            raw = params.get(key)
+            if raw:
+                date_value = parse_date(raw)
+                if date_value is None:
+                    raise ValidationFailed(
+                        f"{key} must be an ISO date.",
+                        field_errors={key: ["Use YYYY-MM-DD."]},
+                    )
+                queryset = queryset.filter(**{f"doc_date__{lookup}": date_value})
+
+        today = timezone.localdate()
+        balance = ExpressionWrapper(
+            F("total") - F("amount_paid") - F("settlement_discount"),
+            output_field=MONEY,
+        )
+        queryset = queryset.annotate(_receivable_balance=balance)
+        if status_filter == "Overdue":
+            queryset = queryset.filter(due_date__lt=today, _receivable_balance__gt=0)
+        elif status_filter == "Due":
+            queryset = queryset.filter(due_date__gte=today, _receivable_balance__gt=0)
+        elif status_filter == "Paid":
+            queryset = queryset.filter(_receivable_balance__lte=0)
+        elif status_filter in ("Unpaid", "Partially Paid"):
+            queryset = queryset.filter(status=status_filter, _receivable_balance__gt=0)
+        return queryset
+
+    def get_aggregates(self, queryset):
+        client_id = self.get_client_id()
+        today = timezone.localdate()
+        if queryset is None:
+            queryset = self.get_queryset()
+        if not hasattr(queryset.query, "annotations") or "_receivable_balance" not in queryset.query.annotations:
+            queryset = queryset.annotate(
+                _receivable_balance=ExpressionWrapper(
+                    F("total") - F("amount_paid") - F("settlement_discount"),
+                    output_field=MONEY,
+                )
+            )
+        active = Q(_receivable_balance__gt=0)
+        invoice_totals = queryset.aggregate(
+            totalOutstanding=Coalesce(
+                Sum("_receivable_balance", filter=active),
+                Value(Decimal("0.00")),
+                output_field=MONEY,
+            ),
+            dueAmount=Coalesce(
+                Sum(
+                    "_receivable_balance",
+                    filter=active & Q(due_date__gte=today),
+                ),
+                Value(Decimal("0.00")),
+                output_field=MONEY,
+            ),
+            dueCount=Count("id", filter=active & Q(due_date__gte=today)),
+            overdueAmount=Coalesce(
+                Sum(
+                    "_receivable_balance",
+                    filter=active & Q(due_date__lt=today),
+                ),
+                Value(Decimal("0.00")),
+                output_field=MONEY,
+            ),
+            overdueCount=Count("id", filter=active & Q(due_date__lt=today)),
+            approvedDiscountAmount=Coalesce(
+                Sum("settlement_discount"),
+                Value(Decimal("0.00")),
+                output_field=MONEY,
+            ),
+        )
+        payments = PaymentIn.objects.filter(
+            client_id=client_id, status="Active", deleted_at__isnull=True
+        ).aggregate(
+            receivedAmount=Coalesce(Sum("amount"), Value(Decimal("0.00")), output_field=MONEY),
+            receivedCount=Count("id"),
+        )
+        discount_requests = EarlyPaymentDiscountRequest.objects.filter(
+            client_id=client_id, deleted_at__isnull=True
+        ).aggregate(
+            pendingDiscountCount=Count(
+                "id", filter=Q(status__in=["Draft", "Submitted", "Under Review"])
+            ),
+            pendingDiscountAmount=Coalesce(
+                Sum(
+                    "requested_amount",
+                    filter=Q(status__in=["Draft", "Submitted", "Under Review"]),
+                ),
+                Value(Decimal("0.00")),
+                output_field=MONEY,
+            ),
+            approvedDiscountCount=Count("id", filter=Q(status="Approved")),
+        )
+        return {**invoice_totals, **payments, **discount_requests}
+
+
+class EarlyPaymentDiscountRequestViewSet(TenantModelViewSet):
+    queryset = EarlyPaymentDiscountRequest.objects.select_related(
+        "party", "invoice", "payment", "requested_by", "decided_by", "credit_note"
+    )
+    serializer_class = EarlyPaymentDiscountRequestSerializer
+    http_method_names = ["get", "post", "patch", "head", "options"]
+    permission_map = {
+        "read": ["view_sales"],
+        "create": ["request_payment_discount"],
+        "update": ["request_payment_discount"],
+        "partial_update": ["request_payment_discount"],
+        "submit": ["request_payment_discount"],
+        "review": ["approve_payment_discount"],
+        "propose": ["approve_payment_discount"],
+        "approve": ["approve_payment_discount"],
+        "reject": ["approve_payment_discount"],
+        "cancel": [],
+        "history": ["view_sales"],
+    }
+
+    def filter_queryset(self, queryset):
+        params = self.request.query_params
+        for key, field in (("customerId", "party_id"), ("invoiceId", "invoice_id"), ("status", "status")):
+            value = params.get(key)
+            if value:
+                queryset = queryset.filter(**{field: value})
+        search = (params.get("search") or "").strip()
+        if search:
+            queryset = queryset.filter(
+                Q(request_number__icontains=search)
+                | Q(invoice_number__icontains=search)
+                | Q(party__name__icontains=search)
+            )
+        for key, lookup in (("date_from", "gte"), ("date_to", "lte")):
+            raw = params.get(key)
+            if raw:
+                date_value = parse_date(raw)
+                if date_value is None:
+                    raise ValidationFailed(
+                        f"{key} must be an ISO date.",
+                        field_errors={key: ["Use YYYY-MM-DD."]},
+                    )
+                queryset = queryset.filter(**{f"payment_date__{lookup}": date_value})
+        return queryset
+
+    def create(self, request, *args, **kwargs):
+        from . import early_payment
+
+        input_serializer = EarlyPaymentDiscountCreateSerializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
+        data = input_serializer.validated_data
+        invoice = SalesInvoice.objects.filter(
+            pk=data["invoice_id"], client_id=self.get_client_id(), deleted_at__isnull=True
+        ).first()
+        payment = PaymentIn.objects.filter(
+            pk=data["payment_id"], client_id=self.get_client_id(), deleted_at__isnull=True
+        ).first()
+        if invoice is None or payment is None:
+            raise NotFound("The selected invoice or receipt no longer exists.")
+        req = early_payment.create_request(
+            client=request.user.client,
+            invoice=invoice,
+            payment=payment,
+            requested_amount=data["requested_amount"],
+            customer_request_date=data.get("customer_request_date"),
+            reason=data["reason"],
+            notes=data.get("notes"),
+            attachments=data.get("attachments"),
+            submit=data.get("submit", False),
+            user=request.user,
+        )
+        return Response(
+            self.get_serializer(req).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    def update(self, request, *args, **kwargs):
+        return self.partial_update(request, *args, **kwargs)
+
+    def partial_update(self, request, *args, **kwargs):
+        from . import early_payment
+
+        req = self.get_object()
+        self.check_concurrency(req)
+        input_serializer = EarlyPaymentDiscountUpdateSerializer(
+            data=request.data, partial=True
+        )
+        input_serializer.is_valid(raise_exception=True)
+        updated = early_payment.update_request(
+            req, user=request.user, **input_serializer.validated_data
+        )
+        return Response(self.get_serializer(updated).data)
+
+    @action(detail=True, methods=["post"])
+    def submit(self, request, pk=None):
+        from . import early_payment
+
+        req = early_payment.submit_request(self.get_object(), user=request.user)
+        return Response(self.get_serializer(req).data)
+
+    @action(detail=True, methods=["post"])
+    def review(self, request, pk=None):
+        from . import early_payment
+
+        serializer = DiscountReviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        req = early_payment.start_review(
+            self.get_object(),
+            user=request.user,
+            comments=serializer.validated_data.get("comments"),
+        )
+        return Response(self.get_serializer(req).data)
+
+    @action(detail=True, methods=["post"])
+    def propose(self, request, pk=None):
+        from . import early_payment
+
+        serializer = DiscountProposeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        req = early_payment.propose_amount(
+            self.get_object(),
+            amount=serializer.validated_data["amount"],
+            reason=serializer.validated_data.get("reason"),
+            user=request.user,
+        )
+        return Response(self.get_serializer(req).data)
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        from . import early_payment
+
+        serializer = DiscountDecisionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        req = early_payment.approve_request(
+            self.get_object(),
+            user=request.user,
+            amount=serializer.validated_data.get("amount"),
+            reason=serializer.validated_data.get("reason"),
+        )
+        return Response(self.get_serializer(req).data)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        from . import early_payment
+
+        serializer = ReasonSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        req = early_payment.reject_request(
+            self.get_object(),
+            user=request.user,
+            reason=serializer.validated_data.get("reason"),
+        )
+        return Response(self.get_serializer(req).data)
+
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        from . import early_payment
+
+        serializer = ReasonSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        req = early_payment.cancel_request(
+            self.get_object(),
+            user=request.user,
+            reason=serializer.validated_data.get("reason"),
+        )
+        return Response(self.get_serializer(req).data)
+
+    @action(detail=True, methods=["get"])
+    def history(self, request, pk=None):
+        from .early_payment import request_history
+
+        return Response(envelope(request_history(self.get_object())))
 
 
 # ---------------------------------------------------------------------------
@@ -1626,7 +2243,6 @@ class PaymentInViewSet(TenantModelViewSet):
             mode=data["mode"],
             bank_account=data.get("bank_account"),
             reference_number=data.get("reference_number"),
-            transaction_reference=data.get("transaction_reference"),
             notes=data.get("notes"),
             allocations=allocations,
             invoice=invoice,
@@ -1799,16 +2415,6 @@ class SalesReturnViewSet(PostedReturnGuardMixin, SalesDocumentViewSet):
             line.save(update_fields=[
                 "qty", "rate", "discount_pct", "tax_pct", "item", "uom", "uom_factor", "updated_at",
             ])
-
-            if stock.normalize_condition(line.condition or "Hold") != "Hold":
-                # Any condition but Hold is a QC decision (Good puts the goods
-                # straight back into usable stock); only QC may make it.
-                from apps.core.permissions import require_permission
-
-                require_permission(
-                    self.request.user, "approve_qc",
-                    "Returned goods go to QC Hold; only QC can accept, regrade or reject them on receipt.",
-                )
 
             if line.item_id and line.item.holds_stock and location_id:
                 # Phase 1.4: route by condition (Good -> return location,
@@ -1989,7 +2595,10 @@ class WarrantyCardViewSet(TenantModelViewSet):
 
 
 class BrokerCommissionViewSet(TenantModelViewSet):
-    queryset = BrokerCommission.objects.select_related("broker", "invoice", "party", "salesperson")
+    queryset = BrokerCommission.objects.select_related(
+        "broker", "invoice", "invoice__sales_order__crm_lead",
+        "invoice__sales_order__quotation__crm_lead", "party", "salesperson",
+    )
     serializer_class = BrokerCommissionSerializer
     required_permissions = ["view_sales"]
     # Reading needs view_sales; changing or settling a commission needs
@@ -1999,9 +2608,22 @@ class BrokerCommissionViewSet(TenantModelViewSet):
     audit_label_field = "commission_number"
     filter_map = {
         "brokerId": "broker_id",
+        "broker_id": "broker_id",
         "invoiceId": "invoice_id",
+        "invoice_id": "invoice_id",
         "status": "status",
     }
+
+    def _include_test_data(self):
+        return self.request.query_params.get("includeTestData") in ("1", "true")
+
+    def get_queryset(self):
+        """Every register, statement and analytic reads this one set: live
+        commissions, test data left out unless ``includeTestData=1``."""
+        queryset = super().get_queryset()
+        if self.action not in ("retrieve", "pay", "approve", "make_payable") and not self._include_test_data():
+            queryset = queryset.filter(is_test_data=False)
+        return queryset
 
     def perform_update(self, serializer):
         """Status and amount move only through the actions below, and a new
@@ -2097,6 +2719,9 @@ class BrokerCommissionViewSet(TenantModelViewSet):
             client_id=client_id,
             deleted_at__isnull=True,
         ).select_related("stage", "source", "party", "owner", "lost_reason").order_by("-is_pinned", "-created_at")
+        if not self._include_test_data():
+            leads_qs = leads_qs.filter(is_test_data=False)
+        commission_set = self.get_queryset()
 
         broker_id_filter = request.query_params.get("brokerId") or request.query_params.get("broker_id")
         status_filter = request.query_params.get("status")
@@ -2105,7 +2730,8 @@ class BrokerCommissionViewSet(TenantModelViewSet):
         results = []
         for lead in leads_qs:
             cv = lead.custom_values or {}
-            lead_broker_id = cv.get("broker_id") or cv.get("brokerId")
+            fields = cv.get("fields") if isinstance(cv, dict) and isinstance(cv.get("fields"), dict) else {}
+            lead_broker_id = cv.get("broker_id") or cv.get("brokerId") or fields.get("broker_id") or fields.get("brokerId")
             source_name = (lead.source.name if lead.source else "") or ""
             is_broker_lead = bool(lead_broker_id or cv.get("broker_name") or cv.get("brokerName") or source_name.lower() == "broker")
             if not is_broker_lead:
@@ -2139,7 +2765,10 @@ class BrokerCommissionViewSet(TenantModelViewSet):
 
             # Check linked quotations, orders, invoices
             linked_quotations = []
-            for q in Quotation.objects.filter(client_id=client_id, crm_lead=lead).only("id", "quotation_number", "doc_date", "total", "status"):
+            quote_qs = Quotation.objects.filter(client_id=client_id).filter(
+                Q(crm_lead=lead) | Q(crm_deal__lead=lead)
+            ).only("id", "quotation_number", "doc_date", "total", "status")
+            for q in quote_qs:
                 linked_quotations.append({
                     "id": str(q.id),
                     "number": q.quotation_number,
@@ -2150,7 +2779,9 @@ class BrokerCommissionViewSet(TenantModelViewSet):
 
             linked_orders = []
             q_ids = [q["id"] for q in linked_quotations]
-            for so in SalesOrder.objects.filter(client_id=client_id, quotation_id__in=q_ids).only("id", "order_number", "doc_date", "total", "stage"):
+            for so in SalesOrder.objects.filter(
+                Q(quotation_id__in=q_ids) | Q(crm_lead=lead), client_id=client_id, deleted_at__isnull=True,
+            ).only("id", "order_number", "doc_date", "total", "stage"):
                 linked_orders.append({
                     "id": str(so.id),
                     "number": so.order_number,
@@ -2161,7 +2792,9 @@ class BrokerCommissionViewSet(TenantModelViewSet):
 
             linked_invoices = []
             so_ids = [so["id"] for so in linked_orders]
-            for inv in SalesInvoice.objects.filter(client_id=client_id, sales_order_id__in=so_ids).only("id", "invoice_number", "doc_date", "total", "status"):
+            for inv in SalesInvoice.objects.filter(
+                client_id=client_id, sales_order_id__in=so_ids, deleted_at__isnull=True,
+            ).only("id", "invoice_number", "doc_date", "total", "status"):
                 linked_invoices.append({
                     "id": str(inv.id),
                     "number": inv.invoice_number,
@@ -2172,16 +2805,18 @@ class BrokerCommissionViewSet(TenantModelViewSet):
 
             # Check linked commission
             inv_ids = [inv["id"] for inv in linked_invoices]
-            linked_commissions = BrokerCommission.objects.filter(client_id=client_id, invoice_id__in=inv_ids)
+            linked_commissions = commission_set.filter(invoice_id__in=inv_ids)
             total_comm_earned = ZERO
             total_comm_paid = ZERO
             comm_status = "Unearned (In Pipeline)"
-            if linked_commissions.exists():
+            if lead.stage and lead.stage.is_lost:
+                total_comm_earned = ZERO
+                total_comm_paid = ZERO
+                comm_status = "Lost Deal (No Commission)"
+            elif linked_commissions.exists():
                 total_comm_earned = linked_commissions.aggregate(val=Sum("commission_amount"))["val"] or ZERO
                 total_comm_paid = linked_commissions.aggregate(val=Sum("paid_amount"))["val"] or ZERO
                 comm_status = linked_commissions.first().status
-            elif lead.stage and lead.stage.is_lost:
-                comm_status = "Lost Deal (No Commission)"
 
             text_pool = f"{lead.lead_number} {lead.name} {party_name} {broker_name} {fabric_quality}".lower()
             if search and search not in text_pool:
@@ -2226,9 +2861,11 @@ class BrokerCommissionViewSet(TenantModelViewSet):
 
         client_id = self.get_client_id()
         brokers = Broker.objects.filter(client_id=client_id, deleted_at__isnull=True)
-        commissions = BrokerCommission.objects.filter(client_id=client_id)
+        commissions = self.get_queryset()
 
         all_leads = Lead.objects.filter(client_id=client_id, deleted_at__isnull=True).select_related("stage", "source")
+        if not self._include_test_data():
+            all_leads = all_leads.filter(is_test_data=False)
         broker_leads = []
         for l in all_leads:
             cv = l.custom_values or {}
@@ -2374,287 +3011,3 @@ class PartyDiscountViewSet(TenantModelViewSet):
             })
         results.sort(key=lambda x: Decimal(x["totalDiscount"]), reverse=True)
         return Response({"year": year, "parties": results})
-
-
-# ---------------------------------------------------------------------------
-# Early payment discounts and the receivables dashboard
-# ---------------------------------------------------------------------------
-def _parse_date(value, field):
-    from datetime import date as date_cls
-
-    if not value:
-        return None
-    try:
-        return date_cls.fromisoformat(str(value)[:10])
-    except ValueError:
-        raise ValidationFailed("Enter dates as YYYY-MM-DD.", field_errors={field: ["Invalid date."]})
-
-
-class EarlyPaymentDiscountRequestViewSet(TenantModelViewSet):
-    """``/sales/discount-requests/`` -- early payment discount requests.
-
-    Writes are the workflow actions (``early_payment``); a row is never edited
-    after it leaves Draft, and never deleted.
-    """
-
-    queryset = EarlyPaymentDiscountRequest.objects.select_related(
-        "party", "payment", "invoice", "requested_by", "reviewed_by", "decided_by",
-        "cancelled_by", "credit_note",
-    )
-    serializer_class = EarlyPaymentDiscountRequestSerializer
-    audit_entity_type = "EarlyPaymentDiscountRequest"
-    status_field = "status"
-    default_date_field = "payment_date"
-    allowed_date_fields = ("payment_date", "created_at", "decided_at", "invoice_date")
-    search_fields = ["request_number", "invoice_number", "party__name"]
-    ordering = ["-created_at"]
-    filter_map = {"customerId": "party_id", "invoiceId": "invoice_id", "paymentId": "payment_id"}
-    http_method_names = ["get", "post", "patch", "head", "options"]
-    permission_map = {
-        "read": ["view_sales"],
-        "create": ["request_payment_discount"],
-        "partial_update": ["request_payment_discount"],
-        "submit": ["request_payment_discount"],
-        "review": ["approve_payment_discount"],
-        "propose": ["approve_payment_discount"],
-        "approve": ["approve_payment_discount"],
-        "reject": ["approve_payment_discount"],
-        # The requester may withdraw their own; early_payment.cancel_request checks.
-        "cancel": ["view_sales"],
-    }
-
-    def get_aggregates(self, queryset):
-        rows = queryset.aggregate(
-            count=Count("id"),
-            requested=money_sum("requested_amount"),
-            approved=money_sum("approved_amount", filter=Q(status="Approved")),
-            pending=Count("id", filter=Q(status__in=["Submitted", "Under Review"])),
-            draft=Count("id", filter=Q(status="Draft")),
-        )
-        return rows
-
-    def _respond(self, req, code=status.HTTP_200_OK):
-        req.refresh_from_db()
-        return Response(self.get_serializer(req).data, status=code)
-
-    def create(self, request, *args, **kwargs):
-        from .early_payment import create_request
-
-        data = request.data or {}
-        client_id = self.get_client_id()
-        invoice = SalesInvoice.objects.filter(
-            pk=data.get("invoiceId"), client_id=client_id, deleted_at__isnull=True
-        ).first()
-        if invoice is None:
-            raise ValidationFailed("Choose the invoice.", field_errors={"invoiceId": ["Not found."]})
-        payment = PaymentIn.objects.filter(
-            pk=data.get("paymentId"), client_id=client_id, deleted_at__isnull=True
-        ).first()
-        if payment is None:
-            raise ValidationFailed("Choose the receipt the customer paid with.", field_errors={"paymentId": ["Not found."]})
-        req = create_request(
-            client=request.user.client,
-            invoice=invoice,
-            payment=payment,
-            requested_amount=data.get("requestedAmount"),
-            reason=data.get("reason"),
-            customer_request_date=_parse_date(data.get("customerRequestDate"), "customerRequestDate"),
-            notes=data.get("notes"),
-            attachments=data.get("attachments") or [],
-            submit=bool(data.get("submit")),
-            user=request.user,
-        )
-        return self._respond(req, status.HTTP_201_CREATED)
-
-    def partial_update(self, request, *args, **kwargs):
-        from .early_payment import update_request
-
-        data = request.data or {}
-        changes = {}
-        if "requestedAmount" in data:
-            changes["requested_amount"] = data.get("requestedAmount")
-        if "reason" in data:
-            changes["reason"] = data.get("reason")
-        if "notes" in data:
-            changes["notes"] = data.get("notes")
-        if "customerRequestDate" in data:
-            changes["customer_request_date"] = _parse_date(data.get("customerRequestDate"), "customerRequestDate")
-        if "attachments" in data:
-            changes["attachments"] = data.get("attachments") or []
-        req = self.get_object()
-        if req.requested_by_id and req.requested_by_id != request.user.id and not request.user.is_superuser:
-            from apps.core.exceptions import PermissionDenied
-
-            raise PermissionDenied("Only the person who raised this draft can edit it.")
-        return self._respond(update_request(req, user=request.user, **changes))
-
-    def update(self, request, *args, **kwargs):
-        return self.partial_update(request, *args, **kwargs)
-
-    @action(detail=True, methods=["post"])
-    def submit(self, request, pk=None):
-        from .early_payment import submit_request
-
-        return self._respond(submit_request(self.get_object(), user=request.user))
-
-    @action(detail=True, methods=["post"])
-    def review(self, request, pk=None):
-        from .early_payment import start_review
-
-        data = request.data or {}
-        return self._respond(start_review(
-            self.get_object(), user=request.user,
-            proposed_amount=data.get("proposedAmount"), comments=data.get("comments"),
-        ))
-
-    @action(detail=True, methods=["post"])
-    def propose(self, request, pk=None):
-        from .early_payment import propose_amount
-
-        data = request.data or {}
-        return self._respond(propose_amount(
-            self.get_object(), amount=data.get("proposedAmount"), reason=data.get("reason"), user=request.user,
-        ))
-
-    @action(detail=True, methods=["post"])
-    def approve(self, request, pk=None):
-        from .early_payment import approve_request
-
-        data = request.data or {}
-        return self._respond(approve_request(
-            self.get_object(), user=request.user, amount=data.get("approvedAmount"), reason=data.get("reason"),
-        ))
-
-    @action(detail=True, methods=["post"])
-    def reject(self, request, pk=None):
-        from .early_payment import reject_request
-
-        return self._respond(reject_request(self.get_object(), user=request.user, reason=(request.data or {}).get("reason")))
-
-    @action(detail=True, methods=["post"])
-    def cancel(self, request, pk=None):
-        from .early_payment import cancel_request
-
-        return self._respond(cancel_request(self.get_object(), user=request.user, reason=(request.data or {}).get("reason")))
-
-    @action(detail=True, methods=["get"])
-    def history(self, request, pk=None):
-        from .early_payment import request_history
-
-        return Response({"results": request_history(self.get_object())})
-
-
-class ReceivablesView(APIView):
-    """``GET /sales/receivables/`` -- the customer payments dashboard.
-
-    KPIs plus one row per finalized invoice: terms, due date, invoice amount,
-    money received, approved discount and what is still outstanding.
-
-    Query: ``customerId``, ``search`` (invoice no. / customer), ``date_from`` /
-    ``date_to`` (invoice date), ``status`` (Unpaid | Partially Paid | Paid |
-    Due | Overdue), ``page``, ``page_size``.
-    """
-
-    permission_classes = [HasModulePermission]
-    required_permissions = ["view_sales"]
-
-    def get(self, request):
-        from django.db.models import ExpressionWrapper
-
-        params = request.query_params
-        client_id = request.client_id
-        today = timezone.localdate()
-        money = DecimalField(max_digits=18, decimal_places=2)
-        outstanding = ExpressionWrapper(
-            F("total") - F("amount_paid") - F("settlement_discount"), output_field=money
-        )
-
-        scope = SalesInvoice.objects.filter(
-            client_id=client_id, deleted_at__isnull=True, posted_at__isnull=False,
-        ).exclude(status__in=["Draft", "Cancelled"]).annotate(open_balance=outstanding)
-        if params.get("customerId"):
-            scope = scope.filter(party_id=params["customerId"])
-        date_from = _parse_date(params.get("date_from"), "date_from")
-        date_to = _parse_date(params.get("date_to"), "date_to")
-        if date_from:
-            scope = scope.filter(doc_date__gte=date_from)
-        if date_to:
-            scope = scope.filter(doc_date__lte=date_to)
-        search = (params.get("search") or "").strip()
-        if search:
-            scope = scope.filter(Q(invoice_number__icontains=search) | Q(party_name__icontains=search))
-
-        open_rows = scope.filter(open_balance__gt=0)
-        due_q = Q(due_date__gte=today) | Q(due_date__isnull=True)
-        kpi = open_rows.aggregate(
-            totalOutstanding=money_sum("open_balance"),
-            dueAmount=money_sum("open_balance", filter=due_q),
-            dueCount=Count("id", filter=due_q),
-            overdueAmount=money_sum("open_balance", filter=Q(due_date__lt=today)),
-            overdueCount=Count("id", filter=Q(due_date__lt=today)),
-        )
-        receipts = PaymentIn.objects.filter(client_id=client_id, status="Active", deleted_at__isnull=True)
-        discounts = EarlyPaymentDiscountRequest.objects.filter(client_id=client_id, deleted_at__isnull=True)
-        if params.get("customerId"):
-            receipts = receipts.filter(party_id=params["customerId"])
-            discounts = discounts.filter(party_id=params["customerId"])
-        if date_from:
-            receipts = receipts.filter(payment_date__gte=date_from)
-            discounts = discounts.filter(payment_date__gte=date_from)
-        if date_to:
-            receipts = receipts.filter(payment_date__lte=date_to)
-            discounts = discounts.filter(payment_date__lte=date_to)
-        kpi.update(receipts.aggregate(receivedAmount=money_sum("amount"), receivedCount=Count("id")))
-        kpi.update(discounts.aggregate(
-            pendingDiscountCount=Count("id", filter=Q(status__in=["Submitted", "Under Review"])),
-            pendingDiscountAmount=money_sum("requested_amount", filter=Q(status__in=["Submitted", "Under Review"])),
-            approvedDiscountCount=Count("id", filter=Q(status="Approved")),
-            approvedDiscountAmount=money_sum("approved_amount", filter=Q(status="Approved")),
-        ))
-
-        rows = scope
-        wanted = params.get("status")
-        if wanted == "Overdue":
-            rows = rows.filter(open_balance__gt=0, due_date__lt=today)
-        elif wanted == "Due":
-            rows = rows.filter(due_q, open_balance__gt=0)
-        elif wanted in ("Unpaid", "Partially Paid", "Paid"):
-            rows = rows.filter(status=wanted)
-        rows = rows.order_by("due_date", "-doc_date", "id")
-
-        try:
-            page = max(1, int(params.get("page") or 1))
-            page_size = min(200, max(1, int(params.get("page_size") or 25)))
-        except ValueError:
-            page, page_size = 1, 25
-        count = rows.count()
-        chunk = list(rows.select_related("party")[(page - 1) * page_size: page * page_size])
-        pending = dict(
-            EarlyPaymentDiscountRequest.objects.filter(
-                client_id=client_id, invoice_id__in=[i.id for i in chunk],
-                status__in=["Draft", "Submitted", "Under Review"], deleted_at__isnull=True,
-            ).values("invoice_id").annotate(n=Count("id")).values_list("invoice_id", "n")
-        )
-        results = []
-        for inv in chunk:
-            balance = services.invoice_balance(inv)
-            due = inv.due_date
-            results.append({
-                "id": str(inv.id),
-                "invoiceNumber": inv.invoice_number,
-                "customerId": str(inv.party_id) if inv.party_id else None,
-                "customerName": inv.party_name or getattr(inv.party, "name", ""),
-                "invoiceDate": inv.doc_date,
-                "dueDate": due,
-                "paymentTerms": inv.payment_terms,
-                "creditDays": inv.credit_days,
-                "invoiceAmount": round2(inv.total),
-                "paidAmount": round2(inv.amount_paid),
-                "approvedDiscount": round2(inv.settlement_discount),
-                "outstandingAmount": balance,
-                "customerCredit": round2(max(D(inv.amount_paid) + D(inv.settlement_discount) - D(inv.total), ZERO)),
-                "paymentStatus": services.display_status(inv),
-                "daysOverdue": (today - due).days if due and due < today and balance > ZERO else 0,
-                "openDiscountRequests": pending.get(inv.id, 0),
-            })
-        return Response(envelope(results, count=count, page=page, page_size=page_size, aggregates=kpi))

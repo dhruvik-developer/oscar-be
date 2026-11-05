@@ -1,5 +1,6 @@
 """Approval decisions for sales documents (see core.approval_services)."""
 from apps.core.approval_services import approval_handler, document_uuid
+from apps.core.exceptions import BusinessRuleViolation, Conflict
 from apps.sales.discount_control import APPROVAL_TYPES
 
 PENDING = "Pending Approval"
@@ -12,6 +13,50 @@ def on_brokerage_rate_change(req, decision):
 
     if decision == "Approved" and document_uuid(req) is not None:
         broker_services.apply_rate_change(req)
+
+
+@approval_handler("credit_limit_exceeded")
+def on_credit_limit_override(req, decision):
+    """Finalize the same Draft only after an authorized credit approval."""
+    if decision != "Approved":
+        return
+
+    from decimal import Decimal
+
+    from apps.sales import services
+    from apps.sales.models import SalesInvoice
+
+    invoice_id = document_uuid(req)
+    if invoice_id is None:
+        raise Conflict("The credit approval is not linked to a valid invoice.")
+    invoice = SalesInvoice.objects.select_for_update().filter(
+        client_id=req.client_id, id=invoice_id, deleted_at__isnull=True
+    ).first()
+    if invoice is None or invoice.status != "Draft" or invoice.posted_at is not None:
+        raise Conflict("The approved Draft invoice is no longer available to finalize.")
+
+    approved_values = req.new_values or {}
+    approved_amount = Decimal(str(approved_values.get("currentInvoiceAmount", "0")))
+    approved_exposure = Decimal(str(approved_values.get("projectedExposure", "0")))
+    approved_limit = Decimal(str(approved_values.get("creditLimit", "0")))
+    current_snapshot = services.credit_limit_snapshot(invoice.party, invoice.total)
+    if (
+        Decimal(current_snapshot["currentInvoiceAmount"]) != approved_amount
+        or Decimal(current_snapshot["projectedExposure"]) > approved_exposure
+        or Decimal(current_snapshot["creditLimit"]) < approved_limit
+    ):
+        raise BusinessRuleViolation(
+            "The invoice or credit exposure changed after approval was requested. "
+            "Request a new credit approval.",
+            code="CREDIT_APPROVAL_STALE",
+            payload={"approved": approved_values, "current": current_snapshot},
+        )
+
+    services.finalize_invoice(
+        invoice,
+        user=req.decided_by,
+        override_credit_limit=True,
+    )
 
 
 @approval_handler(*APPROVAL_TYPES)

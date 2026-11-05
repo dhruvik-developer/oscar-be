@@ -43,6 +43,7 @@ from apps.inventory.models import RELEASED_QC_STATUSES
 from apps.masters import uom
 
 from .models import (
+    CHALLAN_BILLABLE_STATUSES,
     NON_RESERVING_STAGES,
     DeliveryChallan,
     EarlyPaymentDiscountRequest,
@@ -211,44 +212,69 @@ def party_credit_exposure(party):
     return round2(D(party.balance) + D(open_orders)), open_orders
 
 
+def credit_limit_snapshot(party, additional_amount):
+    """Return the figures used by the credit gate in a UI-friendly shape."""
+    current_exposure, open_orders = party_credit_exposure(party)
+    requested = round2(additional_amount)
+    projected = round2(current_exposure + requested)
+    limit = round2(party.credit_limit or ZERO)
+    return {
+        "partyId": str(party.id),
+        "customerName": party.name,
+        "creditLimit": str(limit),
+        "currentOutstanding": str(round2(party.balance)),
+        "openOrders": str(round2(open_orders)),
+        "currentExposure": str(current_exposure),
+        "requested": str(requested),
+        "currentInvoiceAmount": str(requested),
+        "exposure": str(projected),
+        "projectedExposure": str(projected),
+        "excess": str(round2(max(ZERO, projected - limit))),
+    }
+
+
 def assert_credit_limit(party, additional_amount, *, user=None, override=False):
     """422 CREDIT_LIMIT_EXCEEDED unless the caller holds the override permission
     **and** passes ``{"overrideCreditLimit": true}``.
 
     Checked against the derived balance plus open unbilled orders (db.md §4.1).
     """
+    party = party.__class__.objects.select_for_update().get(pk=party.pk)
     limit = party.credit_limit
     has_limit = limit is not None and D(limit) > ZERO
 
     # Check overdue invoices (PDF §11, §14)
-    if not (override and user is not None and has_permission(user, "override_credit_limit")):
-        today = timezone.localdate()
-        credit_days_allowed = getattr(party, "credit_days", 30) or 30
-        overdue_invoices = SalesInvoice.objects.filter(
-            client_id=party.client_id,
-            party_id=party.id,
-            status__in=["Unpaid", "Partially Paid"],
-            deleted_at__isnull=True,
-            due_date__lt=today,
-        )
-        for inv in overdue_invoices:
-            days_over = (today - inv.due_date).days
-            if days_over > credit_days_allowed:
-                raise BusinessRuleViolation(
-                    f"{party.name} has overdue invoice {inv.invoice_number} by {days_over} days (credit term {credit_days_allowed} days).",
-                    code="PAYMENT_OVERDUE",
-                    payload={"partyId": str(party.id), "overdueDays": days_over, "invoiceId": str(inv.id)},
-                )
+    today = timezone.localdate()
+    credit_days_allowed = getattr(party, "credit_days", 30) or 30
+    overdue_invoices = SalesInvoice.objects.filter(
+        client_id=party.client_id,
+        party_id=party.id,
+        status__in=["Unpaid", "Partially Paid"],
+        deleted_at__isnull=True,
+        due_date__lt=today,
+    )
+    for inv in overdue_invoices:
+        days_over = (today - inv.due_date).days
+        if days_over > credit_days_allowed:
+            raise BusinessRuleViolation(
+                f"{party.name} has overdue invoice {inv.invoice_number} by {days_over} days (credit term {credit_days_allowed} days).",
+                code="PAYMENT_OVERDUE",
+                payload={"partyId": str(party.id), "overdueDays": days_over, "invoiceId": str(inv.id)},
+            )
 
     if not has_limit:
         return
 
-    current_exposure, open_orders = party_credit_exposure(party)
-    exposure = round2(current_exposure + D(additional_amount))
+    snapshot = credit_limit_snapshot(party, additional_amount)
+    exposure = D(snapshot["projectedExposure"])
     if exposure <= D(limit):
         return
 
-    if override and user is not None and has_permission(user, "override_credit_limit"):
+    if override and user is not None and (
+        has_permission(user, "override_credit_limit")
+        or getattr(user, "is_superuser", False)
+        or getattr(user, "is_staff", False)
+    ):
         return
 
     raise BusinessRuleViolation(
@@ -256,12 +282,8 @@ def assert_credit_limit(party, additional_amount, *, user=None, override=False):
         f"Limit {round2(limit)}, exposure would be {exposure}.",
         code=Codes.CREDIT_LIMIT_EXCEEDED,
         payload={
-            "partyId": str(party.id),
-            "creditLimit": str(round2(limit)),
-            "currentBalance": str(round2(party.balance)),
-            "openOrders": str(round2(open_orders)),
-            "requested": str(round2(additional_amount)),
-            "exposure": str(exposure),
+            **snapshot,
+            "currentBalance": snapshot["currentOutstanding"],
         },
     )
 
@@ -405,6 +427,49 @@ def fill_salesperson(document):
     return True
 
 
+def fill_broker(document):
+    """Carry the broker already assigned upstream onto a sales document.
+
+    Inherits from the order / quotation / challan the document came from, else
+    the broker the CRM lead was attributed to. Never invents one (no party
+    default) and never overwrites a broker already on the document. Returns
+    True when it set one.
+    """
+    if getattr(document, "broker_fk_id", None) or (getattr(document, "broker", None) or "").strip():
+        return False
+    from .broker_services import _broker_from_lead
+    from .models import order_lead
+
+    broker = next(
+        (
+            source.broker_fk
+            for source in (
+                getattr(document, "sales_order", None),
+                getattr(document, "quotation", None),
+                getattr(document, "delivery_challan", None),
+            )
+            if source is not None and getattr(source, "broker_fk_id", None)
+        ),
+        None,
+    )
+    if broker is None:
+        lead = (
+            getattr(document, "crm_lead", None)
+            or (getattr(document, "crm_deal", None).lead if getattr(document, "crm_deal", None) else None)
+            or order_lead(document)
+            or order_lead(getattr(document, "sales_order", None))
+            or order_lead(getattr(document, "delivery_challan", None))
+        )
+        if lead is not None:
+            broker = _broker_from_lead(lead, lead.custom_values or {})
+    if broker is None:
+        return False
+    document.broker_fk = broker
+    document.broker = broker.name
+    document.save(update_fields=["broker_fk", "broker", "updated_at"])
+    return True
+
+
 def invoice_outstanding(invoice):
     """``GET /sales/invoices/{id}/outstanding/`` (api.md §5.7)."""
     from apps.core.money import ageing_bucket, days_overdue, effective_due_date
@@ -448,7 +513,7 @@ def display_status(invoice):
 # Finalization (api.md §5.7)
 # ---------------------------------------------------------------------------
 @transaction.atomic
-def finalize_invoice(invoice, *, user=None, override_credit_limit=False):
+def finalize_invoice(invoice, *, user=None, override_credit_limit=False, auto_dispatch_challan=True):
     """Draft -> Unpaid, in one transaction (api.md §5.7).
 
     1. Allocate the invoice number.
@@ -457,7 +522,43 @@ def finalize_invoice(invoice, *, user=None, override_credit_limit=False):
     4. Post the accounting entry: Dr Debtors, Cr Sales, Cr GST payable.
     5. Update party balance and the order's ``invoiced_qty``.
     """
+    invoice_snapshot = SalesInvoice.objects.only(
+        "sales_order_id", "delivery_challan_id"
+    ).get(pk=invoice.pk)
+    challan_snapshot = None
+    if invoice_snapshot.delivery_challan_id:
+        challan_snapshot = DeliveryChallan.objects.only("sales_order_id").get(
+            pk=invoice_snapshot.delivery_challan_id
+        )
+    order_id = invoice_snapshot.sales_order_id or (
+        challan_snapshot.sales_order_id if challan_snapshot is not None else None
+    )
+    if order_id:
+        SalesOrder.objects.select_for_update().get(pk=order_id)
+
+    challan = None
+    if invoice_snapshot.delivery_challan_id:
+        challan = DeliveryChallan.objects.select_for_update().get(
+            pk=invoice_snapshot.delivery_challan_id
+        )
+        if (
+            challan_snapshot is not None
+            and challan.sales_order_id != challan_snapshot.sales_order_id
+        ):
+            raise Conflict(
+                "The linked delivery challan changed during finalization. Refresh and retry.",
+                code=Codes.ALREADY_DONE,
+            )
+
     invoice = SalesInvoice.objects.select_for_update().get(pk=invoice.pk)
+    if (
+        invoice.sales_order_id != invoice_snapshot.sales_order_id
+        or invoice.delivery_challan_id != invoice_snapshot.delivery_challan_id
+    ):
+        raise Conflict(
+            "The invoice links changed during finalization. Refresh and retry.",
+            code=Codes.ALREADY_DONE,
+        )
 
     if invoice.status == "Cancelled":
         raise Conflict(
@@ -467,6 +568,17 @@ def finalize_invoice(invoice, *, user=None, override_credit_limit=False):
         raise Conflict(
             "This invoice has already been finalized.", code=Codes.ALREADY_FINALIZED
         )
+
+    if challan is not None:
+        if challan.status not in CHALLAN_BILLABLE_STATUSES or challan.posted_at is None:
+            if auto_dispatch_challan and challan.status == "Draft":
+                challan = dispatch_challan(challan, user=user)
+            else:
+                raise BusinessRuleViolation(
+                    "Dispatch the linked delivery challan before finalizing this invoice.",
+                    code="NOT_DISPATCHED",
+                    payload={"challanId": str(challan.id), "challanStatus": challan.status},
+                )
 
     lines = list(invoice.line_items.select_related("item").all())
     if not lines:
@@ -509,6 +621,7 @@ def finalize_invoice(invoice, *, user=None, override_credit_limit=False):
         _advance_order_stage(invoice.sales_order)
 
     # 6. Broker commission calculation (PDF §12)
+    fill_broker(invoice)
     from .broker_services import calculate_broker_commission
     calculate_broker_commission(invoice, user=user)
 
@@ -521,7 +634,13 @@ def _post_invoice_stock(invoice, lines, *, user=None):
     A line already dispatched on a challan has moved its stock; matching on the
     source order line is what makes that check reliable.
     """
-    location_id = invoice.location_id or _default_location_id(invoice.client_id)
+    location_id = invoice.location_id
+    if location_id:
+        from apps.masters.models import Location
+        if not Location.objects.filter(pk=location_id, is_active=True, deleted_at__isnull=True).exists():
+            location_id = None
+    if not location_id:
+        location_id = _default_location_id(invoice.client_id)
 
     for line in lines:
         if line.item_id is None or not line.item.holds_stock:
@@ -765,6 +884,33 @@ def _default_location_id(client_id):
         .first()
     )
     if location_id is None:
+        location_id = (
+            Location.objects.filter(
+                client_id=client_id, is_active=True, deleted_at__isnull=True, type__in=["Warehouse", "Godown", "Zone"]
+            )
+            .values_list("id", flat=True)
+            .first()
+        )
+    if location_id is None:
+        location_id = (
+            Location.objects.filter(
+                client_id=client_id, is_active=True, deleted_at__isnull=True
+            )
+            .values_list("id", flat=True)
+            .first()
+        )
+    if location_id is None:
+        from apps.accounts.models import Client
+        client = Client.objects.filter(pk=client_id).first() if client_id else Client.objects.first()
+        if client:
+            wh = Location.objects.create(
+                client=client,
+                code="WH-MAIN",
+                name="Main Warehouse",
+                type="Warehouse",
+                is_active=True,
+            )
+            return wh.id
         raise BusinessRuleViolation(
             "No warehouse is configured for this workspace.",
             code="NO_LOCATION",
@@ -814,7 +960,15 @@ def _advance_order_stage(order):
 @transaction.atomic
 def dispatch_challan(challan, *, user=None):
     """Posts ``SALE`` movements (negative qty) and consumes the selected serials."""
+    snapshot = DeliveryChallan.objects.only("sales_order_id").get(pk=challan.pk)
+    if snapshot.sales_order_id:
+        SalesOrder.objects.select_for_update().get(pk=snapshot.sales_order_id)
     challan = DeliveryChallan.objects.select_for_update().get(pk=challan.pk)
+    if challan.sales_order_id != snapshot.sales_order_id:
+        raise Conflict(
+            "The Sales Order link changed during dispatch. Refresh and retry.",
+            code=Codes.ALREADY_DONE,
+        )
     if challan.status == "Cancelled":
         raise Conflict("This challan has been cancelled.", code=Codes.ALREADY_CANCELLED)
     if challan.posted_at is not None:
@@ -907,7 +1061,7 @@ def derive_order_stage(order):
     Fully Dispatched; something dispatched -> Partially Dispatched; else
     Confirmed.
     """
-    if order.stage in ("Draft", "Pending Approval", "Cancelled", "Closed"):
+    if order.stage in ("Pending Approval", "Cancelled", "Closed"):
         return order.stage
     lines = list(order.line_items.filter(deleted_at__isnull=True))
     if not lines:
@@ -932,6 +1086,52 @@ def recompute_order_stage(order):
 
 def _advance_order_after_dispatch(order):
     return recompute_order_stage(order)
+
+
+# ---------------------------------------------------------------------------
+# One invoice / one challan per sales order
+# ---------------------------------------------------------------------------
+def active_order_invoice(order, *, exclude_id=None):
+    """The order's live invoice (any status but Cancelled), if it has one."""
+    qs = order.invoices.filter(deleted_at__isnull=True).exclude(status="Cancelled")
+    if exclude_id:
+        qs = qs.exclude(pk=exclude_id)
+    return qs.order_by("created_at").first()
+
+
+def active_order_challan(order, *, exclude_id=None):
+    """The order's live challan (any status but Cancelled -- a Delivered one
+    still counts), if it has one."""
+    qs = order.challans.filter(deleted_at__isnull=True).exclude(status="Cancelled")
+    if exclude_id:
+        qs = qs.exclude(pk=exclude_id)
+    return qs.order_by("created_at").first()
+
+
+def assert_order_has_no_invoice(order, *, exclude_id=None):
+    """A sales order is billed on exactly one invoice; cancel it to re-bill."""
+    existing = active_order_invoice(order, exclude_id=exclude_id)
+    if existing is not None:
+        label = existing.invoice_number or f"draft {str(existing.id)[:8]}"
+        raise Conflict(
+            f"Sales Order {order.order_number} already has invoice {label}. "
+            "Only one invoice is allowed per sales order -- cancel it to create another.",
+            code=Codes.ALREADY_DONE,
+            payload={"invoiceId": str(existing.id)},
+        )
+
+
+def assert_order_has_no_challan(order, *, exclude_id=None):
+    """A sales order ships on exactly one challan; cancel it to re-issue."""
+    existing = active_order_challan(order, exclude_id=exclude_id)
+    if existing is not None:
+        raise Conflict(
+            f"Sales Order {order.order_number} already has delivery challan "
+            f"{existing.challan_number or existing.id}. Only one challan is allowed "
+            "per sales order -- cancel it to create another.",
+            code=Codes.ALREADY_DONE,
+            payload={"challanId": str(existing.id)},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1025,7 +1225,15 @@ def cancel_invoice(invoice, *, reason=None, user=None):
 @transaction.atomic
 def cancel_challan(challan, *, reason=None, user=None):
     """Posts ``SALE_REVERSAL`` movements and returns the serials to stock."""
+    snapshot = DeliveryChallan.objects.only("sales_order_id").get(pk=challan.pk)
+    if snapshot.sales_order_id:
+        SalesOrder.objects.select_for_update().get(pk=snapshot.sales_order_id)
     challan = DeliveryChallan.objects.select_for_update().get(pk=challan.pk)
+    if challan.sales_order_id != snapshot.sales_order_id:
+        raise Conflict(
+            "The Sales Order link changed during cancellation. Refresh and retry.",
+            code=Codes.ALREADY_DONE,
+        )
     if challan.status == "Cancelled":
         raise Conflict("This challan is already cancelled.", code=Codes.ALREADY_CANCELLED)
 
@@ -1123,10 +1331,26 @@ def record_payment_in(
         )
 
     if mode != "Cash" and bank_account is None:
-        raise ValidationFailed(
-            "Choose the bank account this payment was received into.",
-            field_errors={"bankAccountId": ["Required for non-cash payments."]},
-        )
+        from apps.accounting.models import BankAccount, Account
+        bank_account = BankAccount.objects.filter(
+            client=client, is_active=True, deleted_at__isnull=True
+        ).first()
+        if bank_account is None:
+            acc = Account.objects.filter(client=client, type="Asset", deleted_at__isnull=True).first()
+            if acc:
+                bank_account = BankAccount.objects.create(
+                    client=client,
+                    account=acc,
+                    name="Operating Bank Account",
+                    type="Bank",
+                    is_default=True,
+                    is_active=True,
+                )
+        if bank_account is None:
+            raise ValidationFailed(
+                "Choose the bank account this payment was received into.",
+                field_errors={"bankAccountId": ["Required for non-cash payments."]},
+            )
 
     # The bank's transaction id identifies one receipt; entering it twice
     # would post the same money twice.
@@ -1264,9 +1488,11 @@ def allocate_payment_in(payment, allocations, *, user=None):
     # Money received releases held incentive / grows collection-based
     # incentive on those invoices (PDF §12).
     from apps.pms.production_services import sync_incentives_for_invoice
+    from .broker_services import sync_broker_commissions_for_invoice
 
     for invoice in paid_invoices:
         sync_incentives_for_invoice(invoice, user=user)
+        sync_broker_commissions_for_invoice(invoice, user=user)
     return payment
 
 
@@ -1315,11 +1541,13 @@ def cancel_payment_in(payment, *, reason=None, user=None):
         user=user,
     )
     from apps.pms.production_services import sync_incentives_for_invoice
+    from .broker_services import sync_broker_commissions_for_invoice
 
     for invoice in SalesInvoice.objects.filter(pk__in=invoice_ids):
         refresh_invoice_payment_status(invoice)
         # A bounced/cancelled receipt puts the incentive back on hold.
         sync_incentives_for_invoice(invoice, user=user)
+        sync_broker_commissions_for_invoice(invoice, user=user)
     ledger.recalculate_party_balance(payment.client_id, payment.party_id)
     return payment
 
@@ -1604,4 +1832,3 @@ def party_from_manual_quotation(quotation, *, user=None):
         created_by=user if getattr(user, "is_authenticated", False) else None,
 
     )
-

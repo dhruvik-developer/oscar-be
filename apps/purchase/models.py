@@ -119,6 +119,11 @@ class PurchaseOrder(DocumentHeader):
     dyeing_mill = models.ForeignKey(
         "masters.Party", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
+    #: Flow B: the colour the mill dyes this order to. Every dyed batch received
+    #: against the PO inherits it; older orders may have none.
+    dyeing_colour_name = models.TextField(null=True, blank=True)
+    #: ``#RRGGBB`` swatch of that colour, when one was picked.
+    dyeing_colour_hex = models.TextField(null=True, blank=True)
 
     class Meta:
         db_table = "purchase_orders"
@@ -523,7 +528,7 @@ class Expense(TenantModel, LegacyIdMixin):
 # ---------------------------------------------------------------------------
 #: Draft / Pending Approval are written by the agency bill match flow
 #: (save draft / submit for approval); approve and reject accept both pending states.
-VENDOR_BILL_STATUSES = ["Draft", "Pending", "Pending Approval", "Approved", "Rejected"]
+VENDOR_BILL_STATUSES = ["Draft", "Pending", "Pending Approval", "Approved", "Partially Paid", "Paid", "Rejected"]
 VENDOR_BILL_PENDING_STATUSES = ("Pending", "Pending Approval")
 VENDOR_BILL_MATCH_STATUSES = ["Pending Matching", "Matched", "Mismatch"]
 
@@ -559,6 +564,8 @@ class VendorBill(TenantModel, LegacyIdMixin):
     #: All DERIVED from the lines (header-level GST, not per-line tax).
     subtotal = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     gst_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    #: Entered from the invoice (freight, packing...); added after GST.
+    other_charges = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     total = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     remarks = models.TextField(null=True, blank=True)
     status = models.TextField(choices=choices(VENDOR_BILL_STATUSES), default="Pending")
@@ -610,6 +617,13 @@ class VendorBillLine(TenantModel):
         VendorBill, on_delete=models.CASCADE, related_name="line_items"
     )
     line_no = models.IntegerField(default=1)
+    batch = models.ForeignKey(
+        "inventory.Batch", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    batch_number = models.TextField(null=True, blank=True)
+    goods_receipt = models.ForeignKey(
+        "purchase.GoodsReceipt", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
     item = models.ForeignKey(
         "masters.Item", null=True, blank=True, on_delete=models.PROTECT, related_name="+"
     )
