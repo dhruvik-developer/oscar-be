@@ -122,6 +122,12 @@ class PurchaseOrderSerializer(DocumentSerializer):
         source="dyeing_mill", model="masters.Party", required=False, allow_null=True
     )
     dyeingMillName = serializers.CharField(source="dyeing_mill.name", read_only=True, default=None)
+    dyeingColourName = serializers.CharField(
+        source="dyeing_colour_name", required=False, allow_null=True, allow_blank=True
+    )
+    dyeingColourHex = serializers.CharField(
+        source="dyeing_colour_hex", required=False, allow_null=True, allow_blank=True
+    )
 
     class Meta:
         model = PurchaseOrder
@@ -129,7 +135,7 @@ class PurchaseOrderSerializer(DocumentSerializer):
             "po_number", "status", "expected_date", "location",
             "reference_number", "auto_generated", "vendorId", "vendorName",
             "billedStatus", "purchaseType", "projectId", "projectCode", "projectName",
-            "fabricFlow", "dyeingMillId", "dyeingMillName",
+            "fabricFlow", "dyeingMillId", "dyeingMillName", "dyeingColourName", "dyeingColourHex",
         ]
         read_only_fields = READ_ONLY_HEADER_FIELDS + ["po_number", "auto_generated"]
 
@@ -156,7 +162,7 @@ class PurchaseOrderSerializer(DocumentSerializer):
         return validate_flow(value)
 
     def validate(self, attrs):
-        from .fabric_flow import mark_purchase_type
+        from .fabric_flow import clean_dyeing_colour, clean_dyeing_mill, mark_purchase_type
 
         attrs = super().validate(attrs)
         instance = self.instance
@@ -168,6 +174,8 @@ class PurchaseOrderSerializer(DocumentSerializer):
         attrs = mark_purchase_type(attrs)
         if attrs.get("fabric_flow") is None and "fabric_flow" in attrs:
             attrs["dyeing_mill"] = None
+        attrs = clean_dyeing_colour(attrs, instance)
+        attrs = clean_dyeing_mill(attrs, instance)
         purchase_type = attrs.get("purchase_type")
         if instance is None:
             # Final job work POs are only generated from a verified production
@@ -229,11 +237,16 @@ class PurchaseBillSerializer(DocumentSerializer):
     purchaseOrder = serializers.CharField(source="purchase_order_id", read_only=True)
     poNumber = serializers.CharField(source="purchase_order.po_number", read_only=True, allow_null=True)
 
+    poAlreadyReceived = serializers.SerializerMethodField()
+
+    def get_poAlreadyReceived(self, bill):
+        return bool(getattr(bill, "po_already_received", False))
+
     class Meta:
         model = PurchaseBill
         fields = HEADER_FIELDS + [
             "bill_number", "vendorBillNumber", "status", "due_date",
-            "purchase_order", "purchaseOrderId", "purchaseOrder", "poNumber", "location", "goodsReceived", "received_date",
+            "purchase_order", "purchaseOrderId", "purchaseOrder", "poNumber", "location", "goodsReceived", "poAlreadyReceived", "received_date",
             "qcStatus", "qc_note", "vendorId", "vendorName",
         ]
         read_only_fields = READ_ONLY_HEADER_FIELDS + [
@@ -298,11 +311,21 @@ class GoodsReceiptSerializer(BaseModelSerializer):
     poNumber = serializers.CharField(
         source="purchase_order.po_number", read_only=True, allow_null=True
     )
+    fabricFlow = serializers.CharField(source="purchase_order.fabric_flow", read_only=True, default=None)
+    dyeingColourName = serializers.CharField(source="purchase_order.dyeing_colour_name", read_only=True, default=None)
+    dyeingColourHex = serializers.CharField(source="purchase_order.dyeing_colour_hex", read_only=True, default=None)
+    fabricType = serializers.SerializerMethodField()
+
+    def get_fabricType(self, receipt):
+        from .fabric_flow import receipt_fabric_type
+
+        return receipt_fabric_type(receipt.purchase_order)
 
     class Meta:
         model = GoodsReceipt
         fields = [
-            "id", "grn_number", "purchase_order", "poNumber", "purchase_bill", "billNumber",
+            "id", "grn_number", "purchase_order", "poNumber", "fabricFlow", "fabricType",
+            "dyeingColourName", "dyeingColourHex", "purchase_bill", "billNumber",
             "party", "vendorName", "vendorCode", "receipt_date",
             "supplier_challan_no", "supplier_challan_date",
             "location", "qc_status", "qc_note", "qc_at", "lines", "created_at",

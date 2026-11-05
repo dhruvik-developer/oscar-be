@@ -13,7 +13,7 @@ from apps.accounting.models import JournalEntry
 from apps.accounts.authentication import build_tokens
 from apps.accounts.models import Client, Permission, Role, RolePermission, User
 from apps.masters.models import FabricQuality, Item, Location, Party
-from apps.purchase.models import PaymentOut, PurchaseBill, PurchaseOrder, VendorBill
+from apps.purchase.models import GoodsReceipt, PaymentOut, PurchaseBill, PurchaseOrder, VendorBill
 
 
 class VendorBillWorkflowTests(TestCase):
@@ -154,6 +154,27 @@ class VendorBillWorkflowTests(TestCase):
         self.assertEqual(data["batches"], [])
         self.assertFalse(data["poSummary"]["canCreateBill"])
         self.assertIn("received", data["poSummary"]["createBlockedReason"])
+
+    def test_header_without_lines_is_not_a_bill(self):
+        po = self._po()
+        ghost = VendorBill.objects.create(
+            client=self.tenant, vendor_bill_number="VB-TEST-1", bill_date="2026-11-04",
+            party=self.vendor, party_name=self.vendor.name, purchase_order=po,
+            subtotal=Decimal("1000"), gst_amount=Decimal("50"), total=Decimal("1050"),
+            status="Approved", match_status="Matched",
+        )
+        data = self._details(po)
+        self.assertEqual(data["bills"], [])
+        self.assertEqual(data["poSummary"]["totalBilledAmount"], 0)
+        self.assertTrue(data["poSummary"]["canCreateBill"])
+
+        res = self._pay(ghost, "100")
+        self.assertEqual(res.status_code, 409, res.content)
+        self.assertEqual(res.json()["code"], "BILL_HAS_NO_LINES")
+        ghost.status = "Pending"
+        ghost.save(update_fields=["status", "updated_at"])
+        self.assertEqual(self._approve(ghost, "x").json()["code"], "BILL_HAS_NO_LINES")
+        self.assertFalse(PaymentOut.objects.filter(party=self.vendor).exists())
 
     # -- creating a bill ----------------------------------------------------
     def test_bill_saves_once_and_reopening_shows_it(self):
@@ -378,6 +399,30 @@ class VendorBillWorkflowTests(TestCase):
         url = f"/api/v1/purchase/vendor-bills/{bill.id}/"
         self.assertEqual(self.api.patch(url, {"remarks": "x"}, format="json").status_code, 409)
         self.assertEqual(self.api.delete(url).status_code, 409)
+
+    def _draft_payable(self, po):
+        bill = self._bill(po, "INV-D", 4000, 12)
+        self._review(bill)
+        res = self.api.post(f"/api/v1/purchase/vendor-bills/{bill.id}/send-for-matching/", {}, format="json")
+        self.assertEqual(res.status_code, 201, res.content)
+        return res.json()["purchaseBillId"]
+
+    def test_goods_on_a_grn_cannot_be_received_again_from_the_bill(self):
+        po = self._po()
+        payable_id = self._draft_payable(po)
+        self.assertTrue(self.api.get(f"/api/v1/purchase/bills/{payable_id}/").json()["poAlreadyReceived"])
+        res = self.api.post(f"/api/v1/purchase/bills/{payable_id}/receive-goods/", {"lines": []}, format="json")
+        self.assertEqual(res.status_code, 409, res.content)
+        self.assertEqual(GoodsReceipt.objects.filter(purchase_order=po).count(), 1)
+
+    def test_payment_out_refuses_a_draft_bill_but_allows_an_advance(self):
+        payable_id = self._draft_payable(self._po())
+        body = {"vendorId": str(self.vendor.id), "date": "2026-11-05", "amount": 100, "mode": "Cash"}
+        res = self.api.post("/api/v1/purchase/payments/", {**body, "billId": payable_id}, format="json")
+        self.assertEqual(res.status_code, 422, res.content)
+        self.assertEqual(res.json()["code"], "PAYMENT_ON_DRAFT")
+        self.assertFalse(PaymentOut.objects.filter(party=self.vendor).exists())
+        self.assertEqual(self.api.post("/api/v1/purchase/payments/", body, format="json").status_code, 201)
 
     def test_state_survives_a_fresh_read(self):
         po = self._po()

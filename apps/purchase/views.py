@@ -6,7 +6,7 @@ from decimal import Decimal
 
 from django.db import transaction
 
-from django.db.models import Count, DecimalField, F, Q, Sum, Value
+from django.db.models import Count, DecimalField, Exists, F, OuterRef, Q, Sum, Value
 
 from django.db.models.functions import Coalesce
 
@@ -338,6 +338,8 @@ class PurchaseOrderViewSet(SalesDocumentViewSet):
     def submit_for_approval(self, request, pk=None):
 
         from apps.core import approval_services
+
+        fabric_flow.require_dyeing_colour(self.get_object())
 
         res = self._transition(request, from_statuses=("Draft", "Issued"), to_status="Pending Approval")
 
@@ -2273,6 +2275,13 @@ class PurchaseBillViewSet(SalesDocumentViewSet):
 
     }
 
+    def get_queryset(self):
+        standalone_grn = GoodsReceipt.objects.filter(
+            purchase_order_id=OuterRef("purchase_order_id"),
+            purchase_bill__isnull=True, deleted_at__isnull=True,
+        )
+        return super().get_queryset().annotate(po_already_received=Exists(standalone_grn))
+
     def get_object(self):
         lookup_url_kwarg = self.lookup_url_kwarg or self.lookup_field
         pk = self.kwargs.get(lookup_url_kwarg)
@@ -2837,6 +2846,7 @@ class GoodsReceiptViewSet(TenantModelViewSet):
 
                     user=request.user,
 
+                    fabric_type=data.get("fabricType"),
                 )
 
                 # A factory fabric order received here books the batch's cost
@@ -3564,6 +3574,13 @@ class VendorBillViewSet(TenantModelViewSet):
                 code=Codes.DRAFT_ONLY,
             )
 
+    def _assert_has_lines(self, bill):
+        if not bill.line_items.filter(deleted_at__isnull=True).exists():
+            raise Conflict(
+                f"Vendor bill {bill.vendor_bill_number} has no lines, so there is nothing to approve or pay.",
+                code="BILL_HAS_NO_LINES",
+            )
+
     def perform_update(self, serializer):
         self._assert_editable(serializer.instance)
         return super().perform_update(serializer)
@@ -4024,6 +4041,8 @@ class VendorBillViewSet(TenantModelViewSet):
                 code=Codes.DRAFT_ONLY,
 
             )
+
+        self._assert_has_lines(bill)
 
         # Separation of duties: Creator cannot approve their own bill unless superuser
 
@@ -4698,6 +4717,7 @@ class VendorBillViewSet(TenantModelViewSet):
         if bill is None:
             raise NotFound("Vendor bill not found.")
 
+        self._assert_has_lines(bill)
         workflow = services.vendor_bill_workflow(bill)
         if "pay" not in workflow["actions"]:
             if workflow["stage"] == "paid":
@@ -4772,6 +4792,22 @@ class VendorBillViewSet(TenantModelViewSet):
         payable.refresh_from_db()
         bill.purchase_bill = payable
         summary = services.vendor_bill_payment_summary(bill)
+
+        if summary.get("paymentStatus") == "Paid":
+            bill.status = "Paid"
+            bill.save(update_fields=["status", "purchase_bill", "updated_at"])
+        elif summary.get("paymentStatus") == "Partially Paid" and bill.status != "Partially Paid":
+            bill.status = "Partially Paid"
+            bill.save(update_fields=["status", "purchase_bill", "updated_at"])
+
+        if po:
+            po.refresh_from_db()
+            all_bills_snapshot = services.vendor_bill_po_snapshot(po)
+            po_summary = all_bills_snapshot.get("poSummary", {})
+            total_paid = po_summary.get("totalPaidAmount", 0)
+            po.amount_paid = D(str(total_paid))
+            po.save(update_fields=["amount_paid", "updated_at"])
+
         self.write_audit(
             "pay", bill,
             description=f"Payment {payment.payment_number} of {amount} against {bill.vendor_bill_number}",
@@ -4911,6 +4947,11 @@ class SupplierDeliveryViewSet(TenantModelViewSet):
 
         from apps.core.numbering import allocate_number
 
+        po = serializer.validated_data.get("purchase_order")
+        # On a mill PO the factory ships to the mill: fabric_flow counts only these.
+        if po is not None and po.fabric_flow == fabric_flow.FABRIC_FLOW_FACTORY_TO_MILL:
+            serializer.validated_data["destination"] = "MILL"
+            serializer.validated_data["mill"] = po.dyeing_mill
         serializer.validated_data["delivery_number"] = allocate_number(
 
             self.request.user.client, "SD", serializer.validated_data.get("dispatch_date")

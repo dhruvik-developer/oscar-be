@@ -37,6 +37,7 @@ from apps.sales.services import (
 )
 
 from .models import (
+    FABRIC_FLOW_FACTORY_TO_MILL,
     PURCHASE_TYPE_GREY_STOCK,
     PURCHASE_TYPE_VENDOR_A,
     PURCHASE_TYPE_FINAL_JOB_WORK,
@@ -106,6 +107,23 @@ def receive_bill_goods(bill, *, lines_payload, qc_status=None, user=None, locati
         raise Conflict(
             "Goods have already been received against this bill.",
             code=Codes.ALREADY_DONE,
+        )
+    # A GRN raised on the PO already stocked these goods; receiving them from
+    # the bill would post them a second time. A GRN of another bill on the same
+    # PO is that bill's share, so it does not count.
+    if bill.purchase_order_id and GoodsReceipt.objects.filter(
+        client_id=bill.client_id, purchase_order_id=bill.purchase_order_id,
+        purchase_bill__isnull=True, deleted_at__isnull=True,
+    ).exists():
+        raise Conflict(
+            "These goods were already received through a GRN on the purchase order.",
+            code=Codes.ALREADY_DONE,
+        )
+    # The bill path opens Grey batches; a dyeing-mill order is dyed fabric.
+    if bill.purchase_order_id and bill.purchase_order.fabric_flow == FABRIC_FLOW_FACTORY_TO_MILL:
+        raise Conflict(
+            "Receive this dyed fabric with a GRN on the purchase order.",
+            code="WRONG_FABRIC_TYPE",
         )
 
     lines = list(bill.line_items.select_related("item").order_by("line_no"))
@@ -915,6 +933,14 @@ def record_payment_out(
                 "Cannot record payment against a cancelled bill.",
                 code=Codes.PAYMENT_ON_CANCELLED,
             )
+        # An unposted bill never credited Creditors, so paying it would leave
+        # the vendor's ledger one-sided.
+        if target.posted_at is None or target.status == "Draft":
+            raise BusinessRuleViolation(
+                "Cannot record payment against a draft bill. "
+                "Pay it through Pay Vendor Bill on the purchase order.",
+                code=Codes.PAYMENT_ON_DRAFT,
+            )
 
         already = round2(allocated_to(client.id, "PurchaseBill", target.id))
         balance = round2(D(target.total) - already)
@@ -1204,6 +1230,12 @@ def vendor_bill_po_snapshot(po):
         .prefetch_related("line_items__batch", "line_items__goods_receipt", "line_items__item")
         .order_by("-bill_date", "-created_at")
     )
+    linked_payable_ids = [vb.purchase_bill_id for vb in vendor_bills if vb.purchase_bill_id]
+    # A header with no lines bills nothing: it is not a vendor invoice.
+    vendor_bills = [
+        vb for vb in vendor_bills
+        if any(line.deleted_at is None for line in vb.line_items.all())
+    ]
 
     def _is_live(vendor_bill):
         payable = vendor_bill.purchase_bill
@@ -1225,7 +1257,7 @@ def vendor_bill_po_snapshot(po):
             deleted_at__isnull=True,
         )
         .exclude(purchase_bill__status="Cancelled")
-        .exclude(purchase_bill_id__in=[vb.purchase_bill_id for vb in vendor_bills if vb.purchase_bill_id])
+        .exclude(purchase_bill_id__in=linked_payable_ids)
     )
     billed.extend(
         {"batchId": None, "batchNumber": line.batch_number, "itemId": line.item_id, "qty": D(line.qty or 0)}
@@ -2005,11 +2037,15 @@ def create_standalone_grn(
     lines_payload=None,
     lines_data=None,
     user=None,
+    fabric_type=None,
 ):
     """Create a standalone Goods Receipt Note (GRN) against a PO or directly from a vendor.
 
     Captures taka/roll entries per line, calculates shortage/excess vs PO,
     posts stock movement into QC Hold, and provisions LotTaka entries.
+
+    The PO's delivery type decides Grey or Dyed Fabric; ``fabric_type`` (also
+    accepted per line) is only checked against it, never obeyed.
     """
     party_id = party_id or (getattr(party, "id", party) if party else None)
     purchase_order_id = purchase_order_id or (getattr(purchase_order, "id", purchase_order) if purchase_order else None)
@@ -2017,6 +2053,8 @@ def create_standalone_grn(
     from apps.core.numbering import allocate_number
     from apps.inventory.models import LotTaka
     from apps.masters.models import Item, Location, Party
+
+    from .fabric_flow import check_receipt_fabric_type
 
     party = Party.objects.filter(pk=party_id, client_id=client.id, deleted_at__isnull=True).first()
     if not party:
@@ -2043,6 +2081,9 @@ def create_standalone_grn(
                 field_errors={"purchaseOrderId": ["Not found."]},
             )
         _assert_po_receivable(po, party)
+
+    for requested in [fabric_type, *[row.get("fabricType") for row in lines_payload or []]]:
+        check_receipt_fabric_type(po, requested)
 
     if supplier_challan_no:
         duplicate = GoodsReceipt.objects.filter(
@@ -2110,6 +2151,12 @@ def create_standalone_grn(
             po_line = PurchaseOrderLine.objects.select_for_update().filter(
                 purchase_order=po, item_id=item_id, deleted_at__isnull=True
             ).first()
+        # A line off the PO would escape the remaining-quantity check below.
+        if po is not None and po.fabric_flow and po_line is None:
+            raise ValidationFailed(
+                f"Line {idx + 1}: that fabric is not on {po.po_number}.",
+                field_errors={"lines": [f"Line {idx + 1}: pick a fabric line of {po.po_number}."]},
+            )
 
         item = Item.objects.filter(pk=item_id, client_id=client.id, deleted_at__isnull=True).first()
         if not item:
@@ -2236,6 +2283,11 @@ def create_standalone_grn(
             ).first() or Shade.objects.filter(
                 client_id=client.id, code=resolved_shade, deleted_at__isnull=True
             ).first()
+        if po is not None and po.fabric_flow == FABRIC_FLOW_FACTORY_TO_MILL:
+            # The item may be the grey quality; what arrived is the PO's colour.
+            resolved_shade = Shade.objects.filter(
+                client_id=client.id, name__iexact=po.dyeing_colour_name or "", deleted_at__isnull=True
+            ).first()
 
         for t_idx, t_spec in enumerate(takas_spec):
             taka_qty = round4(D(t_spec.get("qty") or t_spec.get("actual_meter") or t_spec.get("quantity") or 0))
@@ -2287,7 +2339,9 @@ def create_standalone_grn(
             taka_obj.stock_movement = movement
             taka_obj.save(update_fields=["stock_movement", "updated_at"])
 
-        if unit_cost > ZERO:
+        # A factory fabric order's value reaches the batch through
+        # ``fabric_flow.allocate_costs``; booking it here too would double it.
+        if unit_cost > ZERO and not (po is not None and po.fabric_flow):
             from apps.inventory import costing_services
             from apps.inventory.models import LotCostEntry
             cost_exists = LotCostEntry.objects.filter(

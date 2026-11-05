@@ -431,6 +431,8 @@ def grouped_batch_registry(client_id, params, *, with_cost=False):
                 "fabricFlow": po.fabric_flow,
                 "fabricFlowLabel": po.get_fabric_flow_display() if po.fabric_flow else ("Factory -> OSCAR Warehouse" if po.purchase_type == "GREY_STOCK" else ""),
                 "dyeingMillName": (po.dyeing_mill.name if po.dyeing_mill_id else "") if hasattr(po, "dyeing_mill") and po.dyeing_mill else "",
+                "dyeingColourName": po.dyeing_colour_name,
+                "dyeingColourHex": po.dyeing_colour_hex,
                 "fabricNames": sorted({
                     line.item_name or line.description or line.item.name
                     for line in po_lines

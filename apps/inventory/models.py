@@ -660,6 +660,9 @@ class Batch(TenantModel):
     goods_receipt_line = models.ForeignKey(
         "purchase.GoodsReceiptLine", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
+    #: Dyed Fabric batches: the colour inherited from the PO when received.
+    dyeing_colour_name = models.TextField(null=True, blank=True)
+    dyeing_colour_hex = models.TextField(null=True, blank=True)
 
     class Meta:
         db_table = "fabric_batches"

@@ -6,6 +6,7 @@ system location. Nothing is available for sale until a QC disposition moves it
 out, taka by taka, with real movements:
 
     good           -> QC_PASS            -> the receipt's own (godown) location
+    sample         -> QC_PASS, then issued as a Sample from that godown
     second quality -> QC_SECOND_QUALITY  -> Second Quality Stock
     reprocess      -> QC_REPROCESS       -> Reprocess Stock
     reject         -> QC_REJECT          -> Reject / Scrap
@@ -29,10 +30,11 @@ from .models import LotTaka, StockMovement
 
 #: Allocation order: a taka is filled category by category in this order, so
 #: ``hold`` (which does not move) always takes whatever is left at QC Hold.
-CATEGORIES = ("good", "second", "reprocess", "reject", "hold")
+CATEGORIES = ("good", "sample", "second", "reprocess", "reject", "hold")
 
 CATEGORY_CONDITION = {
     "good": "Good",
+    "sample": "Good",
     "second": "Second Quality",
     "reprocess": "Reprocess",
     "reject": "Reject",
@@ -41,6 +43,7 @@ CATEGORY_CONDITION = {
 
 CATEGORY_MOVEMENT = {
     "good": "QC_PASS",
+    "sample": "QC_PASS",
     "second": "QC_SECOND_QUALITY",
     "reprocess": "QC_REPROCESS",
     "reject": "QC_REJECT",
@@ -50,6 +53,7 @@ CATEGORY_MOVEMENT = {
 #: Request keys accepted for each category.
 CATEGORY_KEYS = {
     "good": ("goodQty",),
+    "sample": ("sampleQty",),
     "second": ("secondQualityQty", "secondQty"),
     "reprocess": ("reprocessQty",),
     "reject": ("rejectedQty", "rejectQty"),
@@ -413,6 +417,14 @@ def dispose_receipt(
     on_date = movement_date or timezone.localdate()
     note = f"QC {receipt.grn_number}" + (f": {remarks}" if remarks else "")
 
+    if quantities["sample"] > ZERO and (
+        record_only or any(unit["lot"] is None for unit, category, _ in plan if category == "sample")
+    ):
+        raise ValidationFailed(
+            "A sample is cut from a taka, and this receipt has no takas to cut it from.",
+            field_errors={"sampleQty": ["Only fabric held on takas can go to samples."]},
+        )
+
     reject_by_line = {}
     moved = 0
     for unit, category, qty in plan:
@@ -449,6 +461,17 @@ def dispose_receipt(
             )
             if remarks:
                 LotTaka.objects.filter(pk=target.pk).update(qc_notes=remarks)
+            if category == "sample":
+                from .sampling_services import issue_sample
+
+                issue_sample(
+                    client_id=receipt.client_id,
+                    source_lot_taka_id=target.pk,
+                    quantity=qty,
+                    uom=target.uom or "MTR",
+                    remarks=note,
+                    user=user,
+                )
         else:
             line = unit["line"]
             unit_cost = D(line.unit_cost) if line is not None and line.unit_cost else None
@@ -516,6 +539,11 @@ def record_receipt_verdict(receipt, quantities, *, user=None, remarks=None, meas
         category: D(str(meta.get("cumulative", {}).get(category, 0)))
         for category in ("good", "second", "reprocess", "reject")
     }
+    # A sample passed QC before it was issued, so it counts as good here and
+    # is kept apart only in ``sampleQty``.
+    sample_now = quantities.get("sample", ZERO)
+    sample_total = D(str(meta.get("sampleQty", 0))) + sample_now
+    quantities = {**quantities, "good": quantities.get("good", ZERO) + sample_now}
     if is_reprocess:
         dispositioned_from_reprocess = quantities.get("good", ZERO) + quantities.get("second", ZERO) + quantities.get("reject", ZERO)
         cumulative["reprocess"] = max(ZERO, cumulative.get("reprocess", ZERO) - dispositioned_from_reprocess)
@@ -530,6 +558,7 @@ def record_receipt_verdict(receipt, quantities, *, user=None, remarks=None, meas
     previous_status = receipt.qc_status
     meta = {
         "goodQty": float(cumulative["good"]),
+        "sampleQty": float(sample_total),
         "secondQualityQty": float(cumulative["second"]),
         "reprocessQty": float(cumulative["reprocess"]),
         "rejectedQty": float(cumulative["reject"]),

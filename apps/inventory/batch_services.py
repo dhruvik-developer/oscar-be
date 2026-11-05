@@ -113,7 +113,8 @@ def _receipt_line_batch(taka, po):
     GRN line, so a replayed or repeated save of the same receipt line can never
     open a second batch."""
     from apps.core.numbering import allocate_number
-    from apps.purchase.models import FABRIC_FLOW_FACTORY_TO_MILL, GoodsReceiptLine
+    from apps.purchase.fabric_flow import receipt_fabric_type
+    from apps.purchase.models import GoodsReceiptLine
 
     from .models import Batch
 
@@ -133,7 +134,8 @@ def _receipt_line_batch(taka, po):
             grn_line.batch_number = existing.batch_code
             grn_line.save(update_fields=["batch_number"])
         return existing
-    fabric_type = "DYED" if (po and getattr(po, "fabric_flow", None) == FABRIC_FLOW_FACTORY_TO_MILL) else "GREY"
+    fabric_type = receipt_fabric_type(po)
+    dyed = fabric_type == "DYED"
     on_date = taka.received_date if hasattr(taka.received_date, "year") else None
     supplier_id = (po.party_id if po else None) or taka.supplier_id
     batch = Batch.objects.create(
@@ -150,6 +152,8 @@ def _receipt_line_batch(taka, po):
         purchase_order_line_id=grn_line.purchase_order_line_id if grn_line else None,
         goods_receipt_id=receipt_id,
         goods_receipt_line=grn_line,
+        dyeing_colour_name=po.dyeing_colour_name if dyed else None,
+        dyeing_colour_hex=po.dyeing_colour_hex if dyed else None,
         **({"created_on": on_date} if on_date else {}),
         uom=taka.uom,
     )
@@ -768,7 +772,11 @@ def serialize_batch(batch, *, takas=None, include_cost=False, detail=False):
         "hsnMissingFor": hsn_missing,
         "fabricQuality": getattr(getattr(first, "fabric_quality", None), "name", None),
         "design": getattr(getattr(first, "design", None), "name", None),
-        "shade": getattr(getattr(first, "shade", None), "name", None),
+        "shade": getattr(getattr(first, "shade", None), "name", None) or batch.dyeing_colour_name,
+        "dyeingColourName": batch.dyeing_colour_name,
+        "dyeingColourHex": batch.dyeing_colour_hex,
+        "purchaseOrderId": str(batch.purchase_order_id) if batch.purchase_order_id else None,
+        "poNumber": batch.purchase_order.po_number if batch.purchase_order_id else None,
         "width": str(first.width) if first and first.width is not None else None,
         "gsm": str(first.gsm) if first and first.gsm is not None else None,
         "supplierName": batch.supplier.name if batch.supplier_id else None,

@@ -56,6 +56,8 @@ from .models import (
 )
 
 TOLERANCE = Decimal("0.001")
+HEX_COLOUR = re.compile(r"#[0-9A-F]{6}")
+MAX_COLOUR_NAME = 100
 #: PO statuses in which the factory may dispatch and OSCAR may receive.
 ACTIVE_STATUSES = ("Approved", "Issued", "Partially Received", "Fully Received")
 #: Expense category -> lot cost ledger type (the batch's cost breakdown).
@@ -198,6 +200,89 @@ def validate_flow(value):
     if value not in dict(FABRIC_FLOWS):
         raise ValidationFailed("Choose how the fabric reaches OSCAR.", field_errors={"fabricFlow": ["Unknown flow."]})
     return value
+
+
+def clean_dyeing_colour(attrs, instance=None):
+    """The PO's dyeing colour: required on a Factory -> Dyeing Mill -> OSCAR
+    order while it is Draft, kept off every other order, and fixed once the PO
+    has left Draft because its batches inherit it. An older order that left
+    Draft without one may still be given one."""
+    flow = attrs["fabric_flow"] if "fabric_flow" in attrs else getattr(instance, "fabric_flow", None)
+    if flow != FABRIC_FLOW_FACTORY_TO_MILL:
+        attrs["dyeing_colour_name"] = None
+        attrs["dyeing_colour_hex"] = None
+        return attrs
+    saved_name = getattr(instance, "dyeing_colour_name", None)
+    saved_hex = getattr(instance, "dyeing_colour_hex", None)
+    name = str(attrs.get("dyeing_colour_name", saved_name) or "").strip()
+    colour_hex = str(attrs.get("dyeing_colour_hex", saved_hex) or "").strip().upper()
+    draft = instance is None or instance.status == "Draft"
+    if not name and draft:
+        raise ValidationFailed(
+            "Choose the dyeing colour for this order.", field_errors={"dyeingColourName": ["Required."]},
+        )
+    if len(name) > MAX_COLOUR_NAME:
+        raise ValidationFailed(
+            "The colour name is too long.", field_errors={"dyeingColourName": [f"At most {MAX_COLOUR_NAME} characters."]},
+        )
+    if colour_hex and not HEX_COLOUR.fullmatch(colour_hex):
+        raise ValidationFailed("The colour code must look like #1F3A5F.", field_errors={"dyeingColourHex": ["Invalid colour."]})
+    if not draft and saved_name and (name != saved_name or colour_hex != (saved_hex or "")):
+        raise ValidationFailed(
+            "The dyeing colour cannot change once the PO has left Draft.",
+            field_errors={"dyeingColourName": ["Locked after Draft."]},
+        )
+    attrs["dyeing_colour_name"] = name or None
+    attrs["dyeing_colour_hex"] = colour_hex or None
+    return attrs
+
+
+def clean_dyeing_mill(attrs, instance=None):
+    """The PO's dyeing mill: required on a Factory -> Dyeing Mill -> OSCAR
+    order while it is Draft. An older order that left Draft without one still
+    names its mill on the factory dispatch."""
+    flow = attrs["fabric_flow"] if "fabric_flow" in attrs else getattr(instance, "fabric_flow", None)
+    if flow != FABRIC_FLOW_FACTORY_TO_MILL:
+        return attrs
+    mill = attrs["dyeing_mill"] if "dyeing_mill" in attrs else getattr(instance, "dyeing_mill", None)
+    if mill is None and (instance is None or instance.status == "Draft"):
+        raise ValidationFailed(
+            "Choose the dyeing vendor for this order.", field_errors={"dyeingMillId": ["Required."]},
+        )
+    return attrs
+
+
+def require_dyeing_colour(po):
+    if po.fabric_flow == FABRIC_FLOW_FACTORY_TO_MILL and not (po.dyeing_colour_name or "").strip():
+        raise ValidationFailed(
+            f"Choose the dyeing colour on {po.po_number} first.", field_errors={"dyeingColourName": ["Required."]},
+        )
+
+
+def receipt_fabric_type(po):
+    """What fabric received against ``po`` is. Only the PO's delivery type
+    decides it -- never the fabric's name, colour or the person receiving."""
+    return "DYED" if po is not None and po.fabric_flow == FABRIC_FLOW_FACTORY_TO_MILL else "GREY"
+
+
+def check_receipt_fabric_type(po, requested):
+    """Refuse a receipt that asks for the wrong batch type for its PO."""
+    requested = str(requested or "").strip().upper()
+    if not requested:
+        return
+    if po is None:
+        if requested == "DYED":
+            raise ValidationFailed(
+                "A dyed fabric batch needs its original purchase order.",
+                field_errors={"purchaseOrderId": ["Required for dyed fabric."]},
+            )
+        return
+    expected = receipt_fabric_type(po)
+    if requested != expected:
+        label = "Dyed" if expected == "DYED" else "Grey"
+        raise BusinessRuleViolation(
+            f"{po.po_number} can only be received as {label} Fabric.", code="WRONG_FABRIC_TYPE",
+        )
 
 
 def apply_order_extras(po, data, *, user=None, creating=False):
@@ -465,6 +550,7 @@ def receive(po, data, *, user):
             "receivedQty": _get(row, "receivedQty", "quantity"),
             "unitCost": _get(row, "rate", "unitCost"),
             "takas": row.get("takas") or row.get("rolls") or [],
+            "fabricType": _get(row, "fabricType"),
             "fabricWidth": _get(row, "fabricWidth", "width"),
             "remarks": _text(row, "remarks"),
         })
@@ -477,6 +563,7 @@ def receive(po, data, *, user):
         supplier_challan_date=_get(data, "challanDate", "supplierChallanDate"),
         purchase_order_id=po.id,
         lines_payload=payload,
+        fabric_type=_get(data, "fabricType"),
         user=user,
     )
     allocate_costs(po, user=user)
@@ -1097,6 +1184,8 @@ def batch_trace(batch):
         "purchaseOrderId": str(po.id),
         "fabricFlow": po.fabric_flow,
         "fabricFlowLabel": dict(FABRIC_FLOWS)[po.fabric_flow],
+        "dyeingColourName": batch.dyeing_colour_name,
+        "dyeingColourHex": batch.dyeing_colour_hex,
         "factoryName": po.party.name if po.party_id else None,
         "receipt": {
             "grnNumber": receipt.grn_number if receipt else None,
