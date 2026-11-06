@@ -901,6 +901,9 @@ class EmployeeViewSet(TenantModelViewSet):
                         slip.earned_salary = res["earnedSalary"]
                         slip.net_payable = res["netPayable"]
                         update_flds = ["standard_salary", "earned_salary", "net_payable", "updated_at"]
+                        if slip.paid_amount == 0 and slip.status == "Paid":
+                            slip.paid_amount = res["netPayable"]
+                            update_flds.append("paid_amount")
                         slip.save(update_fields=update_flds)
             except Exception:
                 pass
