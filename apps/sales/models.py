@@ -45,9 +45,9 @@ NON_RESERVING_STAGES = [
 ]
 PAYMENT_STATUSES = ["Unpaid", "Partially Paid", "Paid"]
 PROFORMA_STATUSES = ["Draft", "Sent", "Accepted", "Converted", "Expired", "Cancelled"]
-CHALLAN_STATUSES = ["Draft", "Dispatched", "In Transit", "Delivered", "Cancelled"]
+CHALLAN_STATUSES = ["Draft", "Dispatched", "In Transit", "Out for Delivery", "Delivered", "Cancelled"]
 #: Challan statuses after the stock has left -- the ones that may be billed.
-CHALLAN_BILLABLE_STATUSES = ["Dispatched", "In Transit", "Delivered"]
+CHALLAN_BILLABLE_STATUSES = ["Dispatched", "In Transit", "Out for Delivery", "Delivered"]
 INVOICE_STATUSES = ["Draft", "Unpaid", "Partially Paid", "Paid", "Cancelled"]
 # The strings the UI's <select> actually emits (api.md §0: where code and
 # spec disagree, the frontend code is the fact). PaymentInPage, PaymentOutPage,

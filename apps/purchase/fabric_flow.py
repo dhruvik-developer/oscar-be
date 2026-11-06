@@ -720,14 +720,15 @@ def book_dyeing_bill(bill, *, user=None):
     recoverable and stays out of the cost."""
     po = lock_order(bill.purchase_order)
     booked = 0
-    lines = bill.line_items.filter(deleted_at__isnull=True).select_related("batch__goods_receipt_line")
-    for line in lines.order_by("line_no"):
+    from .services import vendor_bill_payable_terms
+
+    for line, qty, rate in vendor_bill_payable_terms(bill):
         grn_line = line.batch.goods_receipt_line if line.batch_id else None
         if grn_line is None:
             continue
         # A Flow 2 order bills only the dyeing; the fabric came from the grey PO.
-        fabric_value = ZERO if po.fabric_flow == FABRIC_FLOW_OSCAR_TO_MILL else D(line.qty) * D(grn_line.unit_cost)
-        charge = round2(D(line.amount) - fabric_value)
+        fabric_value = ZERO if po.fabric_flow == FABRIC_FLOW_OSCAR_TO_MILL else D(qty) * D(grn_line.unit_cost)
+        charge = round2(D(qty) * D(rate) - fabric_value)
         if charge <= ZERO:
             continue
         PurchaseOrderExpense.objects.create(
@@ -738,7 +739,7 @@ def book_dyeing_bill(bill, *, user=None):
             category=PurchaseOrderExpense.CATEGORY_DYEING,
             expense_type="Dyeing charges",
             party=bill.party,
-            quantity=line.qty,
+            quantity=qty,
             amount=charge,
             expense_date=bill.bill_date,
             bill_reference=bill.vendor_bill_number,

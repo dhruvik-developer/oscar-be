@@ -1079,6 +1079,10 @@ def cancel_bill(bill, *, reason=None, user=None):
 #: moved to the payable; such a bill was approved.
 VENDOR_BILL_APPROVED_STATUSES = ("Approved", "Partially Paid", "Paid")
 VENDOR_BILL_MISMATCH_APPROVAL = "vendor_bill_mismatch"
+#: Which amount approving a mismatched bill accepts for the payable.
+APPROVAL_BASIS_VENDOR_BILL = "VENDOR_BILL"
+APPROVAL_BASIS_PO = "PO"
+APPROVAL_BASES = (APPROVAL_BASIS_VENDOR_BILL, APPROVAL_BASIS_PO)
 
 
 def vendor_bill_payment_summary(bill):
@@ -1136,6 +1140,65 @@ def vendor_bill_workflow(bill, *, approval_pending=False):
     return {"stage": stage, "label": label, "actions": actions}
 
 
+def vendor_bill_approval_basis(bill):
+    """The amount the latest approval accepted; older approvals took the vendor's."""
+    for entry in reversed(bill.approval_history or []):
+        if str(entry.get("action") or "").startswith("Approved"):
+            return entry.get("approvalBasis") or APPROVAL_BASIS_VENDOR_BILL
+    return APPROVAL_BASIS_VENDOR_BILL
+
+
+def _po_basis_terms(bill_lines, rows):
+    """``(line, qty, rate)`` at what was received x the PO rate.
+
+    ``billableQty`` repeats on every line of a fabric, so the lines share it:
+    a batch takes its own receipt and any other line what is left.
+    """
+    left = {}
+    terms = []
+    for line, row in zip(bill_lines, rows):
+        key = line.item_id or line.line_no
+        left.setdefault(key, D(str(row["billableQty"])))
+        grn_line = line.batch.goods_receipt_line if line.batch_id else None
+        wanted = D(grn_line.received_qty or 0) if grn_line is not None else left[key]
+        qty = min(wanted, left[key])
+        left[key] -= qty
+        if qty > ZERO:
+            terms.append((line, qty, D(str(row["poRate"]))))
+    return terms
+
+
+def _po_basis_summary(bill, bill_lines, rows):
+    """What approving this bill at the PO amount would make payable."""
+    if any(not row["poRate"] for row in rows):
+        return {"available": False, "reason": "A line is not on the purchase order, so it has no PO rate."}
+    terms = _po_basis_terms(bill_lines, rows)
+    if not terms:
+        return {"available": False, "reason": "Nothing received is left to bill at the PO rate."}
+    subtotal = sum((round2(qty * rate) for _, qty, rate in terms), ZERO)
+    gst_amount = round2(subtotal * D(bill.gst_pct or 0) / Decimal("100"))
+    return {
+        "available": True,
+        "qty": float(sum((qty for _, qty, _ in terms), ZERO)),
+        "subtotal": float(subtotal),
+        "gstAmount": float(gst_amount),
+        "total": float(round2(subtotal + gst_amount)),
+    }
+
+
+def vendor_bill_payable_terms(bill, matching=None):
+    """``(line, qty, rate)`` the payable carries, per the approved basis."""
+    lines = list(
+        bill.line_items.filter(deleted_at__isnull=True)
+        .select_related("batch__goods_receipt_line", "item")
+        .order_by("line_no")
+    )
+    if vendor_bill_approval_basis(bill) != APPROVAL_BASIS_PO:
+        return [(line, line.qty, line.rate) for line in lines]
+    matching = matching or compute_vendor_bill_matching(bill.client_id, bill)
+    return _po_basis_terms(lines, matching["lines"])
+
+
 def ensure_vendor_bill_payable(bill, *, matching=None, remarks=None, user=None):
     """The posted ``PurchaseBill`` behind an approved vendor bill.
 
@@ -1167,7 +1230,7 @@ def ensure_vendor_bill_payable(bill, *, matching=None, remarks=None, user=None):
             location_id=getattr(effective_po, "location_id", None),
             notes=remarks or bill.remarks or f"Recorded from Vendor Bill {bill.vendor_bill_number}",
         )
-        for line in bill.line_items.filter(deleted_at__isnull=True).order_by("line_no"):
+        for line, qty, rate in vendor_bill_payable_terms(bill, matching):
             PurchaseBillLine.objects.create(
                 client=bill.client,
                 purchase_bill=payable,
@@ -1175,13 +1238,15 @@ def ensure_vendor_bill_payable(bill, *, matching=None, remarks=None, user=None):
                 item=line.item,
                 batch_number=line.batch_number,
                 description=line.item_name or (line.item.name if line.item else "Fabric"),
-                qty=line.qty,
-                rate=line.rate,
+                qty=qty,
+                rate=rate,
                 tax_pct=bill.gst_pct,
                 uom=line.uom or "Meter",
             )
         payable.freeze_party_snapshot()
-    payable.other_charges = bill.other_charges
+    # Other charges are not on the PO, so a PO-amount approval leaves them out.
+    at_po_amount = vendor_bill_approval_basis(bill) == APPROVAL_BASIS_PO
+    payable.other_charges = ZERO if at_po_amount else bill.other_charges
     recalculate_document(payable)
 
     payable.status = "Unpaid"
@@ -1822,6 +1887,7 @@ def compute_vendor_bill_matching(client_id, bill):
         "reasons": reasons,
         "overallStatus": overall,
     }
+    result["poBasis"] = _po_basis_summary(bill, bill_lines, rows)
     if receipt_based and not grns:
         result["note"] = "No GRN found for this purchase order."
 

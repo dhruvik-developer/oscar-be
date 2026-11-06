@@ -301,6 +301,7 @@ class SalesInvoiceSerializer(DocumentSerializer):
     salesOrderNumber = serializers.CharField(source="sales_order.order_number", read_only=True)
     challanId = serializers.CharField(source="delivery_challan_id", read_only=True)
     challanNumber = serializers.CharField(source="delivery_challan.challan_number", read_only=True)
+    settlementDiscount = MoneyField(source="settlement_discount", read_only=True)
 
     #: ``Overdue`` is layered on at read time, never stored (db.md §12).
     displayStatus = serializers.SerializerMethodField()
@@ -308,7 +309,7 @@ class SalesInvoiceSerializer(DocumentSerializer):
     class Meta:
         model = SalesInvoice
         fields = HEADER_FIELDS + [
-            "invoice_number", "status", "displayStatus", "due_date",
+            "invoice_number", "status", "displayStatus", "due_date", "settlementDiscount",
             "sales_order", "salesOrderId", "salesOrderNumber", "delivery_challan", "challanId", "challanNumber", "proforma_invoice", "location",
             "irn", "eway_bill_number", "ewayBillNumber",
             "ack_no", "ackNo", "ack_date", "ackDate", "signed_qrcode", "signedQrcode",

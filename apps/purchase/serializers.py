@@ -709,7 +709,10 @@ class VendorBillSerializer(BaseModelSerializer):
                     other_vbs = VendorBillLine.objects.filter(
                         vendor_bill__purchase_order=po,
                         vendor_bill__deleted_at__isnull=True
-                    ).exclude(vendor_bill__status__in=["Cancelled", "Rejected"])
+                    ).exclude(vendor_bill__status__in=["Cancelled", "Rejected"]).exclude(
+                        # A cancelled payable frees its qty, as in vendor_bill_po_snapshot.
+                        vendor_bill__purchase_bill__status="Cancelled"
+                    )
                     if self.instance is not None:
                         other_vbs = other_vbs.exclude(vendor_bill=self.instance)
                     for ovb in other_vbs:
