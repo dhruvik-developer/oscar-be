@@ -6143,21 +6143,44 @@ class BatchListView(APIView):
 
         from .batch_services import serialize_batch
         from .batch_services import registry_eligible_takas
-        from .models import Batch
+        from .models import Batch, LotTaka
 
         params = request.query_params
         eligible_takas = registry_eligible_takas(request.client_id).select_related(
             "item", "item__category", "location", "fabric_quality", "design", "shade", "supplier"
         ).order_by("created_at")
+        # Grey fabric at a dyeing mill belongs on the Dyeing side until it is
+        # back: the part still at OSCAR stays Grey, so one batch can be in both.
+        fabric_type = params.get("fabricType")
+        sent_for_dyeing = LotTaka.objects.filter(
+            client_id=request.client_id, deleted_at__isnull=True,
+            jwo_outward_lines__outward__job_work_order__purchase_order__isnull=False,
+        )
+        at_mill = sent_for_dyeing.filter(available_quantity__gt=ZERO, location__code__startswith="SYS-WIP-")
+        batch_scope = Q(pk__in=eligible_takas.values("batch_id"))
+        if fabric_type == "DYED":
+            batch_scope |= Q(pk__in=at_mill.values("batch_id"))
+            eligible_takas = LotTaka.objects.filter(
+                Q(batch__fabric_type="DYED", pk__in=eligible_takas.values("pk")) | Q(pk__in=at_mill.values("pk"))
+            ).select_related(
+                "item", "item__category", "location", "fabric_quality", "design", "shade", "supplier"
+            ).order_by("created_at")
         qs = Batch.objects.filter(
-            client_id=request.client_id,
-            deleted_at__isnull=True,
-            pk__in=eligible_takas.values("batch_id"),
+            batch_scope, client_id=request.client_id, deleted_at__isnull=True,
         ).select_related(
             "item", "supplier", "owner_party"
         ).prefetch_related(
             Prefetch("takas", queryset=eligible_takas, to_attr="registry_eligible_takas")
         )
+        if fabric_type == "DYED":
+            qs = qs.filter(Q(fabric_type="DYED") | Q(pk__in=at_mill.values("batch_id")))
+        elif fabric_type:
+            in_house = LotTaka.objects.filter(
+                client_id=request.client_id, deleted_at__isnull=True, available_quantity__gt=ZERO,
+            ).exclude(location__code__startswith="SYS-WIP-")
+            qs = qs.filter(fabric_type=fabric_type).exclude(
+                Q(pk__in=sent_for_dyeing.values("batch_id")) & ~Q(pk__in=in_house.values("batch_id"))
+            )
         q = (params.get("q") or "").strip()
         if q:
             matching_po_ids = PurchaseOrder.objects.filter(
@@ -6195,7 +6218,7 @@ class BatchListView(APIView):
                 | Q(source_document_type__iexact="GoodsReceipt", source_document_id__in=matching_receipt_ids)
                 | Q(source_document_type__iexact="PurchaseBill", source_document_id__in=matching_bill_ids)
             ).distinct()
-        for param, field in (("origin", "origin"), ("ownership", "ownership"), ("fabricType", "fabric_type"),
+        for param, field in (("origin", "origin"), ("ownership", "ownership"),
                              ("supplierId", "supplier_id"), ("itemId", "item_id")):
             if params.get(param):
                 qs = qs.filter(**{field: params[param]})

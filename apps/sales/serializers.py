@@ -336,9 +336,9 @@ class ReceivableRowSerializer(BaseModelSerializer):
     customerName = serializers.CharField(source="party.name", read_only=True)
     invoiceNumber = serializers.CharField(source="invoice_number", read_only=True)
     invoiceDate = serializers.DateField(source="doc_date", read_only=True)
-    dueDate = serializers.DateField(read_only=True, allow_null=True)
-    paymentTerms = serializers.CharField(read_only=True, allow_null=True)
-    creditDays = serializers.IntegerField(read_only=True, allow_null=True)
+    dueDate = serializers.DateField(source="due_date", read_only=True, allow_null=True)
+    paymentTerms = serializers.CharField(source="payment_terms", read_only=True, allow_null=True)
+    creditDays = serializers.IntegerField(source="credit_days", read_only=True, allow_null=True)
     invoiceAmount = MoneyField(source="total", read_only=True)
     paidAmount = MoneyField(source="amount_paid", read_only=True)
     approvedDiscount = MoneyField(source="settlement_discount", read_only=True)
@@ -434,6 +434,7 @@ class EarlyPaymentDiscountRequestSerializer(BaseModelSerializer):
     decisionReason = serializers.CharField(source="decision_reason", read_only=True, allow_null=True)
     cancellationReason = serializers.CharField(source="cancellation_reason", read_only=True, allow_null=True)
     creditNoteNumber = serializers.CharField(source="credit_note.note_number", read_only=True, allow_null=True)
+    creditNoteId = serializers.CharField(source="credit_note_id", read_only=True, allow_null=True)
     invoiceOutstanding = serializers.SerializerMethodField()
 
     class Meta:
@@ -445,7 +446,7 @@ class EarlyPaymentDiscountRequestSerializer(BaseModelSerializer):
             "requestedAmount", "proposedAmount", "approvedAmount", "customerRequestDate",
             "reason", "notes", "attachments", "status", "requestedById",
             "requestedByName", "decidedByName", "decidedAt", "decisionReason",
-            "cancellationReason", "creditNoteNumber", "invoiceOutstanding",
+            "cancellationReason", "creditNoteId", "creditNoteNumber", "invoiceOutstanding",
             "created_at", "updated_at",
         ]
         read_only_fields = fields
@@ -515,6 +516,7 @@ class PaymentInSerializer(BaseModelSerializer):
     allocations = serializers.SerializerMethodField()
     unallocatedAmount = serializers.SerializerMethodField()
     referenceNumber = serializers.CharField(source="reference_number", required=False, allow_null=True, allow_blank=True)
+    transactionReference = serializers.CharField(source="transaction_reference", read_only=True, allow_null=True)
     #: Write-only: the target invoice(s) this payment settles.
     invoiceId = serializers.CharField(required=False, allow_null=True, write_only=True)
     allocationsInput = serializers.ListField(
@@ -525,7 +527,7 @@ class PaymentInSerializer(BaseModelSerializer):
         model = PaymentIn
         fields = [
             "id", "payment_number", "customerId", "customerName", "date", "amount",
-            "mode", "bankAccountId", "reference_number", "referenceNumber", "notes",
+            "mode", "bankAccountId", "reference_number", "referenceNumber", "transactionReference", "notes",
             "allocated_amount", "unallocatedAmount", "allocations", "status",
             "invoiceId", "allocationsInput", "created_at", "updated_at",
         ]

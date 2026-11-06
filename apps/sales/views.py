@@ -2244,6 +2244,7 @@ class PaymentInViewSet(TenantModelViewSet):
             bank_account=data.get("bank_account"),
             reference_number=data.get("reference_number"),
             notes=data.get("notes"),
+            transaction_reference=self.request.data.get("transactionReference"),
             allocations=allocations,
             invoice=invoice,
             user=self.request.user,

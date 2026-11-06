@@ -3,6 +3,7 @@ Factory fabric flows on one purchase order.
 
     Flow A  FACTORY_TO_OSCAR  factory -> OSCAR warehouse
     Flow B  FACTORY_TO_MILL   factory -> dyeing mill -> OSCAR warehouse
+    Flow C  OSCAR_TO_MILL     OSCAR -> dyeing mill -> OSCAR (``dyeing_dispatch``)
 
 A purchase order is the order; a batch is fabric that actually arrived. So:
 
@@ -43,6 +44,7 @@ from apps.core.money import ZERO, D, round2, round4
 from .models import (
     FABRIC_FLOW_FACTORY_TO_MILL,
     FABRIC_FLOW_FACTORY_TO_OSCAR,
+    FABRIC_FLOW_OSCAR_TO_MILL,
     FABRIC_FLOWS,
     PURCHASE_TYPE_GREY_STOCK,
     GoodsReceiptLine,
@@ -203,12 +205,12 @@ def validate_flow(value):
 
 
 def clean_dyeing_colour(attrs, instance=None):
-    """The PO's dyeing colour: required on a Factory -> Dyeing Mill -> OSCAR
-    order while it is Draft, kept off every other order, and fixed once the PO
-    has left Draft because its batches inherit it. An older order that left
-    Draft without one may still be given one."""
+    """The PO's dyeing colour: required on an order that goes to a dyeing mill
+    while it is Draft, kept off every other order, and fixed once the PO has
+    left Draft because its batches inherit it. An older order that left Draft
+    without one may still be given one."""
     flow = attrs["fabric_flow"] if "fabric_flow" in attrs else getattr(instance, "fabric_flow", None)
-    if flow != FABRIC_FLOW_FACTORY_TO_MILL:
+    if flow not in (FABRIC_FLOW_FACTORY_TO_MILL, FABRIC_FLOW_OSCAR_TO_MILL):
         attrs["dyeing_colour_name"] = None
         attrs["dyeing_colour_hex"] = None
         return attrs
@@ -252,17 +254,47 @@ def clean_dyeing_mill(attrs, instance=None):
     return attrs
 
 
-def require_dyeing_colour(po):
-    if po.fabric_flow == FABRIC_FLOW_FACTORY_TO_MILL and not (po.dyeing_colour_name or "").strip():
+def clean_dyeing_rate(attrs, instance=None):
+    """The agreed dyeing charge per unit: required on a Factory -> Dyeing Mill
+    -> OSCAR order while it is Draft, kept off every other order, and fixed
+    once the PO has left Draft. An older order may still be given one."""
+    flow = attrs["fabric_flow"] if "fabric_flow" in attrs else getattr(instance, "fabric_flow", None)
+    if flow != FABRIC_FLOW_FACTORY_TO_MILL:
+        attrs["dyeing_rate"] = None
+        return attrs
+    saved = getattr(instance, "dyeing_rate", None)
+    rate = attrs["dyeing_rate"] if "dyeing_rate" in attrs else saved
+    draft = instance is None or instance.status == "Draft"
+    if rate is None and draft:
+        raise ValidationFailed("Enter the dyeing rate for this order.", field_errors={"dyeingRate": ["Required."]})
+    if rate is not None and D(rate) <= ZERO:
+        raise ValidationFailed("The dyeing rate must be above zero.", field_errors={"dyeingRate": ["Must be above 0."]})
+    if not draft and saved is not None and (rate is None or D(rate) != D(saved)):
+        raise ValidationFailed(
+            "The dyeing rate cannot change once the PO has left Draft.",
+            field_errors={"dyeingRate": ["Locked after Draft."]},
+        )
+    return attrs
+
+
+def require_dyeing_details(po):
+    if po.fabric_flow not in (FABRIC_FLOW_FACTORY_TO_MILL, FABRIC_FLOW_OSCAR_TO_MILL):
+        return
+    if not (po.dyeing_colour_name or "").strip():
         raise ValidationFailed(
             f"Choose the dyeing colour on {po.po_number} first.", field_errors={"dyeingColourName": ["Required."]},
+        )
+    if po.fabric_flow == FABRIC_FLOW_FACTORY_TO_MILL and po.dyeing_rate is None:
+        raise ValidationFailed(
+            f"Enter the dyeing rate on {po.po_number} first.", field_errors={"dyeingRate": ["Required."]},
         )
 
 
 def receipt_fabric_type(po):
     """What fabric received against ``po`` is. Only the PO's delivery type
     decides it -- never the fabric's name, colour or the person receiving."""
-    return "DYED" if po is not None and po.fabric_flow == FABRIC_FLOW_FACTORY_TO_MILL else "GREY"
+    dyed = (FABRIC_FLOW_FACTORY_TO_MILL, FABRIC_FLOW_OSCAR_TO_MILL)
+    return "DYED" if po is not None and po.fabric_flow in dyed else "GREY"
 
 
 def check_receipt_fabric_type(po, requested):
@@ -293,6 +325,10 @@ def apply_order_extras(po, data, *, user=None, creating=False):
     endpoints, so an edit can never duplicate them)."""
     if not po.fabric_flow:
         return
+    if po.fabric_flow == FABRIC_FLOW_OSCAR_TO_MILL:
+        from . import dyeing_dispatch
+
+        dyeing_dispatch.set_source(po, data)
     if "yarnLines" in data:
         replace_yarn_lines(po, data.get("yarnLines") or [], user=user)
     if creating:
@@ -584,8 +620,8 @@ def _expense_fields(po, data, current=None):
         category = _get(data, "category")
         if category not in dict(PurchaseOrderExpense.CATEGORIES):
             raise ValidationFailed("Choose the cost category.", field_errors={"category": ["Unknown category."]})
-        if category == PurchaseOrderExpense.CATEGORY_DYEING and po.fabric_flow != FABRIC_FLOW_FACTORY_TO_MILL:
-            raise ValidationFailed("Dyeing costs belong to Factory -> Dyeing Mill orders.",
+        if category == PurchaseOrderExpense.CATEGORY_DYEING and po.fabric_flow == FABRIC_FLOW_FACTORY_TO_OSCAR:
+            raise ValidationFailed("Dyeing costs belong to orders that go to a dyeing mill.",
                                    field_errors={"category": ["Not for this flow."]})
         fields["category"] = category
     if has("expenseType"):
@@ -658,6 +694,74 @@ def add_expense(po, data, *, user=None, allocate=True):
     return expense
 
 
+def _assert_not_from_bill(expense):
+    if expense.vendor_bill_id:
+        raise Conflict(
+            "This charge comes from an approved vendor bill; cancel the bill to change it.",
+            code="EXPENSE_FROM_BILL",
+        )
+
+
+def bill_po_rate(po, po_line):
+    """What a bill's rate is compared with: on a dyeing-mill order the one
+    invoice rate covers the fabric and its dyeing together."""
+    rate = D(po_line.rate or 0)
+    if po.fabric_flow == FABRIC_FLOW_FACTORY_TO_MILL:
+        rate += D(po.dyeing_rate or 0)
+    return rate
+
+
+@transaction.atomic
+def book_dyeing_bill(bill, *, user=None):
+    """The dyeing part of an approved dyeing-mill bill goes to its own batch.
+
+    The fabric's value is already on the batch from its GRN, so what the bill
+    charges above that value is the dyeing. One entry per billed batch; GST is
+    recoverable and stays out of the cost."""
+    po = lock_order(bill.purchase_order)
+    booked = 0
+    lines = bill.line_items.filter(deleted_at__isnull=True).select_related("batch__goods_receipt_line")
+    for line in lines.order_by("line_no"):
+        grn_line = line.batch.goods_receipt_line if line.batch_id else None
+        if grn_line is None:
+            continue
+        # A Flow 2 order bills only the dyeing; the fabric came from the grey PO.
+        fabric_value = ZERO if po.fabric_flow == FABRIC_FLOW_OSCAR_TO_MILL else D(line.qty) * D(grn_line.unit_cost)
+        charge = round2(D(line.amount) - fabric_value)
+        if charge <= ZERO:
+            continue
+        PurchaseOrderExpense.objects.create(
+            client_id=po.client_id,
+            purchase_order=po,
+            batch_id=line.batch_id,
+            vendor_bill=bill,
+            category=PurchaseOrderExpense.CATEGORY_DYEING,
+            expense_type="Dyeing charges",
+            party=bill.party,
+            quantity=line.qty,
+            amount=charge,
+            expense_date=bill.bill_date,
+            bill_reference=bill.vendor_bill_number,
+            status="ACTUAL",
+            created_by=_user(user),
+        )
+        booked += 1
+    if booked:
+        _audit(po, user, "dyeing_bill", f"Bill {bill.vendor_bill_number} charged dyeing to {booked} batch(es).")
+        allocate_costs(po, user=user)
+
+
+@transaction.atomic
+def release_dyeing_bill(payable, *, user=None):
+    """A cancelled dyeing bill's charges leave its batches."""
+    expenses = _live(PurchaseOrderExpense.objects.filter(vendor_bill__purchase_bill=payable))
+    first = expenses.select_related("purchase_order").first()
+    if first is None:
+        return
+    expenses.update(deleted_at=timezone.now(), deleted_by=_user(user))
+    allocate_costs(first.purchase_order, user=user)
+
+
 @transaction.atomic
 def update_expense(po, expense_id, data, *, user=None):
     po = lock_order(po)
@@ -665,6 +769,7 @@ def update_expense(po, expense_id, data, *, user=None):
     expense = _live(po.fabric_expenses).filter(pk=expense_id).first()
     if expense is None:
         raise ValidationFailed("Cost entry not found.", field_errors={"id": ["Not found."]})
+    _assert_not_from_bill(expense)
     before = str(expense.amount)
     for field, value in _expense_fields(po, data, current=expense).items():
         setattr(expense, field, value)
@@ -682,6 +787,7 @@ def delete_expense(po, expense_id, *, user=None):
     expense = _live(po.fabric_expenses).filter(pk=expense_id).first()
     if expense is None:
         raise ValidationFailed("Cost entry not found.", field_errors={"id": ["Not found."]})
+    _assert_not_from_bill(expense)
     expense.deleted_at = timezone.now()
     expense.deleted_by = _user(user)
     expense.save(update_fields=["deleted_at", "deleted_by", "updated_at"])
@@ -888,6 +994,14 @@ def _desired_allocations(po):
     lines = _receipt_lines(po)
     batches = _line_batches(lines)
     lines = [l for l in lines if l.id in batches]
+    # Fabric back from the mill carries its value onto the dyed batch, so the
+    # grey batch keeps only what is still grey.
+    for returned in _live(GoodsReceiptLine.objects.filter(
+        source_batch__purchase_order=po, goods_receipt__deleted_at__isnull=True,
+    )):
+        for line in lines:
+            if batches[line.id].id == returned.source_batch_id:
+                line.received_qty = max(ZERO, D(line.received_qty) - D(returned.received_qty))
     desired = {}
     # The received fabric itself: what was received x the receipt rate.
     for line in lines:
@@ -895,12 +1009,20 @@ def _desired_allocations(po):
         if amount > ZERO:
             desired[(None, line.id)] = (amount, D(line.received_qty), D(line.received_qty), batches[line.id], line,
                                         FABRIC_COST_TYPE, "Fabric received")
+    expenses = list(_live(po.fabric_expenses).select_related("purchase_order_line"))
+    # Charged dyeing replaces an estimate of it, or the batches would pay twice.
+    dyeing_billed = any(e.batch_id for e in expenses)
     written_off = sum((v for c, v in discrepancy_totals(po).items() if c in PurchaseOrderDiscrepancy.WRITTEN_OFF), ZERO)
-    for expense in _live(po.fabric_expenses).select_related("purchase_order_line"):
+    for expense in expenses:
+        if dyeing_billed and expense.category == PurchaseOrderExpense.CATEGORY_DYEING and expense.status == "ESTIMATED":
+            continue
         scoped = [l for l in lines if not expense.purchase_order_line_id or l.purchase_order_line_id == expense.purchase_order_line_id]
         if not scoped:
             continue
         total, actual = _expected_basis(po, expense, scoped, written_off)
+        if expense.batch_id:
+            scoped = [l for l in scoped if batches[l.id].id == expense.batch_id]
+            total = actual = sum((D(l.received_qty) for l in scoped), ZERO)
         if total <= ZERO:
             continue
         amount = D(expense.amount)
@@ -1156,7 +1278,7 @@ def summary(po):
         "options": {
             "expenseCategories": [
                 {"value": v, "label": l} for v, l in PurchaseOrderExpense.CATEGORIES
-                if v != PurchaseOrderExpense.CATEGORY_DYEING or po.fabric_flow == FABRIC_FLOW_FACTORY_TO_MILL
+                if v != PurchaseOrderExpense.CATEGORY_DYEING or po.fabric_flow != FABRIC_FLOW_FACTORY_TO_OSCAR
             ],
             "discrepancyCategories": [{"value": v, "label": l} for v, l in PurchaseOrderDiscrepancy.CATEGORIES],
         },

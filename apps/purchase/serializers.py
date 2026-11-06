@@ -25,6 +25,7 @@ from apps.sales.serializers import line_serializer_for
 
 from .services import vendor_bill_payment_summary
 from .models import (
+    FABRIC_FLOW_FACTORY_TO_MILL,
     PURCHASE_TYPE_FINAL_JOB_WORK,
     PURCHASE_TYPES,
     Expense,
@@ -128,6 +129,22 @@ class PurchaseOrderSerializer(DocumentSerializer):
     dyeingColourHex = serializers.CharField(
         source="dyeing_colour_hex", required=False, allow_null=True, allow_blank=True
     )
+    dyeingRate = serializers.DecimalField(
+        source="dyeing_rate", max_digits=18, decimal_places=4, required=False, allow_null=True
+    )
+    #: Flow 2: written through ``dyeing_dispatch.set_source``.
+    sourcePurchaseOrderId = serializers.CharField(source="source_purchase_order_id", read_only=True)
+    sourcePoNumber = serializers.CharField(source="source_purchase_order.po_number", read_only=True, default=None)
+    dyeingBatches = serializers.SerializerMethodField()
+
+    def get_dyeingBatches(self, order):
+        if order.fabric_flow != "OSCAR_TO_MILL":
+            return []
+        lines = order.line_items.filter(deleted_at__isnull=True, source_batch__isnull=False).select_related("source_batch")
+        return [
+            {"batchId": str(line.source_batch_id), "batchCode": line.source_batch.batch_code, "qty": str(line.qty)}
+            for line in lines.order_by("line_no")
+        ]
 
     class Meta:
         model = PurchaseOrder
@@ -136,6 +153,7 @@ class PurchaseOrderSerializer(DocumentSerializer):
             "reference_number", "auto_generated", "vendorId", "vendorName",
             "billedStatus", "purchaseType", "projectId", "projectCode", "projectName",
             "fabricFlow", "dyeingMillId", "dyeingMillName", "dyeingColourName", "dyeingColourHex",
+            "dyeingRate", "sourcePurchaseOrderId", "sourcePoNumber", "dyeingBatches",
         ]
         read_only_fields = READ_ONLY_HEADER_FIELDS + ["po_number", "auto_generated"]
 
@@ -162,7 +180,7 @@ class PurchaseOrderSerializer(DocumentSerializer):
         return validate_flow(value)
 
     def validate(self, attrs):
-        from .fabric_flow import clean_dyeing_colour, clean_dyeing_mill, mark_purchase_type
+        from .fabric_flow import clean_dyeing_colour, clean_dyeing_mill, clean_dyeing_rate, mark_purchase_type
 
         attrs = super().validate(attrs)
         instance = self.instance
@@ -176,6 +194,7 @@ class PurchaseOrderSerializer(DocumentSerializer):
             attrs["dyeing_mill"] = None
         attrs = clean_dyeing_colour(attrs, instance)
         attrs = clean_dyeing_mill(attrs, instance)
+        attrs = clean_dyeing_rate(attrs, instance)
         purchase_type = attrs.get("purchase_type")
         if instance is None:
             # Final job work POs are only generated from a verified production
@@ -499,7 +518,9 @@ class VendorBillSerializer(BaseModelSerializer):
         if po_id and not data.get("vendorId"):
             from apps.purchase.models import PurchaseOrder
             po = PurchaseOrder.objects.filter(pk=po_id).select_related("party").first()
-            if po and po.party_id:
+            # A dyeing-mill order is billed by its factory or its mill: the
+            # user says which, it is not assumed.
+            if po and po.party_id and po.fabric_flow != FABRIC_FLOW_FACTORY_TO_MILL:
                 data["vendorId"] = str(po.party_id)
         return super().to_internal_value(data)
     vendorId = TenantPrimaryKeyRelatedField(source="party", model="masters.Party")
@@ -613,12 +634,14 @@ class VendorBillSerializer(BaseModelSerializer):
                 raise serializers.ValidationError(
                     {"purchaseOrderId": f"Purchase order {po.po_number} is cancelled."}
                 )
+        mill_po = po is not None and po.fabric_flow == FABRIC_FLOW_FACTORY_TO_MILL
+        allowed_parties = {po.party_id, po.dyeing_mill_id} - {None} if mill_po else {getattr(po, "party_id", None)} - {None}
         chosen_party = attrs.get("party")
-        if po and po.party_id and chosen_party is not None and chosen_party.pk != po.party_id:
+        if allowed_parties and chosen_party is not None and chosen_party.pk not in allowed_parties:
             raise serializers.ValidationError(
                 {"vendorId": f"This vendor is not the vendor on purchase order {po.po_number}."}
             )
-        if po and po.party:
+        if po and po.party and not mill_po:
             attrs["party"] = po.party
 
         other_charges = attrs.get("other_charges")
@@ -660,6 +683,10 @@ class VendorBillSerializer(BaseModelSerializer):
                     batch = Batch.objects.filter(
                         purchase_order=po, batch_code=b_num, deleted_at__isnull=True
                     ).first()
+                if mill_po and batch is None:
+                    raise serializers.ValidationError(
+                        {"lineItems": "Every line of this bill needs its batch."}
+                    )
                 if batch:
                     if batch.purchase_order_id != po.id:
                         raise serializers.ValidationError(

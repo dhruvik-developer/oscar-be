@@ -14,6 +14,10 @@ def on_purchase_order(req, decision):
         return
     po.status = {"Approved": "Approved", "Rejected": "Rejected", "Returned": "Draft"}[decision]
     po.save(update_fields=["status", "updated_at"])
+    if po.status == "Approved":
+        from apps.purchase import dyeing_dispatch
+
+        dyeing_dispatch.dispatch_planned(po, user=req.decided_by)
 
 
 @approval_handler("vendor_bill_mismatch")

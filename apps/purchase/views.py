@@ -56,7 +56,7 @@ from apps.sales.views import PostedReturnGuardMixin, SalesDocumentViewSet, _clon
 
 
 
-from . import fabric_flow, services
+from . import dyeing_dispatch, fabric_flow, services
 
 from .models import (
 
@@ -227,7 +227,7 @@ class PurchaseOrderViewSet(SalesDocumentViewSet):
     def _flow_order(self, pk):
         return self.get_queryset().select_related("party", "dyeing_mill").get(pk=pk)
 
-    def _flow_write(self, request, pk, permission, work, *, status_code=status.HTTP_200_OK):
+    def _flow_write(self, request, pk, permission, work, *, status_code=status.HTTP_200_OK, answer=None):
         """Run one fabric-flow write under the idempotency key (a replayed
         Save returns the first response instead of writing twice) and answer
         with the PO's refreshed fabric-flow summary."""
@@ -244,11 +244,37 @@ class PurchaseOrderViewSet(SalesDocumentViewSet):
         try:
             with transaction.atomic():
                 work(po)
-                body = fabric_flow.summary(self._flow_order(pk))
+                body = (answer or fabric_flow.summary)(self._flow_order(pk))
         except Exception:
             idempotency.fail(record)
             raise
         return idempotency.finish(record, Response(body, status=status_code))
+
+    @action(detail=False, methods=["get"], url_path="grey-sources")
+    def grey_sources(self, request):
+        """Grey fabric POs with stock free to send for dyeing."""
+        return Response({"results": dyeing_dispatch.grey_sources(request.client_id)})
+
+    @action(detail=True, methods=["get"], url_path="grey-batches")
+    def grey_batches(self, request, pk=None):
+        return Response({"results": dyeing_dispatch.source_batches(self._flow_order(pk))})
+
+    @action(detail=True, methods=["get"], url_path="dyeing")
+    def dyeing_summary(self, request, pk=None):
+        """Grey batches, dyeing dispatches and dyed batches of an OSCAR -> mill order."""
+        return Response(dyeing_dispatch.summary(self._flow_order(pk)))
+
+    @action(detail=True, methods=["post"], url_path="dyeing/dispatches")
+    def dyeing_send(self, request, pk=None):
+        return self._flow_write(request, pk, "receive_goods",
+                                lambda po: dyeing_dispatch.dispatch_planned(po, user=request.user),
+                                status_code=status.HTTP_201_CREATED, answer=dyeing_dispatch.summary)
+
+    @action(detail=True, methods=["post"], url_path=r"dyeing/dispatches/(?P<outward_id>[^/.]+)/returns")
+    def dyeing_return(self, request, pk=None, outward_id=None):
+        return self._flow_write(request, pk, "receive_goods",
+                                lambda po: dyeing_dispatch.receive_return(po, outward_id, request.data, user=request.user),
+                                status_code=status.HTTP_201_CREATED, answer=dyeing_dispatch.summary)
 
     @action(detail=True, methods=["get"], url_path="fabric-flow")
     def fabric_flow_summary(self, request, pk=None):
@@ -339,7 +365,7 @@ class PurchaseOrderViewSet(SalesDocumentViewSet):
 
         from apps.core import approval_services
 
-        fabric_flow.require_dyeing_colour(self.get_object())
+        fabric_flow.require_dyeing_details(self.get_object())
 
         res = self._transition(request, from_statuses=("Draft", "Issued"), to_status="Pending Approval")
 
@@ -404,6 +430,7 @@ class PurchaseOrderViewSet(SalesDocumentViewSet):
 
 
         res = self._transition(request, from_statuses=("Pending Approval",), to_status="Approved")
+        dyeing_dispatch.dispatch_planned(order, user=request.user)
 
         appr_req = ApprovalRequest.objects.filter(
 
@@ -3612,6 +3639,15 @@ class VendorBillViewSet(TenantModelViewSet):
 
 
     
+    @action(detail=False, methods=["get"], url_path="billable-pos")
+    def billable_pos(self, request):
+        """POs that still have received fabric to bill."""
+        orders = PurchaseOrder.objects.filter(client_id=request.client_id, deleted_at__isnull=True).exclude(status="Cancelled")
+        return Response({"results": [
+            str(po.id) for po in orders.select_related("party", "dyeing_mill")
+            if services.vendor_bill_po_snapshot(po)["poSummary"]["canCreateBill"]
+        ]})
+
     @action(detail=False, methods=["get"], url_path="po-details")
     def po_details(self, request):
         """Fetch PO summary, vendor details, and batch-wise billing metrics."""
@@ -3973,6 +4009,8 @@ class VendorBillViewSet(TenantModelViewSet):
                 f"Vendor bill {bill.vendor_bill_number} does not match PO/GRN: "
 
                 + ("; ".join((matching.get("reasons") or [])[:3]) or "variance")
+
+                + f". Approving accepts the vendor bill total {D(bill.total or 0)}, not the PO amount"
 
                 + (f". Remarks: {remarks}" if remarks else "")
 
@@ -4727,7 +4765,7 @@ class VendorBillViewSet(TenantModelViewSet):
                 code="BILL_NOT_PAYABLE",
             )
         po = bill.purchase_order
-        if po is not None and po.party_id and po.party_id != bill.party_id:
+        if po is not None and po.party_id and bill.party_id not in (po.party_id, po.dyeing_mill_id):
             raise Conflict(
                 f"This bill's vendor does not match purchase order {po.po_number}.",
                 code="BILL_VENDOR_MISMATCH",

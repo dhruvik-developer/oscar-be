@@ -59,8 +59,13 @@ GREY_STOCK_PURCHASE_TYPES = {
 #:                     Fabric batch.
 FABRIC_FLOW_FACTORY_TO_OSCAR = "FACTORY_TO_OSCAR"
 FABRIC_FLOW_FACTORY_TO_MILL = "FACTORY_TO_MILL"
+#:   OSCAR_TO_MILL     OSCAR -> dyeing mill -> OSCAR; a dyeing order on the mill
+#:                     for batches of a grey fabric PO. Each return opens a Dyed
+#:                     batch (``dyeing_dispatch``).
+FABRIC_FLOW_OSCAR_TO_MILL = "OSCAR_TO_MILL"
 FABRIC_FLOWS = [
     (FABRIC_FLOW_FACTORY_TO_OSCAR, "Factory -> OSCAR Warehouse"),
+    (FABRIC_FLOW_OSCAR_TO_MILL, "OSCAR Warehouse -> Dyeing Mill -> OSCAR Warehouse"),
     (FABRIC_FLOW_FACTORY_TO_MILL, "Factory -> Dyeing Mill -> OSCAR"),
 ]
 #: A GRN may only be posted against an issued, approved order.
@@ -124,6 +129,13 @@ class PurchaseOrder(DocumentHeader):
     dyeing_colour_name = models.TextField(null=True, blank=True)
     #: ``#RRGGBB`` swatch of that colour, when one was picked.
     dyeing_colour_hex = models.TextField(null=True, blank=True)
+    #: Flow 2: the grey fabric PO whose batches this dyeing order sends.
+    source_purchase_order = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.SET_NULL, related_name="dyeing_orders"
+    )
+    #: Flow B: the agreed dyeing charge per unit. A bill's rate covers fabric
+    #: and dyeing together, so it is matched against ``rate + dyeing_rate``.
+    dyeing_rate = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
 
     class Meta:
         db_table = "purchase_orders"
@@ -145,6 +157,10 @@ class PurchaseOrderLine(DocumentLine):
     #: DERIVED in the receipt / billing transactions.
     received_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
     billed_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    #: Flow 2: the grey batch this line sends for dyeing.
+    source_batch = models.ForeignKey(
+        "inventory.Batch", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
 
     class Meta(DocumentLine.Meta):
         db_table = "purchase_order_lines"
@@ -305,6 +321,10 @@ class GoodsReceipt(TenantModel, LegacyIdMixin):
     )
     qc_status = models.TextField(choices=choices(GRN_QC_STATUSES), default="Pending")
     qc_note = models.TextField(null=True, blank=True)
+    #: Set when this receipt is dyed fabric coming back from a dyeing mill.
+    dyeing_outward = models.ForeignKey(
+        "jobwork.JWOOutward", null=True, blank=True, on_delete=models.SET_NULL, related_name="dyeing_receipts"
+    )
     qc_by = models.ForeignKey(
         "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
@@ -358,6 +378,10 @@ class GoodsReceiptLine(TenantModel):
     remarks = models.TextField(null=True, blank=True)
     batch_number = models.TextField(null=True, blank=True)
     unit_cost = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    #: Dyeing return: the grey batch this dyed fabric came from.
+    source_batch = models.ForeignKey(
+        "inventory.Batch", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
     variation_pct = models.DecimalField(max_digits=9, decimal_places=4, null=True, blank=True)
 
     class Meta:
@@ -425,7 +449,7 @@ class PurchaseReturn(DocumentHeader):
     return_number = models.TextField(null=True, blank=True)
     debit_note_number = models.TextField(null=True, blank=True)
     status = models.TextField(
-        choices=choices(["Draft", "Posted", "Cancelled"]), default="Posted"
+        choices=choices(["Draft", "Posted", "Cancelled", "Settled"]), default="Posted"
     )
     purchase_bill = models.ForeignKey(
         PurchaseBill, on_delete=models.PROTECT, related_name="returns"
@@ -765,6 +789,14 @@ class PurchaseOrderExpense(TenantModel):
     #: Charged to one fabric line only; empty spreads over the whole order.
     purchase_order_line = models.ForeignKey(
         PurchaseOrderLine, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    #: Charged to this batch alone, instead of being spread.
+    batch = models.ForeignKey(
+        "inventory.Batch", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    #: The approved vendor bill this dyeing charge came from; it follows that bill.
+    vendor_bill = models.ForeignKey(
+        VendorBill, null=True, blank=True, on_delete=models.SET_NULL, related_name="dyeing_expenses"
     )
     category = models.TextField(choices=CATEGORIES)
     expense_type = models.TextField()
