@@ -110,10 +110,16 @@ class DepartmentSerializer(BaseModelSerializer):
         return attrs
 
     def get_employees(self, department):
-        return getattr(department, "employee_count", None)
+        count = getattr(department, "employee_count", None)
+        if count is None:
+            count = department.employees.filter(deleted_at__isnull=True).count()
+        return count
 
     def get_teams(self, department):
-        return getattr(department, "team_count", None)
+        count = getattr(department, "team_count", None)
+        if count is None:
+            count = department.teams.filter(deleted_at__isnull=True).count()
+        return count
 
 
 class DesignationSerializer(BaseModelSerializer):
@@ -645,6 +651,7 @@ class PayslipSerializer(BaseModelSerializer):
     month = serializers.DateField(source="period_month", read_only=True)
     standardSalary = MoneyField(source="standard_salary", read_only=True)
     earnedSalary = MoneyField(source="earned_salary", read_only=True)
+    earnedSalaryOverride = MoneyField(write_only=True, required=False, allow_null=True)
     additionalEarnings = MoneyField(source="additional_earnings", required=False)
     advance = MoneyField(source="advance_recovery", required=False)
     paidLeaves = serializers.DecimalField(
@@ -671,7 +678,7 @@ class PayslipSerializer(BaseModelSerializer):
         model = Payslip
         fields = [
             "id", "empId", "employeeId", "name", "role", "department", "month",
-            "standardSalary", "earnedSalary", "additionalEarnings", "deductions",
+            "standardSalary", "earnedSalary", "earnedSalaryOverride", "additionalEarnings", "deductions",
             "advance", "paidLeaves", "basic", "hra", "allowances", "status",
             "paidAmount", "paymentDate", "bank", "attendedDays", "totalDays",
             "netPayable", "earned_salary_overridden", "components", "breakdown",

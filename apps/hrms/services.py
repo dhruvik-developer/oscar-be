@@ -826,8 +826,7 @@ def approve_leave(leave_request, *, user=None, remark=None):
             user=user,
         )
 
-    balance.used = D(balance.used) + D(leave_request.days)
-    balance.save(update_fields=["used", "updated_at"])
+    balance.refresh_from_db(fields=["used", "balance", "updated_at"])
 
     # api.md §11.8 -- leave-derived calendar events are generated, not entered.
     CalendarEvent.objects.create(
@@ -885,8 +884,7 @@ def cancel_leave(leave_request, *, user=None, reason=None):
             leave_request.client_id, leave_request.employee_id,
             leave_request.leave_type_id, leave_request.from_date.year,
         )
-        balance.used = max(D(balance.used) - D(leave_request.days), ZERO)
-        balance.save(update_fields=["used", "updated_at"])
+        balance.refresh_from_db(fields=["used", "balance", "updated_at"])
 
         # Source-tagged events make this exact, rather than a fuzzy date match.
         CalendarEvent.objects.filter(
@@ -1124,11 +1122,10 @@ def process_payroll(*, client, period_month, employee_ids=None, user=None):
                 settled.paid_leaves = paid_leaves
                 settled.earned_salary = result["earnedSalary"]
                 settled.net_payable = result["netPayable"]
-                if settled.paid_amount == 0:
-                    settled.paid_amount = result["netPayable"]
+                # Never touch paid_amount on a settled (Approved/Paid) slip.
                 settled.save(update_fields=[
                     "standard_salary", "total_days", "attended_days", "paid_leaves",
-                    "earned_salary", "net_payable", "paid_amount", "updated_at"
+                    "earned_salary", "net_payable", "updated_at"
                 ])
             payslips.append(settled)
             continue

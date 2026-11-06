@@ -15,6 +15,7 @@ from django.db.models import DecimalField, F, Q, Sum, Value
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
+from apps.accounts.models import Client
 from apps.core.exceptions import BusinessRuleViolation, Codes, ValidationFailed
 from apps.core.money import ZERO, D, round2, round4
 from apps.core.numbering import allocate_number
@@ -167,7 +168,6 @@ def system_account(client_id, system_key):
     if account is None:
         spec = next((item for item in SYSTEM_ACCOUNTS if item[0] == system_key), None)
         if spec:
-            from apps.accounts.models import Client
             client = Client.objects.filter(id=getattr(client_id, "id", client_id)).first()
             if client:
                 # A system account added after a workspace was set up may find
@@ -300,6 +300,12 @@ def reverse_entry(entry, *, user=None, narration=None):
     if JournalEntry.objects.filter(reversal_of=entry, deleted_at__isnull=True).exists():
         return None  # already reversed
 
+    # Mark the original as Reversed first so any query that excludes reversed
+    # entries sees only the mirror going forward. The mirror posts within the
+    # same transaction; the original's status flip is committed together with it.
+    party_ids = {line.party_id for line in entry.lines.all() if line.party_id}
+    JournalEntry.objects.filter(pk=entry.pk).update(status="Reversed")
+
     postings = [
         Posting(
             line.account,
@@ -321,11 +327,10 @@ def reverse_entry(entry, *, user=None, narration=None):
         user=user,
         reversal_of=entry,
     )
-    JournalEntry.objects.filter(pk=entry.pk).update(status="Reversed")
     # Ledgers leave out both the reversed original and its mirror, so the pair
-    # nets to zero. The mirror's own post ran before the status flip above;
-    # refresh the party balances now that the original is excluded.
-    for party_id in {line.party_id for line in entry.lines.all() if line.party_id}:
+    # nets to zero. Refresh party balances now that both entries are posted
+    # and the original is excluded.
+    for party_id in party_ids:
         recalculate_party_balance(entry.client_id, party_id)
     return reversal
 
@@ -663,15 +668,17 @@ def post_payment_out(payment, *, user=None):
 
 def post_purchase_return(purchase_return, *, user=None):
     """Dr Creditors | Cr Inventory (stock lines), Cr Purchase Return (the
-    rest), Cr GST Input.
+    rest), Cr GST Input, Cr Freight (other charges).
 
     Mirrors ``purchase_bill_postings``: the bill debited Inventory for
     stock-holding lines, so returning them must credit Inventory -- crediting
     Purchase Returns left the ledger's stock value above the physical stock.
+    Freight and other charges debited on the original bill are credited back.
     """
     client_id = purchase_return.client_id
     tax = round2(purchase_return.total_tax)
-    goods = round2(purchase_return.total - tax)
+    freight = round2(D(purchase_return.freight_charges) + D(purchase_return.other_charges))
+    goods = round2(purchase_return.total - tax - freight)
     stock_net = non_stock_net = ZERO
     for line in purchase_return.line_items.filter(deleted_at__isnull=True).select_related("item"):
         net = D(line.amount or 0) - D(line.discount_amount or 0)
@@ -688,6 +695,7 @@ def post_purchase_return(purchase_return, *, user=None):
                   party=purchase_return.party),
             credit(system_account(client_id, "stock"), stock_amt),
             credit(system_account(client_id, "purchase_return"), round2(goods - stock_amt)),
+            credit(system_account(client_id, "freight"), freight),
             credit(system_account(client_id, "gst_input"), tax),
         ],
         entry_date=purchase_return.doc_date,
@@ -1068,14 +1076,17 @@ def party_ledger(client_id, party_id, *, date_from=None, date_to=None):
         .order_by("journal_entry__entry_date", "journal_entry__created_at", "line_no")
     )
 
+    is_vendor_or_processor = party and party.type in ("Vendor", "Processor")
+
     if date_from:
         prior = queryset.filter(journal_entry__entry_date__lt=date_from)
-        opening = round2(opening + _sum(prior, "debit") - _sum(prior, "credit"))
+        if is_vendor_or_processor:
+            opening = round2(opening + _sum(prior, "credit") - _sum(prior, "debit"))
+        else:
+            opening = round2(opening + _sum(prior, "debit") - _sum(prior, "credit"))
         queryset = queryset.filter(journal_entry__entry_date__gte=date_from)
     if date_to:
         queryset = queryset.filter(journal_entry__entry_date__lte=date_to)
-
-    is_vendor_or_processor = party and party.type in ("Vendor", "Processor")
     running = opening
     entries = []
     for line in queryset:

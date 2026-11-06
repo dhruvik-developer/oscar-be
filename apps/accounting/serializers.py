@@ -1,4 +1,6 @@
 """Accounts serializers (api.md §8)."""
+from decimal import Decimal
+
 from rest_framework import serializers
 
 from apps.core.money import D, round2
@@ -95,7 +97,23 @@ class BankAccountSerializer(BaseModelSerializer):
         ]
 
     def get_balance(self, bank_account):
-        return getattr(bank_account, "computed_balance", None)
+        balance = getattr(bank_account, "computed_balance", None)
+        if balance is None:
+            from django.db.models import DecimalField, Sum, Value
+            from django.db.models.functions import Coalesce
+            from decimal import Decimal
+            rows = JournalLine.objects.filter(
+                client_id=bank_account.client_id,
+                account_id=bank_account.account_id,
+                deleted_at__isnull=True,
+            ).exclude(journal_entry__status="Reversed").exclude(
+                journal_entry__reversal_of__isnull=False
+            ).aggregate(
+                net=Coalesce(Sum("debit"), Value(Decimal("0.00")))
+                - Coalesce(Sum("credit"), Value(Decimal("0.00")))
+            )
+            balance = round2(D(bank_account.opening_balance) + D(rows["net"] or Decimal("0.00")))
+        return balance
 
 
 class JournalLineSerializer(BaseModelSerializer):
@@ -202,13 +220,34 @@ class BudgetSerializer(BaseModelSerializer):
         ]
 
     def get_actual(self, budget):
-        return getattr(budget, "actual_amount", None)
-
-    def get_variance(self, budget):
         actual = getattr(budget, "actual_amount", None)
         if actual is None:
+            from django.db.models import DecimalField, OuterRef, Subquery, Sum, Value
+            from django.db.models.functions import Coalesce
+            from decimal import Decimal
+            sub = (
+                JournalLine.objects.filter(
+                    client_id=budget.client_id,
+                    account_id=budget.account_id,
+                    deleted_at__isnull=True,
+                    journal_entry__entry_date__gte=budget.period_start,
+                    journal_entry__entry_date__lte=budget.period_end,
+                )
+                .exclude(journal_entry__status="Reversed")
+                .exclude(journal_entry__reversal_of__isnull=False)
+                .aggregate(
+                    net=Coalesce(Sum("debit"), Value(Decimal("0.00")))
+                    - Coalesce(Sum("credit"), Value(Decimal("0.00")))
+                )
+            )
+            actual = sub["net"] or Decimal("0.00")
+        return round2(actual)
+
+    def get_variance(self, budget):
+        actual = self.get_actual(budget)
+        if actual is None:
             return None
-        return budget.amount - actual
+        return round2(budget.amount - actual)
 
 
 class ExpenseCategorySerializer(BaseModelSerializer):

@@ -80,7 +80,7 @@ class ProductionInstructionViewSet(TenantModelViewSet):
             width=data.get("width"),
             gsm=data.get("gsm"),
             tentative_rate=data.get("tentative_rate") or 0,
-            agreed_rate=data.get("agreed_rate") or data.get("agreed_job_rate") or 0,
+            agreed_rate=data.get("agreed_rate") or 0,
             rate_uom=data.get("rate_uom") or "Meter",
             special_terms=data.get("special_terms"),
             expected_start_date=data.get("expected_start_date"),
@@ -90,7 +90,7 @@ class ProductionInstructionViewSet(TenantModelViewSet):
             pi_date=data.get("pi_date"),
             fabric=data.get("fabric"),
             process_type=data.get("process_type"),
-            agreed_job_rate=data.get("agreed_job_rate") or data.get("agreed_rate") or 0,
+            agreed_job_rate=data.get("agreed_job_rate") or 0,
             grey_lot=data.get("grey_lot"),
             status="Draft",
             user=self.request.user,
@@ -115,16 +115,11 @@ class ProductionInstructionViewSet(TenantModelViewSet):
         serializer = VerifyInstructionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        raw_rejected = (
-            request.data.get("rejectedQty")
-            if isinstance(request.data, dict) and "rejectedQty" in request.data
-            else data.get("rejectedQty", data.get("rejected_qty", 0))
-        )
         instruction = services.verify_instruction(
             self.get_object(),
             user=request.user,
             reason=data.get("reason") or request.data.get("reason"),
-            rejected_qty=raw_rejected,
+            rejected_qty=data.get("rejectedQty", 0),
             physically_verified_qty=data.get("physicallyVerifiedQty") or request.data.get("physicallyVerifiedQty"),
             action=data.get("action") or request.data.get("action"),
             verified_by_employee_id=data.get("verifiedByEmployeeId") or request.data.get("verifiedByEmployeeId"),

@@ -562,8 +562,9 @@ class ProjectViewSet(TenantModelViewSet):
         return super().perform_create(serializer)
 
     def perform_update(self, serializer):
-        # A generic PATCH must never slip past the completion gate: completing
-        # goes through the service so open stages still block it (api.md §10.3).
+        # Completing a project must go through the completion gate so open
+        # stages still block it (api.md §10.3). A generic PATCH that sets
+        # status="Completed" is redirected to the proper completion flow.
         instance = serializer.instance
         if (
             serializer.validated_data.get("status") == "Completed"
@@ -571,7 +572,19 @@ class ProjectViewSet(TenantModelViewSet):
         ):
             serializer.validated_data.pop("status", None)
             updated = super().perform_update(serializer)
-            services.complete_project(updated, user=self.request.user, force=False)
+            try:
+                completed = services.complete_project(
+                    updated, user=self.request.user, force=False
+                )
+            except BusinessRuleViolation as exc:
+                # Open stages block completion: restore the pre-patch status
+                # and surface the blocker instead of silently dropping it.
+                instance.refresh_from_db()
+                raise Conflict(
+                    str(exc.detail or exc),
+                    code=getattr(exc, "code", "COMPLETION_BLOCKED"),
+                    payload=getattr(exc, "payload", None),
+                )
             updated.refresh_from_db()
             self._concurrency_instance = updated
             return updated
