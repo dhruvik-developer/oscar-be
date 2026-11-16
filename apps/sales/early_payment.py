@@ -483,6 +483,154 @@ def approve_request(req, *, user=None, amount=None, reason=None):
     return req
 
 
+# ---------------------------------------------------------------------------
+# Discount granted together with a customer receipt (integrated workflow)
+# ---------------------------------------------------------------------------
+@transaction.atomic
+def grant_discount_at_receipt(
+    *, client, invoice, payment, amount, discount_type=None, reason=None, user=None
+):
+    """Grant and post a discount at the moment a customer receipt is recorded.
+
+    This is the integrated equivalent of creating, submitting and approving a
+    discount request, collapsed into the receipt's own atomic transaction. It
+    deliberately reuses the existing credit-note posting path
+    (create -> approve -> post), so a discount is booked exactly like any other
+    customer credit note: Dr Sales Returns (/ Dr GST Output) | Cr Debtors. The
+    bank/cash account is never touched -- only the receipt's cash amount is a
+    payment. A separate, approved EarlyPaymentDiscountRequest row is kept so
+    the discount has its own record, ledger trail and reversal path
+    (cancel_request reverses the credit note).
+
+    Granting authority is unchanged: the actor must hold
+    ``approve_payment_discount`` (or be a superuser). Unlike the request flow
+    there is no separate requester, so the separation-of-duties rule that
+    stops a requester deciding their own request does not apply here.
+    """
+    from apps.accounting import note_services, services as ledger
+
+    from .models import DISCOUNT_TYPE_DEFAULT, DISCOUNT_TYPES
+    from .services import refresh_invoice_payment_status
+
+    if not has_permission(user, "approve_payment_discount"):
+        raise PermissionDenied("You don't have permission to grant a discount with a receipt.")
+
+    invoice = SalesInvoice.objects.select_for_update().get(pk=invoice.pk)
+    payment = PaymentIn.objects.select_for_update().get(pk=payment.pk)
+
+    if invoice.client_id != client.id or invoice.party_id != payment.party_id:
+        raise ValidationFailed(
+            "The discount invoice and the receipt must belong to the same customer.",
+            field_errors={"invoiceId": ["Customer mismatch."]},
+        )
+    if invoice.posted_at is None or invoice.status in ("Draft", "Cancelled"):
+        raise BusinessRuleViolation(
+            "A discount can only be granted on a finalized, active invoice.", code=Codes.NOT_FINALIZED
+        )
+    if payment.status != "Active":
+        raise BusinessRuleViolation("That receipt has been cancelled.", code=Codes.ALREADY_CANCELLED)
+
+    allocation = _allocation(invoice, payment)
+    if allocation is None:
+        raise ValidationFailed(
+            "Allocate the receipt to this invoice before granting a discount.",
+            field_errors={"invoiceId": ["Not allocated to this invoice."]},
+        )
+
+    discount_type = (discount_type or DISCOUNT_TYPE_DEFAULT).strip()
+    if discount_type not in DISCOUNT_TYPES:
+        raise ValidationFailed(
+            "Choose a supported discount type.", field_errors={"discountType": ["Unsupported type."]}
+        )
+
+    reason = (reason or "").strip()
+    if not reason:
+        raise ValidationFailed("Give a reason for the discount.", field_errors={"discountReason": ["Required."]})
+
+    granted = _amount(amount, "discountAmount")
+    # Cash already allocated to this invoice settled part of it. Never let the
+    # combined cash + discount exceed what the customer still owes.
+    available = round2(D(invoice.total) - D(invoice.amount_paid) - D(invoice.settlement_discount))
+    if granted > available + ROUNDING_TOLERANCE:
+        raise BusinessRuleViolation(
+            f"The discount ({granted}) plus this receipt's allocation exceeds the "
+            f"invoice's outstanding balance ({available}).",
+            code="DISCOUNT_EXCEEDS_OUTSTANDING",
+            payload={"granted": str(granted), "available": str(available)},
+        )
+
+    duplicate = EarlyPaymentDiscountRequest.objects.filter(
+        client_id=client.id, invoice=invoice, payment=payment, deleted_at__isnull=True,
+    ).exclude(status__in=["Rejected", "Cancelled"]).first()
+    if duplicate is not None:
+        raise Conflict(
+            f"Discount request {duplicate.request_number} already covers this receipt on this invoice.",
+            code="DUPLICATE_DISCOUNT_REQUEST",
+            payload={"requestId": str(duplicate.id)},
+        )
+
+    due = invoice.due_date
+    req = EarlyPaymentDiscountRequest.objects.create(
+        client=client,
+        request_number=allocate_number(client, "EPD"),
+        party_id=invoice.party_id,
+        invoice=invoice,
+        payment=payment,
+        invoice_number=invoice.invoice_number,
+        invoice_date=invoice.doc_date,
+        invoice_total=invoice.total,
+        payment_terms=invoice.payment_terms,
+        credit_days=invoice.credit_days,
+        due_date=due,
+        payment_date=payment.payment_date,
+        eligible_amount=allocation.amount,
+        days_paid_early=(due - payment.payment_date).days if due else 0,
+        discount_type=discount_type,
+        requested_amount=granted,
+        approved_amount=granted,
+        customer_request_date=payment.payment_date,
+        reason=reason,
+        notes=f"Granted with customer receipt {payment.payment_number}",
+        status="Approved",
+        requested_by=_user(user),
+        decided_by=_user(user),
+        decided_at=timezone.now(),
+        decision_reason=reason,
+        created_by=_user(user),
+    )
+
+    note = note_services.create_standalone_note(
+        client=client,
+        party=invoice.party,
+        note_type="CREDIT_NOTE",
+        taxable_amount=granted,
+        against_document_type="INVOICE",
+        against_document_id=invoice.id,
+        against_document_number=invoice.invoice_number,
+        reason_notes=f"{discount_type} {req.request_number}",
+        notes=reason,
+        user=user,
+    )
+    # The receipt-granted discount is itself the approval; the note's approve
+    # step records the same actor before it is posted.
+    note_services.approve_standalone_note(note, user=user)
+    note = note_services.post_standalone_note(note, user=user)
+
+    req.credit_note = note
+    req.save(update_fields=["credit_note", "updated_at"])
+    refresh_invoice_payment_status(invoice)
+    ledger.recalculate_party_balance(client.id, invoice.party)
+    _audit(
+        req, user, "discount_request_approve",
+        f"Granted {granted} ({discount_type}) with receipt {payment.payment_number} "
+        f"({note.note_number}).",
+        after={"status": "Approved", "approvedAmount": str(granted),
+               "discountType": discount_type, "creditNote": note.note_number},
+        comments=reason,
+    )
+    return req
+
+
 @transaction.atomic
 def reject_request(req, *, user=None, reason=None):
     req = _lock(req)

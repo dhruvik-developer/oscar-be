@@ -1315,7 +1315,7 @@ def _restore_serials(client_id, reference_type, reference_id):
 def record_payment_in(
     *, client, party, amount, payment_date, mode, bank_account=None,
     reference_number=None, notes=None, allocations=None, invoice=None, user=None,
-    transaction_reference=None,
+    transaction_reference=None, discount_allocations=None,
 ):
     """api.md §5.8 -- all five validations moved server-side.
 
@@ -1393,7 +1393,32 @@ def record_payment_in(
         payment.journal_entry = entry
         payment.save(update_fields=["journal_entry", "updated_at"])
 
+    # Discounts granted in the same receipt workflow. Each one is posted
+    # through the existing credit-note path inside this very transaction, so a
+    # failed discount rolls back the receipt and all of its postings with it.
+    from .early_payment import grant_discount_at_receipt
+
+    for row in discount_allocations or []:
+        invoice_id = row.get("invoiceId") or row.get("invoice_id") or row.get("documentId")
+        if not invoice_id:
+            raise ValidationFailed("Each discount needs an invoice.")
+        discount_invoice = SalesInvoice.objects.filter(
+            pk=invoice_id, client_id=client.id, deleted_at__isnull=True
+        ).first()
+        if discount_invoice is None:
+            raise NotFound("That invoice no longer exists.")
+        grant_discount_at_receipt(
+            client=client,
+            invoice=discount_invoice,
+            payment=payment,
+            amount=row.get("discountAmount", row.get("amount")),
+            discount_type=row.get("discountType"),
+            reason=row.get("discountReason", row.get("reason")),
+            user=user,
+        )
+
     ledger.recalculate_party_balance(client.id, party)
+    payment.refresh_from_db()
     return payment
 
 

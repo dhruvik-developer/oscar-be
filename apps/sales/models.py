@@ -594,6 +594,18 @@ class PaymentAllocation(TenantModel):
 DISCOUNT_OPEN_STATUSES = ["Draft", "Submitted", "Under Review"]
 DISCOUNT_STATUSES = DISCOUNT_OPEN_STATUSES + ["Approved", "Rejected", "Cancelled"]
 
+#: Discount types that may be granted when a customer receipt is recorded.
+#: Kept as a model-level constant so both the receipt form and the posting
+#: service agree on the allowed values. Historical rows (created before this
+#: field existed) are "Early Payment Discount", the only type that existed.
+DISCOUNT_TYPES = [
+    "Early Payment Discount",
+    "Special Discount",
+    "Settlement Discount",
+    "Other Approved Discount",
+]
+DISCOUNT_TYPE_DEFAULT = DISCOUNT_TYPES[0]
+
 
 class EarlyPaymentDiscountRequest(TenantModel):
     """A customer's request for a discount for paying an invoice early.
@@ -631,6 +643,11 @@ class EarlyPaymentDiscountRequest(TenantModel):
     #: due_date - payment_date; zero or negative when the payment was not early.
     days_paid_early = models.IntegerField(default=0)
 
+    #: Why the discount was granted (see DISCOUNT_TYPES). Stored so a settlement
+    #: or special discount is not mislabelled as an early-payment discount.
+    discount_type = models.TextField(
+        choices=choices(DISCOUNT_TYPES), default=DISCOUNT_TYPE_DEFAULT
+    )
     requested_amount = models.DecimalField(max_digits=18, decimal_places=2)
     proposed_amount = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
     approved_amount = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)

@@ -2276,6 +2276,7 @@ class PaymentInViewSet(TenantModelViewSet):
     def perform_create(self, serializer):
         data = serializer.validated_data
         allocations = self.request.data.get("allocations") or []
+        discount_allocations = self.request.data.get("discountAllocations") or []
         invoice_id = self.request.data.get("invoiceId")
         invoice = None
         if invoice_id:
@@ -2298,6 +2299,7 @@ class PaymentInViewSet(TenantModelViewSet):
             allocations=allocations,
             invoice=invoice,
             user=self.request.user,
+            discount_allocations=discount_allocations,
         )
         serializer.instance = payment
         self._created_instance = payment

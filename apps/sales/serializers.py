@@ -414,6 +414,7 @@ class ReceivableRowSerializer(BaseModelSerializer):
 
 class EarlyPaymentDiscountRequestSerializer(BaseModelSerializer):
     requestNumber = serializers.CharField(source="request_number", read_only=True)
+    discountType = serializers.CharField(source="discount_type", read_only=True)
     customerName = serializers.CharField(source="party.name", read_only=True)
     invoiceNumber = serializers.CharField(source="invoice_number", read_only=True)
     invoiceDate = serializers.DateField(source="invoice_date", read_only=True)
@@ -441,7 +442,7 @@ class EarlyPaymentDiscountRequestSerializer(BaseModelSerializer):
     class Meta:
         model = EarlyPaymentDiscountRequest
         fields = [
-            "id", "requestNumber", "customerName", "invoice", "invoiceNumber",
+            "id", "requestNumber", "discountType", "customerName", "invoice", "invoiceNumber",
             "invoiceDate", "invoiceTotal", "paymentTerms", "dueDate", "payment",
             "paymentNumber", "paymentDate", "eligibleAmount", "daysPaidEarly",
             "requestedAmount", "proposedAmount", "approvedAmount", "customerRequestDate",
@@ -516,11 +517,19 @@ class PaymentInSerializer(BaseModelSerializer):
     date = serializers.DateField(source="payment_date")
     allocations = serializers.SerializerMethodField()
     unallocatedAmount = serializers.SerializerMethodField()
+    #: Discounts granted with this receipt, plus the accounting totals. Cash
+    #: received (``amount``) and discount (``discountTotal``) stay separate.
+    discounts = serializers.SerializerMethodField()
+    discountTotal = serializers.SerializerMethodField()
+    totalSettled = serializers.SerializerMethodField()
     referenceNumber = serializers.CharField(source="reference_number", required=False, allow_null=True, allow_blank=True)
     transactionReference = serializers.CharField(source="transaction_reference", read_only=True, allow_null=True)
     #: Write-only: the target invoice(s) this payment settles.
     invoiceId = serializers.CharField(required=False, allow_null=True, write_only=True)
     allocationsInput = serializers.ListField(
+        child=serializers.DictField(), required=False, write_only=True
+    )
+    discountAllocationsInput = serializers.ListField(
         child=serializers.DictField(), required=False, write_only=True
     )
 
@@ -529,8 +538,9 @@ class PaymentInSerializer(BaseModelSerializer):
         fields = [
             "id", "payment_number", "customerId", "customerName", "date", "amount",
             "mode", "bankAccountId", "reference_number", "referenceNumber", "transactionReference", "notes",
-            "allocated_amount", "unallocatedAmount", "allocations", "status",
-            "invoiceId", "allocationsInput", "created_at", "updated_at",
+            "allocated_amount", "unallocatedAmount", "allocations", "discounts",
+            "discountTotal", "totalSettled", "status",
+            "invoiceId", "allocationsInput", "discountAllocationsInput", "created_at", "updated_at",
         ]
         read_only_fields = [
             "payment_number", "allocated_amount", "status", "created_at", "updated_at",
@@ -559,6 +569,21 @@ class PaymentInSerializer(BaseModelSerializer):
 
     def get_unallocatedAmount(self, payment):
         return payment.unallocated_amount
+
+    def _live_discounts(self, payment):
+        return EarlyPaymentDiscountRequest.objects.filter(
+            client_id=payment.client_id, payment=payment,
+            status="Approved", deleted_at__isnull=True,
+        )
+
+    def get_discounts(self, payment):
+        return EarlyPaymentDiscountRequestSerializer(self._live_discounts(payment), many=True).data
+
+    def get_discountTotal(self, payment):
+        return round2(sum((D(r.approved_amount or 0) for r in self._live_discounts(payment)), ZERO))
+
+    def get_totalSettled(self, payment):
+        return round2(D(payment.allocated_amount) + D(self.get_discountTotal(payment)))
 
 
 class AllocateSerializer(BaseSerializer):

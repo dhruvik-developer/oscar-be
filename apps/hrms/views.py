@@ -4020,7 +4020,7 @@ class AppraisalCycleViewSet(TenantModelViewSet):
 
 class PerformanceIndicatorViewSet(TenantModelViewSet):
 
-    queryset = PerformanceIndicator.objects.select_related("department")
+    queryset = PerformanceIndicator.objects.select_related("department", "location")
 
     serializer_class = PerformanceIndicatorSerializer
 
