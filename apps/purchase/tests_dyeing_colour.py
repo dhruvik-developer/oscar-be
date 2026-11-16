@@ -27,7 +27,7 @@ class DyeingColourTestBase(FabricFlowTestBase):
             "date": "2026-10-19",
             "fabricFlow": flow,
             "lineItems": [{"itemId": str(self.fabric.id), "qty": 4000, "rate": 40, "uom": "Mtr"}],
-            **({"dyeingMillId": str(self.mill.id)} if flow == MILL else {}),
+            **({"dyeingMillId": str(self.mill.id), "dyeingRate": 15} if flow == MILL else {}),
             **extra,
         }
 
@@ -179,11 +179,11 @@ class DyeingMillDeliveryTests(DyeingColourTestBase):
         self.assertEqual(Decimal(row["quantities"]["qcHold"]), Decimal("1000"))
         self.assertEqual(self.registry_group(po)["batches"][0]["qcStatus"], "Pending")
 
-        self.qc(receipt["grnNumber"], 900)
+        self.qc(receipt["grnNumber"], 1000)
 
         row = self.api.get(f"/api/v1/inventory/batches/{batch.batch_code}/").json()
         row = row.get("batch", row)
-        self.assertEqual(Decimal(row["quantities"]["available"]), Decimal("900"))
+        self.assertEqual(Decimal(row["quantities"]["available"]), Decimal("1000"))
         self.assertEqual(row["dyeingColourName"], "Navy Blue")
         self.assertEqual(row["poNumber"], po.po_number)
         batch.refresh_from_db()

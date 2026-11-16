@@ -311,6 +311,65 @@ class VendorBillWorkflowTests(TestCase):
         self.assertEqual(data["poSummary"]["remainingBillableQty"], 4000)
         self.assertEqual(data["poSummary"]["totalBilledAmount"], 0)
 
+    def test_cancelled_payable_frees_its_batch_quantity(self):
+        po = self._po(qty=1000, received=1000)
+        row = self._details(po)["batches"][0]
+        self.assertTrue(row["batchId"])
+        lines = [{
+            "itemId": str(self.fabric.id), "batchId": row["batchId"], "batchNumber": row["batchCode"],
+            "qty": 1000, "rate": 12,
+        }]
+        res = self._post_bill(po, "INV-001", 0, 0, lineItems=lines)
+        self.assertEqual(res.status_code, 201, res.content)
+        bill = VendorBill.objects.get(pk=res.json()["id"])
+        self.assertEqual(self._approve(bill).status_code, 200)
+        self.assertEqual(self._post_bill(po, "INV-002", 0, 0, lineItems=lines).status_code, 400)
+
+        bill.refresh_from_db()
+        PurchaseBill.objects.filter(pk=bill.purchase_bill_id).update(status="Cancelled")
+        self.assertEqual(self._details(po)["poSummary"]["remainingBillableQty"], 1000)
+        res = self._post_bill(po, "INV-003", 0, 0, lineItems=lines)
+        self.assertEqual(res.status_code, 201, res.content)
+
+    def _approve_at_po(self, bill, payable=True):
+        return self.api.post(f"/api/v1/purchase/vendor-bills/{bill.id}/approve/", {
+            "remarks": "Pay our rate", "approvalBasis": "PO", "createPayable": payable,
+        }, format="json")
+
+    def test_po_amount_approval_pays_received_qty_at_po_rate(self):
+        po = self._po(qty=1000, rate=12, received=800)
+        bill = self._bill(po, "INV-001", 1000, 15)
+        self.assertEqual(self._review(bill)["poBasis"]["total"], 10080)
+
+        res = self._approve_at_po(bill)
+        self.assertEqual(res.status_code, 200, res.content)
+        bill.refresh_from_db()
+        self.assertEqual(bill.total, Decimal("15750.00"), "The vendor's invoice stays as it was")
+        self.assertEqual(bill.purchase_bill.total, Decimal("10080.00"))
+        line = bill.purchase_bill.line_items.get()
+        self.assertEqual((line.qty, line.rate), (Decimal("800.0000"), Decimal("12.0000")))
+        entry = bill.approval_history[-1]
+        self.assertEqual(entry["action"], "Approved at PO amount")
+        self.assertEqual((entry["approvalBasis"], entry["approvedAmount"]), ("PO", 10080))
+
+    def test_po_amount_reaches_a_payable_made_by_send_for_matching(self):
+        po = self._po(qty=1000, rate=12, received=1000)
+        bill = self._bill(po, "INV-001", 1000, 15)
+        self.assertEqual(self._approve_at_po(bill, payable=False).status_code, 200)
+        res = self.api.post(f"/api/v1/purchase/vendor-bills/{bill.id}/send-for-matching/", {}, format="json")
+        self.assertEqual(res.status_code, 201, res.content)
+        self.assertEqual(PurchaseBill.objects.get(pk=res.json()["purchaseBillId"]).total, Decimal("12600.00"))
+
+    def test_po_amount_needs_a_mismatch_and_vendor_amount_stays_the_default(self):
+        po = self._po(qty=1000, rate=12, received=1000)
+        clean = self._bill(po, "INV-001", 500, 12)
+        self.assertEqual(self._approve_at_po(clean).status_code, 400)
+        other = self._bill(po, "INV-002", 500, 15)
+        self.assertEqual(self._approve(other, remarks="Accepted").status_code, 200)
+        other.refresh_from_db()
+        self.assertEqual(other.purchase_bill.total, other.total)
+        self.assertEqual(other.approval_history[-1]["action"], "Approved with variance")
+
     def test_payable_does_not_double_count_billed_quantity(self):
         po = self._po()
         self._approved_bill(po, qty=1000)
@@ -422,6 +481,24 @@ class VendorBillWorkflowTests(TestCase):
         self.assertEqual(res.status_code, 422, res.content)
         self.assertEqual(res.json()["code"], "PAYMENT_ON_DRAFT")
         self.assertFalse(PaymentOut.objects.filter(party=self.vendor).exists())
+        self.assertEqual(self.api.post("/api/v1/purchase/payments/", body, format="json").status_code, 201)
+
+    def test_approved_bill_sent_for_matching_is_posted_and_can_be_paid(self):
+        bill = self._bill(self._po(), "INV-M", 4000, 12)
+        self._review(bill)
+        self.assertEqual(self._approve(bill, payable=False).status_code, 200)
+        res = self.api.post(f"/api/v1/purchase/vendor-bills/{bill.id}/send-for-matching/", {}, format="json")
+        self.assertEqual(res.status_code, 201, res.content)
+        payable = PurchaseBill.objects.get(pk=res.json()["purchaseBillId"])
+        self.assertEqual(payable.status, "Unpaid")
+        self.assertIsNotNone(payable.posted_at)
+        self.assertTrue(JournalEntry.objects.filter(
+            source_document_type="PurchaseBill", source_document_id=payable.id
+        ).exists())
+        body = {
+            "vendorId": str(self.vendor.id), "date": "2026-11-05", "amount": 100,
+            "mode": "Cash", "billId": str(payable.id),
+        }
         self.assertEqual(self.api.post("/api/v1/purchase/payments/", body, format="json").status_code, 201)
 
     def test_state_survives_a_fresh_read(self):

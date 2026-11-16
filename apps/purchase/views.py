@@ -56,7 +56,7 @@ from apps.sales.views import PostedReturnGuardMixin, SalesDocumentViewSet, _clon
 
 
 
-from . import fabric_flow, services
+from . import dyeing_dispatch, fabric_flow, services
 
 from .models import (
 
@@ -227,7 +227,7 @@ class PurchaseOrderViewSet(SalesDocumentViewSet):
     def _flow_order(self, pk):
         return self.get_queryset().select_related("party", "dyeing_mill").get(pk=pk)
 
-    def _flow_write(self, request, pk, permission, work, *, status_code=status.HTTP_200_OK):
+    def _flow_write(self, request, pk, permission, work, *, status_code=status.HTTP_200_OK, answer=None):
         """Run one fabric-flow write under the idempotency key (a replayed
         Save returns the first response instead of writing twice) and answer
         with the PO's refreshed fabric-flow summary."""
@@ -244,11 +244,37 @@ class PurchaseOrderViewSet(SalesDocumentViewSet):
         try:
             with transaction.atomic():
                 work(po)
-                body = fabric_flow.summary(self._flow_order(pk))
+                body = (answer or fabric_flow.summary)(self._flow_order(pk))
         except Exception:
             idempotency.fail(record)
             raise
         return idempotency.finish(record, Response(body, status=status_code))
+
+    @action(detail=False, methods=["get"], url_path="grey-sources")
+    def grey_sources(self, request):
+        """Grey fabric POs with stock free to send for dyeing."""
+        return Response({"results": dyeing_dispatch.grey_sources(request.client_id)})
+
+    @action(detail=True, methods=["get"], url_path="grey-batches")
+    def grey_batches(self, request, pk=None):
+        return Response({"results": dyeing_dispatch.source_batches(self._flow_order(pk))})
+
+    @action(detail=True, methods=["get"], url_path="dyeing")
+    def dyeing_summary(self, request, pk=None):
+        """Grey batches, dyeing dispatches and dyed batches of an OSCAR -> mill order."""
+        return Response(dyeing_dispatch.summary(self._flow_order(pk)))
+
+    @action(detail=True, methods=["post"], url_path="dyeing/dispatches")
+    def dyeing_send(self, request, pk=None):
+        return self._flow_write(request, pk, "receive_goods",
+                                lambda po: dyeing_dispatch.dispatch_planned(po, user=request.user),
+                                status_code=status.HTTP_201_CREATED, answer=dyeing_dispatch.summary)
+
+    @action(detail=True, methods=["post"], url_path=r"dyeing/dispatches/(?P<outward_id>[^/.]+)/returns")
+    def dyeing_return(self, request, pk=None, outward_id=None):
+        return self._flow_write(request, pk, "receive_goods",
+                                lambda po: dyeing_dispatch.receive_return(po, outward_id, request.data, user=request.user),
+                                status_code=status.HTTP_201_CREATED, answer=dyeing_dispatch.summary)
 
     @action(detail=True, methods=["get"], url_path="fabric-flow")
     def fabric_flow_summary(self, request, pk=None):
@@ -339,7 +365,7 @@ class PurchaseOrderViewSet(SalesDocumentViewSet):
 
         from apps.core import approval_services
 
-        fabric_flow.require_dyeing_colour(self.get_object())
+        fabric_flow.require_dyeing_details(self.get_object())
 
         res = self._transition(request, from_statuses=("Draft", "Issued"), to_status="Pending Approval")
 
@@ -404,6 +430,7 @@ class PurchaseOrderViewSet(SalesDocumentViewSet):
 
 
         res = self._transition(request, from_statuses=("Pending Approval",), to_status="Approved")
+        dyeing_dispatch.dispatch_planned(order, user=request.user)
 
         appr_req = ApprovalRequest.objects.filter(
 
@@ -3612,6 +3639,15 @@ class VendorBillViewSet(TenantModelViewSet):
 
 
     
+    @action(detail=False, methods=["get"], url_path="billable-pos")
+    def billable_pos(self, request):
+        """POs that still have received fabric to bill."""
+        orders = PurchaseOrder.objects.filter(client_id=request.client_id, deleted_at__isnull=True).exclude(status="Cancelled")
+        return Response({"results": [
+            str(po.id) for po in orders.select_related("party", "dyeing_mill")
+            if services.vendor_bill_po_snapshot(po)["poSummary"]["canCreateBill"]
+        ]})
+
     @action(detail=False, methods=["get"], url_path="po-details")
     def po_details(self, request):
         """Fetch PO summary, vendor details, and batch-wise billing metrics."""
@@ -3814,15 +3850,15 @@ class VendorBillViewSet(TenantModelViewSet):
 
                     ),
 
-                    qty=line.qty,
+                    qty=qty,
 
-                    rate=line.rate,
+                    rate=rate,
 
                     tax_pct=bill.gst_pct,
 
                 )
 
-                for line in lines
+                for line, qty, rate in services.vendor_bill_payable_terms(bill)
 
             ]
 
@@ -3874,6 +3910,13 @@ class VendorBillViewSet(TenantModelViewSet):
 
         )
 
+        # An approved bill has nothing left to wait for: post it now, or the
+        # payable sits in Draft and cannot be paid from Purchase Bills.
+
+        if bill.status == "Approved":
+
+            services.ensure_vendor_bill_payable(bill, user=request.user)
+
         self.write_audit(
 
             "match", bill,
@@ -3906,7 +3949,7 @@ class VendorBillViewSet(TenantModelViewSet):
 
 
 
-    def _mismatch_gate(self, bill, matching, remarks):
+    def _mismatch_gate(self, bill, matching, remarks, basis):
 
         """None when this mismatched bill may be approved now; otherwise a 409
 
@@ -3926,7 +3969,11 @@ class VendorBillViewSet(TenantModelViewSet):
 
         summary = matching.get("summary") or {}
 
-        fingerprint = {"billTotal": str(D(bill.total or 0)), "amountDiff": str(summary.get("amountDiff"))}
+        fingerprint = {
+            "billTotal": str(D(bill.total or 0)),
+            "amountDiff": str(summary.get("amountDiff")),
+            "approvalBasis": basis,
+        }
 
         approved = ApprovalRequest.objects.filter(
 
@@ -3949,6 +3996,8 @@ class VendorBillViewSet(TenantModelViewSet):
             (req.new_values or {}).get("billTotal") == fingerprint["billTotal"]
 
             and (req.new_values or {}).get("amountDiff") == fingerprint["amountDiff"]
+
+            and (req.new_values or {}).get("approvalBasis", services.APPROVAL_BASIS_VENDOR_BILL) == basis
 
             for req in approved
 
@@ -3973,6 +4022,12 @@ class VendorBillViewSet(TenantModelViewSet):
                 f"Vendor bill {bill.vendor_bill_number} does not match PO/GRN: "
 
                 + ("; ".join((matching.get("reasons") or [])[:3]) or "variance")
+
+                + (
+                    f". Approving sets the payable to the PO amount {(matching.get('poBasis') or {}).get('total')}, not the vendor bill total"
+                    if basis == services.APPROVAL_BASIS_PO
+                    else f". Approving accepts the vendor bill total {D(bill.total or 0)}, not the PO amount"
+                )
 
                 + (f". Remarks: {remarks}" if remarks else "")
 
@@ -4084,6 +4139,18 @@ class VendorBillViewSet(TenantModelViewSet):
 
             )
 
+        basis = request.data.get("approvalBasis") or services.APPROVAL_BASIS_VENDOR_BILL
+
+        at_po_amount = basis == services.APPROVAL_BASIS_PO
+
+        po_basis = matching.get("poBasis") or {}
+
+        if basis not in services.APPROVAL_BASES or (at_po_amount and not (is_mismatch and po_basis.get("available"))):
+
+            message = po_basis.get("reason") or "Only a mismatched bill can be approved at the PO amount."
+
+            raise ValidationFailed(message, field_errors={"approvalBasis": [message]})
+
         if is_mismatch:
 
             # A mismatched bill releases a payable the records do not support,
@@ -4092,7 +4159,7 @@ class VendorBillViewSet(TenantModelViewSet):
 
             # user approving now, or given through the approvals inbox.
 
-            blocked = self._mismatch_gate(bill, matching, remarks)
+            blocked = self._mismatch_gate(bill, matching, remarks, basis)
 
             if blocked is not None:
 
@@ -4124,7 +4191,15 @@ class VendorBillViewSet(TenantModelViewSet):
 
                 "by": getattr(request.user, "name", None) or str(request.user),
 
-                "action": "Approved with variance" if is_mismatch else "Approved",
+                "action": (
+                    "Approved at PO amount" if at_po_amount
+                    else "Approved with variance" if is_mismatch
+                    else "Approved"
+                ),
+
+                "approvalBasis": basis,
+
+                "approvedAmount": po_basis.get("total") if at_po_amount else float(D(bill.total or 0)),
 
                 "remarks": remarks,
 
@@ -4159,7 +4234,9 @@ class VendorBillViewSet(TenantModelViewSet):
 
         if is_mismatch:
 
-            description = f"Approved with variance: {remarks}. " + "; ".join(matching.get("reasons") or [])
+            label = f"Approved at PO amount {po_basis.get('total')}" if at_po_amount else "Approved with variance"
+
+            description = f"{label}: {remarks}. " + "; ".join(matching.get("reasons") or [])
 
         self.write_audit("approve", bill, description=description)
 
@@ -4727,7 +4804,7 @@ class VendorBillViewSet(TenantModelViewSet):
                 code="BILL_NOT_PAYABLE",
             )
         po = bill.purchase_order
-        if po is not None and po.party_id and po.party_id != bill.party_id:
+        if po is not None and po.party_id and bill.party_id not in (po.party_id, po.dyeing_mill_id):
             raise Conflict(
                 f"This bill's vendor does not match purchase order {po.po_number}.",
                 code="BILL_VENDOR_MISMATCH",

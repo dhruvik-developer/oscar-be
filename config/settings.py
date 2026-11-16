@@ -352,7 +352,7 @@ STOCK_ADJUSTMENT_APPROVAL_LIMIT = env("STOCK_ADJUSTMENT_APPROVAL_LIMIT", None) o
 # --------------------------------------------------------------------------
 # E-Invoicing & E-Way Bill Integration (PDF §20)
 # --------------------------------------------------------------------------
-EINVOICE_ENABLED = env_bool("EINVOICE_ENABLED", False)
+EINVOICE_ENABLED = env_bool("EINVOICE_ENABLED", True)
 EINVOICE_PROVIDER = env("EINVOICE_PROVIDER", "sandbox-sim")
 EINVOICE_SANDBOX_MODE = env_bool("EINVOICE_SANDBOX_MODE", True)
 EINVOICE_BASE_URL = env("EINVOICE_BASE_URL", "https://einv-apisandbox.nic.in")

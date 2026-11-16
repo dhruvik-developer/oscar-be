@@ -233,6 +233,10 @@ class JobWorkOrder(TenantModel, LegacyIdMixin):
         ProcessPlan, null=True, blank=True, on_delete=models.SET_NULL,
         related_name="job_work_orders",
     )
+    #: Set when grey fabric of a fabric order went out for dyeing.
+    purchase_order = models.ForeignKey(
+        "purchase.PurchaseOrder", null=True, blank=True, on_delete=models.SET_NULL, related_name="dyeing_job_orders"
+    )
     process = models.TextField(default="")
     process_master = models.ForeignKey(
         "masters.ProcessMaster", null=True, blank=True, on_delete=models.SET_NULL, related_name="job_work_orders"

@@ -903,6 +903,15 @@ class PerformanceIndicator(TenantModel):
     department = models.ForeignKey(
         Department, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
+    location = models.ForeignKey(
+        Location, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    target = models.TextField(null=True, blank=True)
+    measurement_type = models.TextField(null=True, blank=True)
+    assigned_employee = models.TextField(null=True, blank=True)
+    designation = models.TextField(null=True, blank=True)
+    description = models.TextField(null=True, blank=True)
+    status = models.TextField(default="Active")
 
     class Meta:
         db_table = "hrms_performance_indicators"
@@ -917,6 +926,10 @@ class Kpi(TenantModel):
     target = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
     unit = models.TextField(null=True, blank=True)
     applies_to = models.TextField(null=True, blank=True)
+    weight = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    status = models.TextField(default="Active")
+    designation = models.TextField(null=True, blank=True)
+    assigned_employee = models.TextField(null=True, blank=True)
 
     class Meta:
         db_table = "hrms_kpis"

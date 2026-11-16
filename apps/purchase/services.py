@@ -38,6 +38,7 @@ from apps.sales.services import (
 
 from .models import (
     FABRIC_FLOW_FACTORY_TO_MILL,
+    FABRIC_FLOW_OSCAR_TO_MILL,
     PURCHASE_TYPE_GREY_STOCK,
     PURCHASE_TYPE_VENDOR_A,
     PURCHASE_TYPE_FINAL_JOB_WORK,
@@ -739,6 +740,11 @@ def po_billed_status(order):
 
 def assert_po_cancellable(order):
     """api.md §6.2 -- a PO with any active bill cannot be cancelled."""
+    if order.dyeing_job_orders.filter(deleted_at__isnull=True).exists():
+        raise Conflict(
+            f"The fabric of {order.po_number} is at the dyeing mill; receive it back first.",
+            code="FABRIC_AT_MILL",
+        )
     blocking = list(
         PurchaseBill.objects.filter(purchase_order=order, deleted_at__isnull=True)
         .exclude(status="Cancelled")
@@ -1024,6 +1030,8 @@ def cancel_payment_out(payment, *, reason=None, user=None):
 def cancel_bill(bill, *, reason=None, user=None):
     """Reverses stock and ledger (api.md §6.4)."""
     from apps.sales.models import PaymentAllocation
+
+    from . import fabric_flow
     from apps.sales.services import _reverse_document
 
     bill = PurchaseBill.objects.select_for_update().get(pk=bill.pk)
@@ -1060,6 +1068,7 @@ def cancel_bill(bill, *, reason=None, user=None):
     GoodsReceipt.objects.filter(purchase_bill=bill, deleted_at__isnull=True).update(
         deleted_at=timezone.now()
     )
+    fabric_flow.release_dyeing_bill(bill, user=user)
     return bill
 
 
@@ -1070,6 +1079,10 @@ def cancel_bill(bill, *, reason=None, user=None):
 #: moved to the payable; such a bill was approved.
 VENDOR_BILL_APPROVED_STATUSES = ("Approved", "Partially Paid", "Paid")
 VENDOR_BILL_MISMATCH_APPROVAL = "vendor_bill_mismatch"
+#: Which amount approving a mismatched bill accepts for the payable.
+APPROVAL_BASIS_VENDOR_BILL = "VENDOR_BILL"
+APPROVAL_BASIS_PO = "PO"
+APPROVAL_BASES = (APPROVAL_BASIS_VENDOR_BILL, APPROVAL_BASIS_PO)
 
 
 def vendor_bill_payment_summary(bill):
@@ -1127,6 +1140,65 @@ def vendor_bill_workflow(bill, *, approval_pending=False):
     return {"stage": stage, "label": label, "actions": actions}
 
 
+def vendor_bill_approval_basis(bill):
+    """The amount the latest approval accepted; older approvals took the vendor's."""
+    for entry in reversed(bill.approval_history or []):
+        if str(entry.get("action") or "").startswith("Approved"):
+            return entry.get("approvalBasis") or APPROVAL_BASIS_VENDOR_BILL
+    return APPROVAL_BASIS_VENDOR_BILL
+
+
+def _po_basis_terms(bill_lines, rows):
+    """``(line, qty, rate)`` at what was received x the PO rate.
+
+    ``billableQty`` repeats on every line of a fabric, so the lines share it:
+    a batch takes its own receipt and any other line what is left.
+    """
+    left = {}
+    terms = []
+    for line, row in zip(bill_lines, rows):
+        key = line.item_id or line.line_no
+        left.setdefault(key, D(str(row["billableQty"])))
+        grn_line = line.batch.goods_receipt_line if line.batch_id else None
+        wanted = D(grn_line.received_qty or 0) if grn_line is not None else left[key]
+        qty = min(wanted, left[key])
+        left[key] -= qty
+        if qty > ZERO:
+            terms.append((line, qty, D(str(row["poRate"]))))
+    return terms
+
+
+def _po_basis_summary(bill, bill_lines, rows):
+    """What approving this bill at the PO amount would make payable."""
+    if any(not row["poRate"] for row in rows):
+        return {"available": False, "reason": "A line is not on the purchase order, so it has no PO rate."}
+    terms = _po_basis_terms(bill_lines, rows)
+    if not terms:
+        return {"available": False, "reason": "Nothing received is left to bill at the PO rate."}
+    subtotal = sum((round2(qty * rate) for _, qty, rate in terms), ZERO)
+    gst_amount = round2(subtotal * D(bill.gst_pct or 0) / Decimal("100"))
+    return {
+        "available": True,
+        "qty": float(sum((qty for _, qty, _ in terms), ZERO)),
+        "subtotal": float(subtotal),
+        "gstAmount": float(gst_amount),
+        "total": float(round2(subtotal + gst_amount)),
+    }
+
+
+def vendor_bill_payable_terms(bill, matching=None):
+    """``(line, qty, rate)`` the payable carries, per the approved basis."""
+    lines = list(
+        bill.line_items.filter(deleted_at__isnull=True)
+        .select_related("batch__goods_receipt_line", "item")
+        .order_by("line_no")
+    )
+    if vendor_bill_approval_basis(bill) != APPROVAL_BASIS_PO:
+        return [(line, line.qty, line.rate) for line in lines]
+    matching = matching or compute_vendor_bill_matching(bill.client_id, bill)
+    return _po_basis_terms(lines, matching["lines"])
+
+
 def ensure_vendor_bill_payable(bill, *, matching=None, remarks=None, user=None):
     """The posted ``PurchaseBill`` behind an approved vendor bill.
 
@@ -1158,7 +1230,7 @@ def ensure_vendor_bill_payable(bill, *, matching=None, remarks=None, user=None):
             location_id=getattr(effective_po, "location_id", None),
             notes=remarks or bill.remarks or f"Recorded from Vendor Bill {bill.vendor_bill_number}",
         )
-        for line in bill.line_items.filter(deleted_at__isnull=True).order_by("line_no"):
+        for line, qty, rate in vendor_bill_payable_terms(bill, matching):
             PurchaseBillLine.objects.create(
                 client=bill.client,
                 purchase_bill=payable,
@@ -1166,13 +1238,15 @@ def ensure_vendor_bill_payable(bill, *, matching=None, remarks=None, user=None):
                 item=line.item,
                 batch_number=line.batch_number,
                 description=line.item_name or (line.item.name if line.item else "Fabric"),
-                qty=line.qty,
-                rate=line.rate,
+                qty=qty,
+                rate=rate,
                 tax_pct=bill.gst_pct,
                 uom=line.uom or "Meter",
             )
         payable.freeze_party_snapshot()
-    payable.other_charges = bill.other_charges
+    # Other charges are not on the PO, so a PO-amount approval leaves them out.
+    at_po_amount = vendor_bill_approval_basis(bill) == APPROVAL_BASIS_PO
+    payable.other_charges = ZERO if at_po_amount else bill.other_charges
     recalculate_document(payable)
 
     payable.status = "Unpaid"
@@ -1198,6 +1272,10 @@ def ensure_vendor_bill_payable(bill, *, matching=None, remarks=None, user=None):
         payable.journal_entry = entry
         payable.save(update_fields=["journal_entry", "updated_at"])
     ledger.recalculate_party_balance(bill.client_id, bill.party)
+    if bill.purchase_order_id and bill.purchase_order.fabric_flow in (FABRIC_FLOW_FACTORY_TO_MILL, FABRIC_FLOW_OSCAR_TO_MILL):
+        from .fabric_flow import book_dyeing_bill
+
+        book_dyeing_bill(bill, user=user)
     return payable
 
 
@@ -1216,10 +1294,12 @@ def vendor_bill_po_snapshot(po):
         po.line_items.filter(deleted_at__isnull=True).select_related("item").order_by("line_no")
     )
     first_line = po_lines[0] if po_lines else None
+    from .fabric_flow import bill_po_rate
+
     rate_by_item = {}
     for po_line in po_lines:
-        rate_by_item.setdefault(po_line.item_id, D(po_line.rate or 0))
-    default_rate = D(first_line.rate or 0) if first_line else ZERO
+        rate_by_item.setdefault(po_line.item_id, bill_po_rate(po, po_line))
+    default_rate = bill_po_rate(po, first_line) if first_line else ZERO
     receipt_based = po.purchase_type in GREY_STOCK_PURCHASE_TYPES
 
     vendor_bills = list(
@@ -1449,7 +1529,15 @@ def vendor_bill_po_snapshot(po):
     elif remaining_billable <= ZERO:
         create_blocked_reason = "The full received quantity has already been billed."
 
+    # A dyeing-mill order's bill may come from either party; the user picks.
+    bill_vendors = []
+    if po.fabric_flow == FABRIC_FLOW_FACTORY_TO_MILL:
+        bill_vendors.append({"id": str(po.party_id), "name": po.party_name or po.party.name, "role": "Grey Fabric Vendor"})
+        if po.dyeing_mill_id:
+            bill_vendors.append({"id": str(po.dyeing_mill_id), "name": po.dyeing_mill.name, "role": "Dyeing Vendor"})
+
     return {
+        "billVendors": bill_vendors,
         "poSummary": {
             "poId": str(po.id),
             "poNumber": po.po_number,
@@ -1461,7 +1549,7 @@ def vendor_bill_po_snapshot(po):
             "previouslyBilledQty": float(total_billed),
             "remainingBillableQty": float(remaining_billable),
             "originalPoRate": float(default_rate),
-            "originalPoAmount": float(D(po.total or 0)),
+            "originalPoAmount": float(sum((D(line.qty or 0) * bill_po_rate(po, line) for line in po_lines), ZERO)),
             "totalBills": len(bills),
             "totalBilledAmount": float(total_billed_amount),
             "totalPaidAmount": float(total_paid),
@@ -1502,6 +1590,7 @@ def compute_vendor_bill_matching(client_id, bill):
                 field_errors={"vendorBill": ["Not found."]},
             )
     client_id = client_id or bill.client_id
+    from .fabric_flow import bill_po_rate
 
     bill_lines = list(
         bill.line_items.filter(deleted_at__isnull=True)
@@ -1661,7 +1750,7 @@ def compute_vendor_bill_matching(client_id, bill):
         bill_rate = D(getattr(bill_line, "rate", 0))
         bill_amount = D(getattr(bill_line, "amount", 0))
         po_qty = D(po_line.qty) if po_line is not None else ZERO
-        po_rate = D(po_line.rate) if po_line is not None else ZERO
+        po_rate = bill_po_rate(po, po_line) if po_line is not None else ZERO
         po_tax_pct = D(po_line.tax_pct or 0) if po_line is not None else None
         grn_qty = grn_qty_by_key.get(key, ZERO) if key else ZERO
         grn_rejected = grn_rejected_by_key.get(key, ZERO) if key else ZERO
@@ -1798,6 +1887,7 @@ def compute_vendor_bill_matching(client_id, bill):
         "reasons": reasons,
         "overallStatus": overall,
     }
+    result["poBasis"] = _po_basis_summary(bill, bill_lines, rows)
     if receipt_based and not grns:
         result["note"] = "No GRN found for this purchase order."
 
@@ -2038,6 +2128,7 @@ def create_standalone_grn(
     lines_data=None,
     user=None,
     fabric_type=None,
+    dyeing_outward=None,
 ):
     """Create a standalone Goods Receipt Note (GRN) against a PO or directly from a vendor.
 
@@ -2046,6 +2137,9 @@ def create_standalone_grn(
 
     The PO's delivery type decides Grey or Dyed Fabric; ``fabric_type`` (also
     accepted per line) is only checked against it, never obeyed.
+
+    ``dyeing_outward`` makes this the dyed fabric of a Flow 2 order coming back
+    from the mill; such an order has no other kind of receipt.
     """
     party_id = party_id or (getattr(party, "id", party) if party else None)
     purchase_order_id = purchase_order_id or (getattr(purchase_order, "id", purchase_order) if purchase_order else None)
@@ -2081,6 +2175,10 @@ def create_standalone_grn(
                 field_errors={"purchaseOrderId": ["Not found."]},
             )
         _assert_po_receivable(po, party)
+        if po.fabric_flow == FABRIC_FLOW_OSCAR_TO_MILL and dyeing_outward is None:
+            raise Conflict(
+                f"{po.po_number} is received through a Dyeing Return.", code="WRONG_RECEIPT_TYPE",
+            )
 
     for requested in [fabric_type, *[row.get("fabricType") for row in lines_payload or []]]:
         check_receipt_fabric_type(po, requested)
@@ -2112,6 +2210,7 @@ def create_standalone_grn(
         grn_number=grn_number,
         purchase_order=po,
         purchase_bill=None,
+        dyeing_outward=dyeing_outward,
         party=party,
         receipt_date=receipt_date,
         supplier_challan_no=supplier_challan_no,
@@ -2237,6 +2336,7 @@ def create_standalone_grn(
             remarks=remarks,
             batch_number=batch_number,
             unit_cost=unit_cost,
+            source_batch_id=line_data.get("sourceBatchId"),
         )
 
         if po_line:
@@ -2247,7 +2347,7 @@ def create_standalone_grn(
             client_id=client.id,
             item=item,
             location=qc_hold_location_id,
-            type="PURCHASE",
+            type="PURCHASE" if dyeing_outward is None else "JOBWORK_INWARD",
             unit_cost=unit_cost,
             reference_type="GoodsReceipt",
             reference_id=receipt.id,
