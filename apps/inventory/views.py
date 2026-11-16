@@ -3297,7 +3297,7 @@ class QCRegisterView(APIView):
     """
     GET /inventory/qc/register/
     POST /inventory/qc/register/manual/
-    Handles QC Inspection Register listing and manual entry.
+    Handles QC Inspection Register listing.
     """
 
     permission_classes = [HasModulePermission]

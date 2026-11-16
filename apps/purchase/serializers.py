@@ -459,7 +459,7 @@ class BillOutstandingSerializer(BaseSerializer):
 
 
 # ---------------------------------------------------------------------------
-# Vendor bills -- manual entry, matched later to a real PurchaseBill
+# Vendor bills, matched later to a real PurchaseBill
 # ---------------------------------------------------------------------------
 class VendorBillLineSerializer(BaseModelSerializer):
     lineNo = serializers.IntegerField(source="line_no", required=False)

@@ -134,7 +134,7 @@ class JournalLineSerializer(BaseModelSerializer):
 
 
 class JournalEntrySerializer(BaseModelSerializer):
-    """A manual entry must balance Dr = Cr (api.md §8).
+    """An entry must balance Dr = Cr (api.md §8).
 
     System entries are immutable and reversible only through the parent
     document's cancel (db.md §8), which the viewset enforces.

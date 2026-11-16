@@ -548,7 +548,7 @@ class Expense(TenantModel, LegacyIdMixin):
 
 
 # ---------------------------------------------------------------------------
-# Vendor bills -- manual entry, matched later to a real PurchaseBill
+# Vendor bills, matched later to a real PurchaseBill
 # ---------------------------------------------------------------------------
 #: Draft / Pending Approval are written by the agency bill match flow
 #: (save draft / submit for approval); approve and reject accept both pending states.
