@@ -1,13 +1,14 @@
 """HRMS endpoints (api.md §11)."""
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from decimal import Decimal
 
 
 
 from django.db import models, transaction
 
-from django.db.models import Count, Q
-from django.db.models.functions import ExtractMonth
+from django.db.models import Count, Q, Sum, Value
+from django.db.models.functions import Coalesce, ExtractMonth
 
 from django.utils import timezone
 
@@ -1424,7 +1425,7 @@ class HrmsDashboardView(APIView):
         for m_idx, m_name in enumerate(months_abbr, 1):
             rows = ass_map.get(m_idx, [])
             m_end = date(current_year, 12, 31) if m_idx == 12 else date(current_year, m_idx + 1, 1) - timedelta(days=1)
-            m_ass = [a for a in rows if a["created_at"] and a["created_at"].date() <= m_end and a["status"] != "Disposed"]
+            m_ass = [a for a in rows if a.get("status") != "Disposed"]
             ass_s1 = sum(a["count"] for a in m_ass if a["category__name"] and "laptop" in a["category__name"].lower())
             ass_s2 = sum(a["count"] for a in m_ass if a["category__name"] and ("monitor" in a["category__name"].lower() or "periph" in a["category__name"].lower()))
             ass_s3 = max(0, sum(a["count"] for a in m_ass) - ass_s1 - ass_s2)

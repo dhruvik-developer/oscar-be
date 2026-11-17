@@ -677,6 +677,20 @@ def generate_final_job_work_po(instruction, *, user=None, custom_data=None):
     accepted_qty = round4(D(str(raw_billable))) if raw_billable is not None else round4(D(completion["acceptedQty"]))
     raw_rate = custom_data.get("rate") or custom_data.get("agreedJobRate")
     rate = D(str(raw_rate)) if raw_rate is not None else D(instruction.agreed_rate or instruction.agreed_job_rate or 0)
+    if rate <= ZERO:
+        ppi = D(str(custom_data.get("ppi") or 0))
+        pick_charge = D(str(custom_data.get("pickCharge") or 0))
+        if ppi > ZERO and pick_charge > ZERO:
+            rate = round4(ppi * pick_charge)
+        else:
+            from .models_loom import LoomQuality
+            lq = LoomQuality.objects.filter(
+                client_id=instruction.client_id, deleted_at__isnull=True
+            ).filter(
+                Q(name__iexact=instruction.fabric) | Q(name__icontains=instruction.fabric)
+            ).first() if instruction.fabric else None
+            if lq and lq.ppi and lq.pick_charge:
+                rate = round4(D(str(lq.ppi)) * D(str(lq.pick_charge)))
     
     # A final PO bills what was verified at the agreed rate -- never a
     # guessed quantity or a made-up rate.

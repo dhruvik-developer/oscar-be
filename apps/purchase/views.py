@@ -2882,6 +2882,12 @@ class GoodsReceiptViewSet(TenantModelViewSet):
                 if receipt.purchase_order_id and receipt.purchase_order.fabric_flow:
                     fabric_flow.allocate_costs(receipt.purchase_order, user=request.user)
 
+                try:
+                    from apps.pms import loom_services
+                    loom_services.sync_yarn_receipt_to_loom_stock(receipt)
+                except Exception:
+                    pass
+
                 self.write_audit("create", receipt, description=f"Standalone GRN created: {receipt.grn_number}")
 
         except Exception:

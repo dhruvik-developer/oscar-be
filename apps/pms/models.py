@@ -631,6 +631,13 @@ class ProductionInstruction(TenantModel):
         "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
     verified_at = models.DateTimeField(null=True, blank=True)
+    source_po = models.ForeignKey(
+        "purchase.PurchaseOrder",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="source_production_instructions",
+    )
     final_po = models.ForeignKey(
         "purchase.PurchaseOrder", null=True, blank=True, on_delete=models.SET_NULL, related_name="production_instructions"
     )

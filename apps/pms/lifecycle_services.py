@@ -54,7 +54,14 @@ def source_purchase_order(instruction):
     """The Vendor A PO an instruction was raised from (linked by number)."""
     from apps.purchase.models import PurchaseOrder
 
-    if not instruction or not instruction.order_reference:
+    if not instruction:
+        return None
+    if getattr(instruction, "source_po_id", None):
+        source = instruction.source_po
+        if source and source.deleted_at is None:
+            return source
+    if not instruction.order_reference:
+        return None
         return None
     return (
         PurchaseOrder.objects.filter(
@@ -68,6 +75,17 @@ def source_purchase_order(instruction):
 
 
 def latest_instruction_for_po(po):
+    """Same pick as the PO production-instruction endpoint: the newest one."""
+    inst = (
+        ProductionInstruction.objects.filter(
+            client_id=po.client_id, source_po=po, deleted_at__isnull=True
+        )
+        .select_related("final_po", "verified_by", "agency", "employee")
+        .order_by("-created_at")
+        .first()
+    )
+    if inst is not None:
+        return inst
     """Same pick as the PO production-instruction endpoint: the newest one."""
     return (
         ProductionInstruction.objects.filter(

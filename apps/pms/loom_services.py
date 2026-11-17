@@ -371,3 +371,73 @@ def seed_loom_demo_data(client_id):
         defaults={"taka": 12, "meters": Decimal("1440"), "dest": "Dyeing mill", "dest_name": "Shree Dyeing", "challan": "SL/101"}
     )
     return True
+
+
+def sync_yarn_receipt_to_loom_stock(goods_receipt):
+    """
+    Auto-credits Yarn PO GoodsReceipt into PMS Loom YarnDelivery stock.
+    Matches lines where item is Yarn to YarnMaster and factory.
+    """
+    po = goods_receipt.purchase_order
+    receipt_date = goods_receipt.receipt_date or timezone.localdate()
+    factory = LoomFactory.objects.filter(client_id=goods_receipt.client_id, deleted_at__isnull=True).first()
+    if not factory:
+        return []
+
+    created_deliveries = []
+    for line in goods_receipt.lines.select_related("item", "item__category").filter(deleted_at__isnull=True):
+        item = line.item
+        is_yarn = (
+            getattr(item, "kind", "") == "Yarn"
+            or "yarn" in (getattr(item.category, "name", "") or "").lower()
+            or "yarn" in (item.name or "").lower()
+        )
+        if not is_yarn:
+            continue
+
+        ym = YarnMaster.objects.filter(
+            client_id=goods_receipt.client_id,
+            name__iexact=item.name,
+            deleted_at__isnull=True,
+        ).first()
+        if not ym:
+            ym = YarnMaster.objects.create(
+                client_id=goods_receipt.client_id,
+                name=item.name,
+                denier=getattr(item, "denier", None) or 150,
+                rate=line.purchase_order_line.rate if line.purchase_order_line else Decimal("120.00"),
+            )
+
+        supplier_name = goods_receipt.party.name if goods_receipt.party else "Yarn Supplier"
+        booking, _ = YarnBooking.objects.get_or_create(
+            client_id=goods_receipt.client_id,
+            supplier=supplier_name,
+            yarn=ym,
+            defaults={
+                "kgs": line.received_qty or line.stock_qty,
+                "rate": line.purchase_order_line.rate if line.purchase_order_line else ym.rate,
+                "date": receipt_date,
+            },
+        )
+
+        delivery, created = YarnDelivery.objects.get_or_create(
+            client_id=goods_receipt.client_id,
+            booking=booking,
+            purchase_order=po,
+            defaults={
+                "factory": factory,
+                "kgs": line.received_qty or line.stock_qty,
+                "recd_kgs": line.received_qty or line.stock_qty,
+                "rate": booking.rate,
+                "due": receipt_date,
+                "recd_date": receipt_date,
+                "status": "Received",
+            },
+        )
+        if not created and delivery.status != "Received":
+            delivery.recd_kgs = line.received_qty or line.stock_qty
+            delivery.recd_date = receipt_date
+            delivery.status = "Received"
+            delivery.save(update_fields=["recd_kgs", "recd_date", "status", "updated_at"])
+        created_deliveries.append(delivery)
+    return created_deliveries

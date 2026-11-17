@@ -228,6 +228,13 @@ class YarnDelivery(TenantModel):
     recd_kgs = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     recd_date = models.DateField(null=True, blank=True)
     status = models.TextField(choices=STATUS_CHOICES, default="Scheduled")
+    purchase_order = models.ForeignKey(
+        "purchase.PurchaseOrder",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="pms_yarn_deliveries",
+    )
 
     class Meta:
         db_table = "loom_yarn_deliveries"

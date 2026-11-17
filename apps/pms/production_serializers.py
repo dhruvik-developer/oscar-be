@@ -39,6 +39,10 @@ class ProductionInstructionSerializer(BaseModelSerializer):
     greyLotNo = serializers.ReadOnlyField(source="grey_lot.lot_number")
     finalPoId = serializers.PrimaryKeyRelatedField(source="final_po", read_only=True)
     finalPoNumber = serializers.ReadOnlyField(source="final_po.po_number")
+    sourcePoId = TenantPrimaryKeyRelatedField(
+        source="source_po", model="purchase.PurchaseOrder", required=False, allow_null=True
+    )
+    sourcePoNumber = serializers.ReadOnlyField(source="source_po.po_number")
     employeeCode = serializers.ReadOnlyField(source="employee.employee_code")
     employeeName = serializers.ReadOnlyField(source="employee.name")
     supervisorName = serializers.ReadOnlyField(source="supervisor.name")
@@ -65,6 +69,7 @@ class ProductionInstructionSerializer(BaseModelSerializer):
             "special_terms", "expected_start_date", "expectedStartDate", "expected_completion_date", "expectedCompletionDate",
             "pi_date", "fabric", "process_type", "agreed_job_rate", "rejected_qty",
             "verification_remarks", "completed_at", "greyLotId", "greyLotNo", "finalPoId", "finalPoNumber",
+            "sourcePoId", "sourcePoNumber",
             "employeeId", "employeeCode", "employeeName", "supervisorId", "supervisorName",
             "status", "verified_by", "verified_at", "notes",
             "cumulative", "balance", "totalProduced", "acceptedQty", "rejectedQty", "reprocessQty",
@@ -75,7 +80,7 @@ class ProductionInstructionSerializer(BaseModelSerializer):
             "completed_at", "rejected_qty", "verification_remarks",
             "employeeCode", "employeeName", "cumulative", "balance",
             "totalProduced", "acceptedQty", "rejectedQty", "reprocessQty", "shortageQty", "finalAmount",
-            "agencyCode", "greyLotNo", "finalPoNumber",
+            "agencyCode", "greyLotNo", "finalPoNumber", "sourcePoNumber",
             # Status only moves through approve/start/complete/verify/generate-po.
             "status",
             "created_at", "updated_at",
