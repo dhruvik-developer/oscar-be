@@ -58,14 +58,14 @@ from .loom_services import (
 class LoomCoordinatorViewSet(TenantModelViewSet):
     permission_classes = [HasModulePermission]
     permission_map = {"read": ["view_pms"], "write": ["create_pms_project"]}
-    queryset = LoomCoordinator.objects.all()
+    queryset = LoomCoordinator.objects.select_related("user", "employee").all()
     serializer_class = LoomCoordinatorSerializer
 
 
 class LoomFactoryViewSet(TenantModelViewSet):
     permission_classes = [HasModulePermission]
     permission_map = {"read": ["view_pms"], "write": ["create_pms_project"]}
-    queryset = LoomFactory.objects.all()
+    queryset = LoomFactory.objects.select_related("coord", "warehouse", "job_worker_party").all()
     serializer_class = LoomFactorySerializer
 
     @action(detail=True, methods=["get"])
@@ -125,7 +125,7 @@ class YarnMasterViewSet(TenantModelViewSet):
 class LoomQualityViewSet(TenantModelViewSet):
     permission_classes = [HasModulePermission]
     permission_map = {"read": ["view_pms"], "write": ["create_pms_project"]}
-    queryset = LoomQuality.objects.all()
+    queryset = LoomQuality.objects.select_related("warp_yarn", "weft_yarn", "fabric_quality", "item").all()
     serializer_class = LoomQualitySerializer
 
 
@@ -317,7 +317,7 @@ class DailyLoomProductionViewSet(TenantModelViewSet):
 class YarnBookingViewSet(TenantModelViewSet):
     permission_classes = [HasModulePermission]
     permission_map = {"read": ["view_pms"], "write": ["create_pms_project"]}
-    queryset = YarnBooking.objects.all()
+    queryset = YarnBooking.objects.select_related("yarn", "supplier_party").all()
     serializer_class = YarnBookingSerializer
 
 
@@ -379,7 +379,7 @@ class ProductionProgramViewSet(TenantModelViewSet):
 class FabricDispatchViewSet(TenantModelViewSet):
     permission_classes = [HasModulePermission]
     permission_map = {"read": ["view_pms"], "write": ["create_pms_project"]}
-    queryset = FabricDispatch.objects.all()
+    queryset = FabricDispatch.objects.select_related("factory", "quality", "job_work_order", "dyeing_mill_party", "delivery_challan").all()
     serializer_class = FabricDispatchSerializer
     filterset_fields = ["factory", "quality"]
 

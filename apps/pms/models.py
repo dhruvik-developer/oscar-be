@@ -806,6 +806,20 @@ class IncentiveCalculation(TenantModel):
         on_delete=models.SET_NULL,
         related_name="+",
     )
+    payroll_run = models.ForeignKey(
+        "hrms.PayrollRun",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="incentive_calculations",
+    )
+    payslip = models.ForeignKey(
+        "hrms.Payslip",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="incentive_calculations",
+    )
     reversed_at = models.DateTimeField(null=True, blank=True)
     reversal_reason = models.TextField(null=True, blank=True)
 

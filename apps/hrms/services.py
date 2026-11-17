@@ -1176,6 +1176,37 @@ def process_payroll(*, client, period_month, employee_ids=None, user=None):
                     for component in split["components"]
                 ]
             )
+
+        # Connection 12: Attach PMS Incentive Calculations
+        try:
+            from apps.pms.models import IncentiveCalculation
+            incentives = IncentiveCalculation.objects.filter(
+                client=client,
+                employee=employee,
+                status="Posted",
+                payslip__isnull=True,
+                period_start__year=period_month.year,
+                period_start__month=period_month.month,
+            )
+            for inc in incentives:
+                p_amt = inc.incentive_amount - inc.hold_amount
+                if p_amt > ZERO:
+                    PayslipComponent.objects.create(
+                        client=client,
+                        payslip=payslip,
+                        name=f"PMS Incentive ({inc.calc_number or inc.period_label})",
+                        amount=p_amt,
+                        kind="earning",
+                    )
+                    payslip.additional_earnings += p_amt
+                    payslip.net_payable += p_amt
+                    payslip.save(update_fields=["additional_earnings", "net_payable", "updated_at"])
+                    inc.payslip = payslip
+                    inc.payroll_run = run
+                    inc.save(update_fields=["payslip", "payroll_run", "updated_at"])
+        except Exception:
+            pass
+
         payslips.append(payslip)
 
     run.status = "Ready for Review"

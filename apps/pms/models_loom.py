@@ -15,6 +15,9 @@ class LoomCoordinator(TenantModel):
     user = models.ForeignKey(
         "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="loom_coordinators"
     )
+    employee = models.ForeignKey(
+        "hrms.Employee", null=True, blank=True, on_delete=models.SET_NULL, related_name="loom_coordinators"
+    )
 
     class Meta:
         db_table = "loom_coordinators"
@@ -25,12 +28,24 @@ class LoomCoordinator(TenantModel):
 
 
 class LoomFactory(TenantModel):
+    FACTORY_TYPE_CHOICES = [
+        ("in_house", "In-House Shed"),
+        ("job_work", "Contract Job-Worker"),
+    ]
+
     name = models.TextField()
     code = models.TextField(null=True, blank=True)
     coord = models.ForeignKey(
         LoomCoordinator, null=True, blank=True, on_delete=models.SET_NULL, related_name="factories"
     )
     address = models.TextField(null=True, blank=True)
+    factory_type = models.TextField(choices=FACTORY_TYPE_CHOICES, default="in_house")
+    warehouse = models.ForeignKey(
+        "masters.Location", null=True, blank=True, on_delete=models.SET_NULL, related_name="loom_factories"
+    )
+    job_worker_party = models.ForeignKey(
+        "masters.Party", null=True, blank=True, on_delete=models.SET_NULL, related_name="job_worker_factories"
+    )
     is_active = models.BooleanField(default=True)
 
     class Meta:
@@ -79,6 +94,12 @@ class YarnMaster(TenantModel):
 
 class LoomQuality(TenantModel):
     name = models.TextField()
+    fabric_quality = models.ForeignKey(
+        "masters.FabricQuality", null=True, blank=True, on_delete=models.SET_NULL, related_name="loom_qualities"
+    )
+    item = models.ForeignKey(
+        "masters.Item", null=True, blank=True, on_delete=models.SET_NULL, related_name="loom_qualities"
+    )
     warp_yarn = models.ForeignKey(YarnMaster, on_delete=models.PROTECT, related_name="warp_qualities")
     ends = models.IntegerField()
     crimp = models.DecimalField(max_digits=5, decimal_places=2, default=5.0)
@@ -201,6 +222,9 @@ class FactoryDayLog(TenantModel):
 
 class YarnBooking(TenantModel):
     supplier = models.TextField()
+    supplier_party = models.ForeignKey(
+        "masters.Party", null=True, blank=True, on_delete=models.SET_NULL, related_name="loom_yarn_bookings"
+    )
     yarn = models.ForeignKey(YarnMaster, on_delete=models.PROTECT, related_name="bookings")
     kgs = models.DecimalField(max_digits=12, decimal_places=2)
     rate = models.DecimalField(max_digits=10, decimal_places=2)
@@ -280,6 +304,15 @@ class FabricDispatch(TenantModel):
     meters = models.DecimalField(max_digits=12, decimal_places=2)
     dest = models.TextField(choices=DEST_CHOICES, default="Godown")
     dest_name = models.TextField(null=True, blank=True)
+    job_work_order = models.ForeignKey(
+        "jobwork.JobWorkOrder", null=True, blank=True, on_delete=models.SET_NULL, related_name="fabric_dispatches"
+    )
+    dyeing_mill_party = models.ForeignKey(
+        "masters.Party", null=True, blank=True, on_delete=models.SET_NULL, related_name="pms_fabric_dispatches"
+    )
+    delivery_challan = models.ForeignKey(
+        "sales.DeliveryChallan", null=True, blank=True, on_delete=models.SET_NULL, related_name="pms_fabric_dispatches"
+    )
     challan = models.TextField(null=True, blank=True)
     vehicle = models.TextField(null=True, blank=True)
 

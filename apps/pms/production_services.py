@@ -1613,8 +1613,37 @@ def post_incentive(calc, *, user=None):
         )
         calc.journal_entry = entry
 
+    # Connection 12: Link to HRMS Payroll Run & Payslip if available
+    try:
+        from apps.hrms.models import Payslip, PayslipComponent
+        from django.db.models import Q
+        payslip = Payslip.objects.filter(
+            client=calc.client,
+            employee=calc.employee,
+            deleted_at__isnull=True,
+        ).filter(
+            Q(period_month__year=calc.period_start.year, period_month__month=calc.period_start.month) |
+            Q(status="In Progress")
+        ).order_by("-period_month").first()
+
+        if payslip and not calc.payslip:
+            calc.payslip = payslip
+            calc.payroll_run = payslip.payroll_run
+            PayslipComponent.objects.create(
+                client=calc.client,
+                payslip=payslip,
+                name=f"PMS Incentive ({calc.calc_number or calc.period_label})",
+                kind="earning",
+                amount=payable_amount,
+            )
+            payslip.additional_earnings = (payslip.additional_earnings or Decimal("0")) + payable_amount
+            payslip.net_payable = (payslip.net_payable or Decimal("0")) + payable_amount
+            payslip.save(update_fields=["additional_earnings", "net_payable", "updated_at"])
+    except Exception:
+        pass
+
     calc.status = "Posted"
-    calc.save(update_fields=["status", "journal_entry", "updated_at"])
+    calc.save(update_fields=["status", "journal_entry", "payroll_run", "payslip", "updated_at"])
     record_audit(
         client=calc.client_id,
         actor=user,
