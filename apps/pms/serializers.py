@@ -128,7 +128,7 @@ class DocumentSerializer(BaseModelSerializer):
         model = Document
         fields = [
             "id", "docKey", "version", "fileId", "fileName", "fileSize",
-            "previewUrl", "uploadedBy", "uploaded_at", "uploadedAt", "comments",
+            "previewUrl", "uploadedBy", "uploadedAt", "comments",
             "revisionReason", "approvalStatus", "is_current", "is_proof",
         ]
 
@@ -474,11 +474,6 @@ class ProjectDetailSerializer(ProjectListSerializer):
             from apps.sales.models import SalesReturn, SalesOrder, SalesInvoice
 
             order = getattr(project, "sales_order", None)
-            if not order and project.crm_order_id:
-                order = SalesOrder.objects.filter(
-                    client_id=project.client_id,
-                    order_number=project.crm_order_id,
-                ).first()
 
             invoices = []
             if order:
@@ -703,7 +698,7 @@ class StageStatusSerializer(BaseSerializer):
         choices=[
             "Not Started", "Assigned", "In Progress", "At Risk", "Delayed",
             "Submitted", "Under Review", "Approved", "Need Improvement",
-            "Completed", "Blocked",
+            "Completed", "Blocked", "Not Required",
         ]
     )
 

@@ -125,7 +125,10 @@ def derive_project_status(project, now=None):
     """Overdue and at-risk are computed, never stored (db.md §12)."""
     if project.status in ("Draft", "On Hold"):
         return project.status
-    if project.actual_completion_date is not None:
+    if project.status == "Completed" or project.actual_completion_date is not None:
+        if not project.actual_completion_date:
+            project.actual_completion_date = timezone.now()
+            project.save(update_fields=["actual_completion_date", "updated_at"])
         return "Completed"
 
     now = now or timezone.now()

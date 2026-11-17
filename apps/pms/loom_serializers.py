@@ -196,3 +196,59 @@ class FabricDispatchSerializer(serializers.ModelSerializer):
             "id", "factory", "factory_name", "quality", "quality_name",
             "date", "taka", "meters", "dest", "dest_name", "challan", "vehicle",
         ]
+
+
+class LoomMachineBatchCreateSerializer(serializers.Serializer):
+    factory = serializers.UUIDField(required=False)
+    factory_id = serializers.UUIDField(required=False)
+    from_no = serializers.IntegerField(min_value=1)
+    to_no = serializers.IntegerField(min_value=1)
+    reed = serializers.IntegerField(min_value=1, required=False, default=84)
+
+    def validate(self, attrs):
+        fid = attrs.get("factory") or attrs.get("factory_id")
+        if not fid:
+            raise serializers.ValidationError({"factory": ["This field is required."]})
+        attrs["factory_id"] = fid
+        if attrs["from_no"] > attrs["to_no"]:
+            raise serializers.ValidationError({"to_no": ["to_no must be greater than or equal to from_no."]})
+        return attrs
+
+
+class DailyLoomProductionBulkSaveRowSerializer(serializers.Serializer):
+    machine_id = serializers.UUIDField()
+    beam_id = serializers.UUIDField(required=False, allow_null=True)
+    meters = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
+    rpm = serializers.DecimalField(max_digits=8, decimal_places=2, required=False, default=650)
+    hours = serializers.DecimalField(max_digits=5, decimal_places=2, required=False, default=22)
+    stop = serializers.DecimalField(max_digits=5, decimal_places=2, required=False, default=0)
+    reason = serializers.CharField(required=False, allow_blank=True, default="")
+    damage = serializers.DecimalField(max_digits=8, decimal_places=2, required=False, default=0)
+
+
+class DailyLoomProductionBulkSaveSerializer(serializers.Serializer):
+    factory_id = serializers.UUIDField(required=False)
+    factory = serializers.UUIDField(required=False)
+    date = serializers.DateField()
+    power = serializers.DecimalField(max_digits=8, decimal_places=2)
+    rows = DailyLoomProductionBulkSaveRowSerializer(many=True)
+
+    def validate(self, attrs):
+        fid = attrs.get("factory_id") or attrs.get("factory")
+        if not fid:
+            raise serializers.ValidationError({"factory_id": ["This field is required."]})
+        attrs["factory_id"] = fid
+        return attrs
+
+
+class YarnDeliveryConfirmReceiptSerializer(serializers.Serializer):
+    recd_kgs = serializers.DecimalField(max_digits=12, decimal_places=2)
+    recd_date = serializers.DateField()
+
+
+class LoomBeamLoadSerializer(serializers.Serializer):
+    machine_id = serializers.UUIDField()
+
+
+class LoomBeamAssignSpareSerializer(serializers.Serializer):
+    machine_id = serializers.UUIDField(required=False, allow_null=True)

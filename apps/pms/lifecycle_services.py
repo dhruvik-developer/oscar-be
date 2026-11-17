@@ -62,7 +62,6 @@ def source_purchase_order(instruction):
             return source
     if not instruction.order_reference:
         return None
-        return None
     return (
         PurchaseOrder.objects.filter(
             client_id=instruction.client_id,

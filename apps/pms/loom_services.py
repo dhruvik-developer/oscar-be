@@ -152,11 +152,12 @@ def get_factory_status(factory):
     # Weft daily burn rate
     weft_daily = {}
     for x in running:
-        q_obj = LoomQuality.objects.get(id=x["quality"]["id"])
-        wid = str(q_obj.weft_yarn_id)
-        weft_daily[wid] = weft_daily.get(wid, 0.0) + (x["avg"] * q_obj.weft_kg_m)
+        q_obj = LoomQuality.objects.filter(id=x["quality"]["id"], client_id=factory.client_id, deleted_at__isnull=True).first()
+        if q_obj:
+            wid = str(q_obj.weft_yarn_id)
+            weft_daily[wid] = weft_daily.get(wid, 0.0) + (x["avg"] * q_obj.weft_kg_m)
 
-    yarns = YarnMaster.objects.filter(deleted_at__isnull=True)
+    yarns = YarnMaster.objects.filter(client_id=factory.client_id, deleted_at__isnull=True)
     yarn_cover = []
     for y in yarns:
         st = get_factory_yarn_stock(factory, y)
