@@ -157,67 +157,21 @@ BATCH_PROFIT_ROWS = 10
 
 
 def _batch_profit(client_id, day):
-    """Profit / loss per batch (``batch_costing``) for OSCAR-owned batches
-    with a sale in the last 90 days. Each figure is the batch's whole life to
-    date, so a loss shows even when the sale that caused it was weeks ago.
-    Rows come worst first so loss-making batches lead."""
-    from apps.inventory.batch_services import batch_costing
-    from apps.inventory.models import Batch, StockMovement
+    """Realized batch profit & loss summary computed by the Batch Profitability Service."""
+    from apps.inventory.batch_profitability import get_batch_profitability_summary
+    return get_batch_profitability_summary(client_id, day)
 
-    since = day - timedelta(days=BATCH_PROFIT_WINDOW_DAYS)
-    recent = (
-        StockMovement.objects.filter(
-            client_id=client_id, type="SALE", deleted_at__isnull=True,
-            movement_date__gte=since, movement_date__lte=day,
-            lot_taka__batch__isnull=False,
-        )
-        .order_by("-movement_date", "-created_at")
-        .values_list("lot_taka__batch_id", flat=True)
-    )
-    batch_ids = list(dict.fromkeys(recent))[:BATCH_PROFIT_MAX_BATCHES]
-    batches = Batch.objects.filter(
-        client_id=client_id, id__in=batch_ids, ownership="OSCAR", deleted_at__isnull=True,
-    ).select_related("item")
-
-    rows = []
-    for batch in batches:
-        c = batch_costing(batch)
-        revenue = D(c["revenue"])
-        net = D(c["netResult"])
-        rows.append({
-            "id": str(batch.id),
-            "batchCode": batch.batch_code,
-            "item": batch.item.name if batch.item_id else None,
-            "soldQty": c["soldQty"],
-            "revenue": c["revenue"],
-            "cost": c["costOfSold"],
-            "writtenOffLoss": c["writtenOffLoss"],
-            "netResult": c["netResult"],
-            "marginPct": round2(net / revenue * Decimal("100")) if revenue > ZERO else None,
-        })
-    rows.sort(key=lambda r: D(r["netResult"]))
-
-    nets = [D(r["netResult"]) for r in rows]
-    return {
-        "windowDays": BATCH_PROFIT_WINDOW_DAYS,
-        "batches": len(rows),
-        "profitable": sum(1 for n in nets if n > ZERO),
-        "lossMaking": sum(1 for n in nets if n < ZERO),
-        "totalProfit": round2(sum((n for n in nets if n > ZERO), ZERO)),
-        "totalLoss": round2(sum((n for n in nets if n < ZERO), ZERO)),
-        "net": round2(sum(nets, ZERO)),
-        "worst": rows[:BATCH_PROFIT_ROWS],
-        "best": [r for r in reversed(rows) if D(r["netResult"]) > ZERO][:BATCH_PROFIT_ROWS],
-    }
 
 
 # ---------------------------------------------------------------------------
 # Funds / stock / working capital
 # ---------------------------------------------------------------------------
 def stock_valuation(client_id):
-    """On-hand qty x weighted average cost, per item, plus the per-stage split
-    (Grey / Dyed / Printed / Finished) from the fabric-type master."""
-    from apps.inventory.models import StockBalance
+    """On-hand qty x rate per roll, per fabric stage (Grey / Dyed / Printed / Finished)
+    from batches and rolls, plus non-roll tracked stock balances from the inventory ledger."""
+    from collections import defaultdict
+    from apps.inventory.models import LotTaka, StockBalance
+    from apps.inventory.batch_services import _bucket
     from apps.masters.models import FabricQuality
 
     stage_by_quality = {}
@@ -228,47 +182,83 @@ def stock_valuation(client_id):
             if key:
                 stage_by_quality[str(key).strip().lower()] = stage
 
-    from apps.inventory.batch_services import customer_owned_qty_by_item_location
+    stages = defaultdict(lambda: {"qty": ZERO, "value": ZERO, "total_qty": ZERO, "total_value": ZERO})
 
-    held_for_others = defaultdict(lambda: ZERO)
-    for (item_id, _location_id), qty in customer_owned_qty_by_item_location(client_id).items():
-        held_for_others[item_id] += qty
+    # 1. Authoritative roll-level stock (OSCAR-owned)
+    rolls = (
+        LotTaka.objects.filter(
+            client_id=client_id, deleted_at__isnull=True, available_quantity__gt=0
+        )
+        .exclude(batch__ownership__in=["CUSTOMER", "THIRD_PARTY"])
+        .select_related("batch", "location", "item")
+    )
 
-    per_item = {}
+    tracked_item_ids = set()
+    total_val = ZERO
+
+    for t in rolls:
+        tracked_item_ids.add(t.item_id)
+        qty = D(t.available_quantity)
+        rate = D(t.rate or 0)
+        val = qty * rate
+        total_val += val
+
+        # Determine stage: batch fabric_type takes precedence
+        b_ft = (t.batch.fabric_type if t.batch else "").upper()
+        if b_ft == "GREY":
+            stage = "Grey"
+        elif b_ft in ("DYED", "FINISHED", "PRINTED"):
+            stage = "Dyed" if b_ft == "DYED" else b_ft.capitalize()
+        else:
+            quality = str(t.item.fabric_quality if t.item else "").strip().lower()
+            stage = stage_by_quality.get(quality) or "Unclassified"
+
+        bucket = _bucket(t)
+        stages[stage]["total_qty"] += qty
+        stages[stage]["total_value"] += val
+
+        # Freely available warehouse stock (not on QC Hold, not with job worker, not scrap/reprocess, not reserved)
+        if bucket == "available" and t.status != "Reserved":
+            stages[stage]["qty"] += qty
+            stages[stage]["value"] += val
+
+    # 2. Non-roll tracked items from StockBalance
     for row in (
         StockBalance.objects.filter(client_id=client_id, item__deleted_at__isnull=True)
         .exclude(item__item_kind="Service")
-        .values("item_id", "item__fabric_quality", "item__cost_price")
+        .exclude(item_id__in=tracked_item_ids)
+        .values("item_id", "item__name", "item__fabric_quality", "item__cost_price")
         .annotate(
             total_on_hand=_qty("on_hand"),
             inward_qty=_qty("inward_qty"),
             inward_value=_money("inward_value"),
         )
     ):
-        # Customer material in our godowns is not OSCAR's asset.
-        on_hand = D(row["total_on_hand"]) - held_for_others.get(row["item_id"], ZERO)
+        on_hand = D(row["total_on_hand"])
         if on_hand <= ZERO:
             continue
-        if D(row["inward_qty"]) > ZERO:
-            unit = D(row["inward_value"]) / D(row["inward_qty"])
-        else:
-            unit = D(row["item__cost_price"])
+        unit = (
+            (D(row["inward_value"]) / D(row["inward_qty"]))
+            if D(row["inward_qty"]) > ZERO
+            else D(row["item__cost_price"])
+        )
+        val = on_hand * unit
         quality = str(row["item__fabric_quality"] or "").strip().lower()
-        per_item[row["item_id"]] = {
-            "qty": on_hand,
-            "value": on_hand * unit,
-            "stage": stage_by_quality.get(quality) or "Unclassified",
-        }
+        stage = stage_by_quality.get(quality) or "Unclassified"
+        stages[stage]["qty"] += on_hand
+        stages[stage]["value"] += val
+        stages[stage]["total_qty"] += on_hand
+        stages[stage]["total_value"] += val
+        total_val += val
 
-    stages = {}
-    for entry in per_item.values():
-        bucket = stages.setdefault(entry["stage"], {"qty": ZERO, "value": ZERO})
-        bucket["qty"] += entry["qty"]
-        bucket["value"] += entry["value"]
-    total = round2(sum((entry["value"] for entry in per_item.values()), ZERO))
-    return total, {
-        stage: {"qty": round4(v["qty"]), "value": round2(v["value"])}
-        for stage, v in stages.items()
+    return round2(total_val), {
+        s: {
+            "qty": round4(v["qty"]),
+            "value": round2(v["value"]),
+            "totalQty": round4(v["total_qty"]),
+            "totalValue": round2(v["total_value"]),
+        }
+        for s, v in stages.items()
     }
 
 
@@ -301,53 +291,60 @@ def _lot_state_totals(client_id):
 
 def _external_wip(client_id):
     """Meters out at job-work vendors (outward - inward) on open orders."""
-    from apps.jobwork.models import JobWorkOrder
+    from apps.jobwork.models import JobWorkOrder, JWOInward, JWOMaterial, JWOOutwardTaka
 
     orders = (
         JobWorkOrder.objects.filter(
-            client_id=client_id, deleted_at__isnull=True, status="In-Process"
+            client_id=client_id, deleted_at__isnull=True
         )
+        .exclude(status__in=["Completed", "Closed", "Cancelled"])
         .annotate(
             out_qty=_qty("outwards__qty", filter=Q(outwards__deleted_at__isnull=True)),
         )
-        .values("id", "process", "out_qty")
+        .values("id", "process", "out_qty", "status")
     )
-    from apps.jobwork.models import JWOInward, JWOMaterial
 
     inward = {
-        row["job_work_order_id"]: D(row["qty"])
+        row["job_work_order_id"]: D(row["qty"] or 0)
         for row in JWOInward.objects.filter(client_id=client_id, deleted_at__isnull=True)
         .values("job_work_order_id")
         .annotate(qty=_qty("qty"))
     }
-    material_rate = {}
-    for row in (
-        JWOMaterial.objects.filter(client_id=client_id, deleted_at__isnull=True)
-        .values("job_work_order_id")
-        .annotate(qty=_qty("qty"), value=_money("amount"))
-    ):
-        if D(row["qty"]) > ZERO and D(row["value"]) > ZERO:
-            material_rate[row["job_work_order_id"]] = D(row["value"]) / D(row["qty"])
+
+    order_rates = {}
+    for m in JWOMaterial.objects.filter(client_id=client_id, deleted_at__isnull=True).select_related("lot_taka"):
+        jid = m.job_work_order_id
+        if D(m.amount or 0) > ZERO and D(m.qty or 0) > ZERO:
+            order_rates[jid] = D(m.amount) / D(m.qty)
+        elif m.lot_taka and D(m.lot_taka.rate or 0) > ZERO:
+            order_rates[jid] = D(m.lot_taka.rate)
+        elif D(m.rate or 0) > ZERO:
+            order_rates[jid] = D(m.rate)
+
+    for ot in JWOOutwardTaka.objects.filter(client_id=client_id, deleted_at__isnull=True).select_related("outward", "lot_taka"):
+        jid = ot.outward.job_work_order_id if ot.outward else None
+        if jid and jid not in order_rates and ot.lot_taka and D(ot.lot_taka.rate or 0) > ZERO:
+            order_rates[jid] = D(ot.lot_taka.rate)
 
     by_process = {}
     total_qty = ZERO
     total_value = ZERO
     valued = True
     for order in orders:
-        pending = D(order["out_qty"]) - inward.get(order["id"], ZERO)
+        pending = D(order["out_qty"] or 0) - inward.get(order["id"], ZERO)
         if pending <= ZERO:
             continue
         process = order["process"] or "Unspecified"
         by_process[process] = by_process.get(process, ZERO) + pending
         total_qty += pending
-        rate = material_rate.get(order["id"])
+        rate = order_rates.get(order["id"])
         if rate is None:
             valued = False
         else:
             total_value += pending * rate
+
     return {
         "qty": round4(total_qty),
-        # None when some pending fabric has no material rate to value it at.
         "value": round2(total_value) if valued else None,
         "byProcess": [
             {"process": process, "qty": round4(qty)}
@@ -426,14 +423,33 @@ def _production(client_id, day):
 def _qc_wastage(client_id, since):
     """Job-work inwards since ``since``: received / accepted / rejected,
     reprocess sent, and process loss on finished orders."""
+    from django.db.models import Case, When, F, Value
     from apps.jobwork.models import JobWorkOrder, JWOInward, JWOOutward, JWOReprocess
 
     inwards = JWOInward.objects.filter(
         client_id=client_id, deleted_at__isnull=True, date__gte=since,
         job_work_order__deleted_at__isnull=True,
     )
+    # Smart acceptance calculation: If accepted was not explicitly entered but status is
+    # Received or Accepted without rejection, count (qty - rejected) as good accepted fabric.
     totals = inwards.aggregate(
-        received=_qty("qty"), good=_qty("accepted"), reject=_qty("rejected")
+        received=_qty("qty"),
+        good=_qty(
+            Case(
+                When(accepted__gt=0, then="accepted"),
+                When(status__in=["Received", "Accepted", "Completed"], then=F("qty") - F("rejected")),
+                default=Value(Decimal("0"), output_field=QTY),
+                output_field=QTY,
+            )
+        ),
+        reject=_qty("rejected"),
+        pending=_qty(
+            Case(
+                When(status__in=["QC Pending", "QC Hold", "Pending"], accepted=0, rejected=0, then="qty"),
+                default=Value(Decimal("0"), output_field=QTY),
+                output_field=QTY,
+            )
+        ),
     )
     reprocess = D(
         JWOReprocess.objects.filter(
@@ -444,7 +460,7 @@ def _qc_wastage(client_id, since):
         JobWorkOrder.objects.filter(
             client_id=client_id,
             deleted_at__isnull=True,
-            status__in=["Completed", "Closed"],
+            status__in=["Completed", "Closed", "Received"],
             inwards__date__gte=since,
         ).values_list("id", flat=True).distinct()
     )
@@ -461,14 +477,19 @@ def _qc_wastage(client_id, since):
     loss = out_total - in_total
     received = D(totals["received"])
     good = D(totals["good"])
+    pending = D(totals["pending"])
+    inspected = received - pending
+    yield_base = inspected if inspected > ZERO else received
+    yield_pct = round(float(good / yield_base * 100), 1) if yield_base > ZERO else None
     return {
         "since": since,
         "received": round4(received),
         "good": round4(good),
         "reprocess": round4(reprocess),
         "reject": round4(D(totals["reject"])),
+        "pending": round4(pending),
         "loss": round4(loss if loss > ZERO else ZERO),
-        "yieldPct": round(float(good / received * 100), 1) if received > ZERO else None,
+        "yieldPct": yield_pct,
         "lossPct": (
             round(float(max(loss, ZERO) / out_total * 100), 1) if out_total > ZERO else None
         ),
@@ -583,7 +604,19 @@ def business_dashboard(client_id, *, day=None, include_batch_profit=False):
     finished = {
         "qty": round4(sum((stages[s]["qty"] for s in finished_stages if s in stages), ZERO)),
         "value": round2(sum((stages[s]["value"] for s in finished_stages if s in stages), ZERO)),
+        "totalQty": round4(sum((stages[s]["totalQty"] for s in finished_stages if s in stages), ZERO)),
+        "totalValue": round2(sum((stages[s]["totalValue"] for s in finished_stages if s in stages), ZERO)),
     }
+
+    # Summary reconciliation across authoritative inventory
+    from apps.inventory.models import StockMovement
+    from apps.inventory.batch_services import SALE_TYPES, RETURN_TYPES
+    total_physical = sum((stages[s]["totalQty"] for s in stages), ZERO)
+    total_available = stages.get("Grey", {}).get("qty", ZERO) + finished["qty"]
+    sale_moves = StockMovement.objects.filter(client_id=client_id, deleted_at__isnull=True)
+    sold_m = -(sale_moves.filter(type__in=SALE_TYPES, quantity__lt=0).aggregate(v=_qty("quantity"))["v"] or ZERO)
+    returned_m = sale_moves.filter(type__in=RETURN_TYPES).aggregate(v=_qty("quantity"))["v"] or ZERO
+    net_sold = D(sold_m) - D(returned_m)
 
     return {
         "date": day,
@@ -602,13 +635,24 @@ def business_dashboard(client_id, *, day=None, include_batch_profit=False):
         "stockValue": stock_value,
         "workingCapital": _working_capital(client_id, funds, stock_value),
         "inventoryPosition": {
-            "grey": stages.get("Grey", {"qty": ZERO, "value": ZERO}),
+            "grey": stages.get("Grey", {"qty": ZERO, "value": ZERO, "totalQty": ZERO, "totalValue": ZERO}),
             "finished": finished,
-            "unclassified": stages.get("Unclassified", {"qty": ZERO, "value": ZERO}),
+            "unclassified": stages.get("Unclassified", {"qty": ZERO, "value": ZERO, "totalQty": ZERO, "totalValue": ZERO}),
             "externalWip": {"qty": wip["qty"], "value": wip["value"]},
             "qcHold": lot_states["qcHold"],
             "reprocess": lot_states["reprocess"],
             "rejected": lot_states["rejected"],
+            "reconciliation": {
+                "totalPhysicalMeters": round4(total_physical),
+                "availableMeters": round4(total_available),
+                "reservedMeters": round4(ZERO),
+                "qcHoldMeters": round4(lot_states["qcHold"]["qty"]),
+                "reworkMeters": round4(lot_states["reprocess"]["qty"]),
+                "rejectedMeters": round4(lot_states["rejected"]["qty"]),
+                "externalWipMeters": round4(wip["qty"]),
+                "soldMeters": round4(net_sold),
+                "totalStockValue": round2(stock_value),
+            },
         },
         "production": production,
         "jobWorkInProcess": wip["byProcess"],

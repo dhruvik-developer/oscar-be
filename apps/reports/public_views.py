@@ -877,3 +877,82 @@ class PublicUploadUrlView(PublicWriteView):
             },
             status=status.HTTP_201_CREATED,
         )
+
+
+# ---------------------------------------------------------------------------
+# Public Batch Passport (QR code scanning without login)
+# ---------------------------------------------------------------------------
+class PublicBatchPassportView(PublicView):
+    """
+    GET /api/v1/public/batches/<token>/
+    Public, unauthenticated endpoint for QR code scanning.
+    Allows anyone scanning a batch QR code to view the Batch Passport
+    directly in their mobile phone browser without logging in or requiring an ERP account.
+    Returns read-only batch traceability, quantities, rolls, QC, job work, yarn,
+    landed cost breakdown, and timeline.
+    """
+
+    def get(self, request, token):
+        from django.db.models import Q
+        from apps.inventory.models import Batch, LotTaka
+        from apps.inventory.batch_services import serialize_batch
+
+        token = (token or "").strip()
+        if not token:
+            return Response(
+                {"message": "Batch token or code required.", "code": "VALIDATION_ERROR"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # 1. Primary lookup by batch_code (case-insensitive)
+        batch = Batch.objects.filter(
+            batch_code__iexact=token, deleted_at__isnull=True
+        ).first()
+
+        # 2. Lookup by primary key (UUID)
+        if batch is None:
+            try:
+                batch = Batch.objects.filter(id=token, deleted_at__isnull=True).first()
+            except Exception:
+                pass
+
+        # 3. Lookup by roll taka ID, barcode, or lot number
+        if batch is None:
+            taka = (
+                LotTaka.objects.filter(deleted_at__isnull=True, batch__isnull=False)
+                .filter(
+                    Q(taka_id__iexact=token)
+                    | Q(barcode__iexact=token)
+                    | Q(lot_number__iexact=token)
+                )
+                .select_related("batch")
+                .first()
+            )
+            if taka:
+                batch = taka.batch
+
+        if batch is None:
+            return Response(
+                {"message": f"No batch found for '{token}'.", "code": "NOT_FOUND"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # Set tenant context for relational integrity
+        set_current_client_id(batch.client_id)
+
+        # Serialize complete batch details with landed cost breakdown
+        body = serialize_batch(batch, detail=True, include_cost=True)
+
+        # Public security allowlist & sanitization:
+        body["permissions"] = {}
+        body["canSeeCost"] = True
+        body["isPublic"] = True
+
+        # Sanitize customer contact details from public view if sales exist
+        if "sales" in body and isinstance(body["sales"], list):
+            for s in body["sales"]:
+                s.pop("customerPhone", None)
+                s.pop("customerEmail", None)
+                s.pop("bankDetails", None)
+
+        return Response(body, status=status.HTTP_200_OK)

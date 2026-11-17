@@ -203,6 +203,9 @@ class BankTransferSerializer(BaseModelSerializer):
             raise serializers.ValidationError(
                 {"toAccountId": ["Must differ from the source account."]}
             )
+        amount = attrs.get("amount")
+        if amount is not None and amount <= 0:
+            raise serializers.ValidationError({"amount": ["Transfer amount must be greater than zero."]})
         return attrs
 
 

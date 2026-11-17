@@ -145,6 +145,29 @@ class PartySerializer(BaseModelSerializer):
             raise serializers.ValidationError("A party with this code already exists.")
         return value
 
+    def validate_gstin(self, value):
+        from apps.core.statutory import validate_gstin
+        return validate_gstin(value)
+
+    def validate_phone(self, value):
+        from apps.core.statutory import validate_phone
+        return validate_phone(value)
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        credit_days = attrs.get("credit_days")
+        if credit_days is not None and credit_days < 0:
+            raise serializers.ValidationError({"creditDays": ["Credit days cannot be negative."]})
+
+        credit_limit = attrs.get("credit_limit")
+        if credit_limit is not None and credit_limit < 0:
+            raise serializers.ValidationError({"credit_limit": ["Credit limit cannot be negative."]})
+
+        default_disc = attrs.get("default_discount_pct")
+        if default_disc is not None and (default_disc < 0 or default_disc > 100):
+            raise serializers.ValidationError({"defaultDiscountPct": ["Default discount must be between 0% and 100%."]})
+        return attrs
+
     def create(self, validated_data):
         party = super().create(validated_data)
         from apps.accounting.services import recalculate_party_balance
@@ -1255,6 +1278,15 @@ class ItemSerializer(BaseModelSerializer):
             raise serializers.ValidationError(
                 {"theoreticalWeight": ["Required for a weight-tracked item."]}
             )
+        selling_price = attrs.get("standard_selling_price")
+        if selling_price is not None and selling_price < 0:
+            raise serializers.ValidationError({"standardSellingPrice": ["Selling price cannot be negative."]})
+        purchase_price = attrs.get("purchase_price")
+        if purchase_price is not None and purchase_price < 0:
+            raise serializers.ValidationError({"purchasePrice": ["Purchase price cannot be negative."]})
+        reorder_level = attrs.get("reorder_level")
+        if reorder_level is not None and reorder_level < 0:
+            raise serializers.ValidationError({"reorderLevel": ["Reorder level cannot be negative."]})
         return attrs
 
 
@@ -1339,6 +1371,14 @@ class AgencySerializer(BaseModelSerializer):
             raise serializers.ValidationError("An agency with this code already exists.")
         return value
 
+    def validate_gstin(self, value):
+        from apps.core.statutory import validate_gstin
+        return validate_gstin(value)
+
+    def validate_phone(self, value):
+        from apps.core.statutory import validate_phone
+        return validate_phone(value)
+
 
 class BrokerSerializer(BaseModelSerializer):
     class Meta:
@@ -1363,6 +1403,18 @@ class BrokerSerializer(BaseModelSerializer):
         if existing.exists():
             raise serializers.ValidationError("A broker with this code already exists.")
         return value
+
+    def validate_gstin(self, value):
+        from apps.core.statutory import validate_gstin
+        return validate_gstin(value)
+
+    def validate_pan(self, value):
+        from apps.core.statutory import validate_pan
+        return validate_pan(value)
+
+    def validate_phone(self, value):
+        from apps.core.statutory import validate_phone
+        return validate_phone(value)
 
 
 class ProcessMasterSerializer(BaseModelSerializer):
@@ -1494,6 +1546,18 @@ class TransporterSerializer(BaseModelSerializer):
         ]
         read_only_fields = ["created_at", "updated_at"]
         extra_kwargs = {"code": {"required": False, "allow_blank": True}}
+
+    def validate_gstin(self, value):
+        from apps.core.statutory import validate_gstin
+        return validate_gstin(value)
+
+    def validate_pan(self, value):
+        from apps.core.statutory import validate_pan
+        return validate_pan(value)
+
+    def validate_phone(self, value):
+        from apps.core.statutory import validate_phone
+        return validate_phone(value)
 
 
 

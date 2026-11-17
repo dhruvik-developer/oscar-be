@@ -31,6 +31,7 @@ SYSTEM_ACCOUNTS = [
     ("cash", "1310", "Cash in Hand", "Asset", "Bank"),
     ("gst_input", "1400", "GST Input Credit", "Asset", "Tax"),
     ("creditors", "2100", "Sundry Creditors", "Liability", "Payable"),
+    ("customer_advance", "2110", "Customer Advances", "Liability", "Payable"),
     ("gst_output", "2200", "GST Payable", "Liability", "Tax"),
     ("salary_payable", "2300", "Salaries Payable", "Liability", "Payable"),
     ("capital", "3000", "Owner Equity", "Equity", None),
@@ -518,21 +519,44 @@ def post_sales_invoice(invoice, *, user=None):
 
 
 def post_payment_in(payment, *, user=None):
-    """Dr Bank/Cash | Cr Debtors."""
+    """Dr Bank/Cash | Cr Debtors (allocated) | Cr Customer Advance (unallocated)."""
     client_id = payment.client_id
     account = (
         payment.bank_account.account
         if payment.bank_account_id
         else system_account(client_id, "cash")
     )
+    allocated = round2(payment.allocated_amount or Decimal("0.00"))
+    unallocated = round2(payment.unallocated_amount or Decimal("0.00"))
+    postings = [
+        debit(account, payment.amount, description=f"Payment {payment.payment_number}"),
+    ]
+    if allocated > ZERO:
+        postings.append(credit(system_account(client_id, "debtors"), allocated, party=payment.party))
+    if unallocated > ZERO:
+        postings.append(credit(system_account(client_id, "customer_advance"), unallocated, party=payment.party))
     return post_entry(
         client=payment.client,
-        postings=[
-            debit(account, payment.amount, description=f"Payment {payment.payment_number}"),
-            credit(system_account(client_id, "debtors"), payment.amount, party=payment.party),
-        ],
+        postings=postings,
         entry_date=payment.payment_date,
         narration=f"Payment received {payment.payment_number}",
+        source_document_type="PaymentIn",
+        source_document_id=payment.id,
+        user=user,
+    )
+
+
+def post_customer_advance_applied(client, party, amount, payment, invoice, *, user=None):
+    """Dr Customer Advance | Cr Debtors."""
+    client_id = getattr(client, "id", client)
+    return post_entry(
+        client=client,
+        postings=[
+            debit(system_account(client_id, "customer_advance"), amount, party=party),
+            credit(system_account(client_id, "debtors"), amount, party=party),
+        ],
+        entry_date=timezone.now().date(),
+        narration=f"Customer advance from {payment.payment_number} applied to {invoice.invoice_number}",
         source_document_type="PaymentIn",
         source_document_id=payment.id,
         user=user,
