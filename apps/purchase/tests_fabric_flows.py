@@ -59,7 +59,10 @@ class FabricFlowTestBase(TestCase):
             "yarnLines": [{"itemId": str(self.yarn.id), "requiredQty": 120, "uom": "Kg", "rate": 300}],
         }
         if flow == "FACTORY_TO_MILL":
-            body.update({"dyeingColourName": "Navy Blue", "dyeingColourHex": "#1F3A5F"})
+            body.update({
+                "dyeingColourName": "Navy Blue", "dyeingColourHex": "#1F3A5F", "dyeingMillId": str(self.mill.id),
+                "dyeingRate": 15,
+            })
         body.update(extra or {})
         res = self.api.post("/api/v1/purchase/orders/", body, format="json")
         self.assertEqual(res.status_code, 201, res.content)

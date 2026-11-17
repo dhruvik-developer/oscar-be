@@ -948,10 +948,59 @@ class PerformanceIndicatorSerializer(BaseModelSerializer):
     departmentId = TenantPrimaryKeyRelatedField(
         source="department", model="hrms.Department", required=False, allow_null=True
     )
+    locationId = TenantPrimaryKeyRelatedField(
+        source="location", model="hrms.Location", required=False, allow_null=True
+    )
+    target = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    measurementType = serializers.CharField(source="measurement_type", required=False, allow_null=True, allow_blank=True)
+    assignedEmployee = serializers.CharField(source="assigned_employee", required=False, allow_null=True, allow_blank=True)
+    designation = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    description = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    status = serializers.CharField(required=False, allow_null=True, allow_blank=True)
 
     class Meta:
         model = PerformanceIndicator
-        fields = ["id", "name", "category", "weight", "departmentId", "created_at"]
+        fields = [
+            "id", "name", "category", "weight", "departmentId", "locationId",
+            "target", "measurementType", "assignedEmployee", "designation",
+            "description", "status", "created_at"
+        ]
+
+    def to_internal_value(self, data):
+        data = data.copy() if isinstance(data, dict) else data
+        client_id = self.context.get("client_id") or getattr(self.context.get("request"), "client_id", None)
+        
+        raw_dept = data.pop("department", None)
+        if raw_dept and not data.get("departmentId"):
+            dept_name = str(raw_dept).strip()
+            if dept_name and client_id:
+                from apps.hrms.models import Department
+                try:
+                    dept, _ = Department.objects.get_or_create(client_id=client_id, name=dept_name)
+                    data["departmentId"] = dept.id
+                except Exception:
+                    pass
+
+        raw_loc = data.pop("location", None) or data.pop("branch", None)
+        if raw_loc and not data.get("locationId"):
+            loc_name = str(raw_loc).strip()
+            if loc_name and client_id:
+                from apps.hrms.models import Location
+                try:
+                    loc, _ = Location.objects.get_or_create(client_id=client_id, name=loc_name)
+                    data["locationId"] = loc.id
+                except Exception:
+                    pass
+
+        return super().to_internal_value(data)
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret["department"] = instance.department.name if instance.department else ""
+        ret["location"] = instance.location.name if instance.location else ""
+        ret["branch"] = ret["location"]
+        ret["weight"] = float(instance.weight) if instance.weight is not None else 0.0
+        return ret
 
 
 class KpiSerializer(BaseModelSerializer):
@@ -964,11 +1013,9 @@ class KpiSerializer(BaseModelSerializer):
     # Extra fields used by frontend KPI Data feature
     targetDisplay = serializers.CharField(source="target", required=False, allow_null=True)
     department = serializers.CharField(source="applies_to", required=False, allow_null=True)
-    designation = serializers.CharField(required=False, allow_null=True, write_only=True)
-    assignedEmployee = serializers.CharField(required=False, allow_null=True, write_only=True)
+    designation = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    assignedEmployee = serializers.CharField(source="assigned_employee", required=False, allow_null=True, allow_blank=True)
     measurementType = serializers.CharField(source="unit", required=False, allow_null=True)
-    weight = serializers.DecimalField(max_digits=6, decimal_places=2, required=False, allow_null=True, write_only=True)
-    status = serializers.CharField(required=False, allow_null=True, write_only=True)
 
     class Meta:
         model = Kpi
@@ -989,22 +1036,28 @@ class KpiSerializer(BaseModelSerializer):
                 match = re.search(r"[-+]?\d*\.?\d+", cleaned_str)
                 if match:
                     data["target"] = match.group()
-                    if not data.get("unit") and "%" in cleaned_str:
+                    # Check for unit in both camelCase (measurementType) and snake_case (unit)
+                    if not data.get("unit") and not data.get("measurementType") and "%" in cleaned_str:
                         data["unit"] = "%"
                 elif cleaned_str == "":
                     data["target"] = None
                 else:
-                    data["target"] = None
+                    raise serializers.ValidationError(
+                        {"target": "Target must include a number, e.g. '\u2265 90%'."}
+                    )
         return super().to_internal_value(data)
 
     def to_representation(self, instance):
         ret = super().to_representation(instance)
         # Pass fields expected by frontend
         ret["target"] = str(instance.target) if instance.target is not None else ""
-        if instance.unit and "%" in instance.unit and ret["target"] and not ret["target"].endswith("%"):
+        unit = (instance.unit or "").strip().lower()
+        if unit in ("%", "percentage") and ret["target"] and not ret["target"].endswith("%"):
             ret["target"] = f"{ret['target']}%"
         ret["department"] = instance.applies_to or ""
         ret["measurementType"] = instance.unit or "Percentage"
+        ret["designation"] = instance.designation or ""
+        ret["assignedEmployee"] = instance.assigned_employee or ""
         return ret
 
     def validate(self, attrs):
@@ -1014,13 +1067,27 @@ class KpiSerializer(BaseModelSerializer):
             try:
                 attrs["target"] = Decimal(str(attrs["target"]))
             except Exception:
-                attrs["target"] = None
+                raise serializers.ValidationError(
+                    {"target": "Target must include a number, e.g. '\u2265 90%'."}
+                )
+
+        weight = attrs.get("weight")
+        if weight is not None and not (Decimal("0") <= Decimal(str(weight)) <= Decimal("100")):
+            raise serializers.ValidationError(
+                {"weight": "Weightage must be between 0 and 100."}
+            )
 
         # Map department or designation into applies_to if applies_to not explicitly provided
         if not attrs.get("applies_to"):
             dept = self.initial_data.get("department") or self.initial_data.get("designation")
             if dept:
                 attrs["applies_to"] = str(dept)
+
+        # Map measurementType to unit
+        if not attrs.get("unit"):
+            mt = self.initial_data.get("measurementType")
+            if mt:
+                attrs["unit"] = str(mt)
 
         return attrs
 
@@ -1061,6 +1128,8 @@ class AppraisalSerializer(BaseModelSerializer):
     managerRating = serializers.DecimalField(source="manager_rating", max_digits=3, decimal_places=2, required=False, allow_null=True)
     finalRating = serializers.DecimalField(source="final_rating", max_digits=3, decimal_places=2, required=False, allow_null=True)
     rating = serializers.SerializerMethodField()
+    stage = serializers.CharField(required=False)
+    status = serializers.CharField(required=False)
 
     def get_rating(self, obj):
         val = obj.final_rating or obj.manager_rating or obj.self_rating or 0.0
@@ -1078,6 +1147,8 @@ class AppraisalSerializer(BaseModelSerializer):
                 except Exception:
                     data.pop("id", None)
 
+            client_id = self.context.get("client_id") or getattr(self.context.get("request"), "client_id", None)
+
             # Cycle ID resolution
             raw_cycle = data.get("cycleId") or data.get("cycle")
             is_valid_cycle_uuid = False
@@ -1089,9 +1160,8 @@ class AppraisalSerializer(BaseModelSerializer):
                 except Exception:
                     is_valid_cycle_uuid = False
 
-            client_id = self.context.get("client_id")
             if not is_valid_cycle_uuid and client_id:
-                active_cycle = AppraisalCycle.objects.filter(client_id=client_id).order_by("-period_start").first()
+                active_cycle = AppraisalCycle.objects.filter(client_id=client_id, deleted_at__isnull=True).order_by("-period_start").first()
                 if not active_cycle:
                     import datetime
                     year = datetime.date.today().year
@@ -1116,12 +1186,33 @@ class AppraisalSerializer(BaseModelSerializer):
                     is_valid_emp_uuid = False
 
             if not is_valid_emp_uuid and client_id:
-                emp_name = str(data.get("employee") or raw_emp)
-                matched_emp = Employee.objects.filter(client_id=client_id, name__iexact=emp_name).first()
+                from apps.hrms.models import Employee
+                emp_name = str(data.get("employee") or raw_emp).strip()
+                matched_emp = Employee.objects.filter(client_id=client_id, name__iexact=emp_name, deleted_at__isnull=True).first()
                 if not matched_emp:
-                    matched_emp = Employee.objects.filter(client_id=client_id).first()
+                    matched_emp = Employee.objects.filter(client_id=client_id, deleted_at__isnull=True).first()
                 if matched_emp:
                     data["employeeId"] = str(matched_emp.id)
+
+            # Manager/Reviewer resolution
+            raw_mgr = data.get("managerId") or data.get("reviewer") or data.get("manager")
+            is_valid_mgr_uuid = False
+            if raw_mgr:
+                try:
+                    import uuid
+                    uuid.UUID(str(raw_mgr))
+                    is_valid_mgr_uuid = True
+                except Exception:
+                    is_valid_mgr_uuid = False
+
+            if not is_valid_mgr_uuid and client_id and raw_mgr:
+                from apps.hrms.models import Employee
+                mgr_name = str(raw_mgr).strip()
+                mgr = Employee.objects.filter(client_id=client_id, name__iexact=mgr_name, deleted_at__isnull=True).first()
+                if mgr:
+                    data["managerId"] = str(mgr.id)
+                else:
+                    data.pop("managerId", None)
 
             if "rating" in data and not data.get("final_rating"):
                 try:
@@ -1130,6 +1221,59 @@ class AppraisalSerializer(BaseModelSerializer):
                     pass
 
         return super().to_internal_value(data)
+
+    def create(self, validated_data):
+        client_id = self.context.get("client_id") or getattr(self.context.get("request"), "client_id", None)
+        cycle = validated_data.get("cycle")
+        employee = validated_data.get("employee")
+        if cycle and employee and client_id:
+            existing = Appraisal.objects.filter(client_id=client_id, cycle=cycle, employee=employee).first()
+            if existing:
+                existing.deleted_at = None
+                for k, v in validated_data.items():
+                    setattr(existing, k, v)
+                existing.save()
+                return existing
+        return super().create(validated_data)
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        cycle = instance.cycle
+        ret["cycle"] = cycle.name if cycle else "Annual Review"
+        ret["cycleName"] = ret["cycle"]
+
+        manager = instance.manager
+        ret["reviewer"] = manager.name if manager else ""
+        ret["managerName"] = ret["reviewer"]
+
+        emp = instance.employee
+        if emp:
+            ret["employee"] = emp.name
+            ret["employeeName"] = emp.name
+            ret["department"] = emp.department.name if emp.department else ""
+            desig = getattr(emp, "designation", None)
+            ret["designation"] = getattr(desig, "name", str(desig)) if desig else ""
+
+        if cycle and cycle.period_end:
+            ret["due"] = cycle.period_end.strftime("%d %b %Y")
+        else:
+            ret["due"] = "15 Nov 2024"
+
+        rating_val = float(instance.final_rating or instance.manager_rating or instance.self_rating or 4.0)
+        ret["rating"] = rating_val
+        ret["weightedScore"] = round((rating_val / 5.0) * 100)
+        if rating_val >= 4.5:
+            ret["ratingScaleLabel"] = "Outstanding"
+        elif rating_val >= 3.8:
+            ret["ratingScaleLabel"] = "Exceeds Expectations"
+        elif rating_val >= 3.0:
+            ret["ratingScaleLabel"] = "Meets Expectations"
+        elif rating_val >= 2.0:
+            ret["ratingScaleLabel"] = "Needs Improvement"
+        else:
+            ret["ratingScaleLabel"] = "Unsatisfactory"
+
+        return ret
 
     class Meta:
         model = Appraisal
@@ -1141,7 +1285,7 @@ class AppraisalSerializer(BaseModelSerializer):
             "hr_comments", "self_comments", "kpiScores", "history",
             "created_at", "updated_at",
         ]
-        read_only_fields = ["stage", "status", "created_at", "updated_at"]
+        read_only_fields = ["created_at", "updated_at"]
 
 
 class GoalSerializer(BaseModelSerializer):

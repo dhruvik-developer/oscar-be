@@ -712,6 +712,7 @@ class SalesOrderViewSet(SalesDocumentViewSet):
         self._gate_discount(order, previous_stage=None)
         return order
 
+    @transaction.atomic
     def perform_update(self, serializer):
         """Confirming an order reserves stock (api.md §5.4).
 
@@ -1382,16 +1383,65 @@ class DeliveryChallanViewSet(SalesDocumentViewSet):
         challan = DeliveryChallan.objects.select_for_update().get(pk=self.get_object().pk)
         if challan.status == "Delivered":
             return Response(self.get_serializer(challan).data)
-        if challan.status not in {"Dispatched", "In Transit"} or challan.posted_at is None:
+        if challan.status == "Cancelled":
+            raise Conflict("This challan has been cancelled.", code=Codes.ALREADY_CANCELLED)
+        # A challan must post stock before it can be delivered. If the client
+        # reached POD without an explicit dispatch step (or dispatch failed
+        # earlier), dispatch it now so the stock/serial/order effects are real.
+        if challan.posted_at is None:
+            challan = services.dispatch_challan(challan, user=request.user)
+            challan = DeliveryChallan.objects.select_for_update().get(pk=challan.pk)
+        if challan.status not in CHALLAN_BILLABLE_STATUSES:
             raise Conflict(
                 "Only a dispatched challan can be confirmed as delivered.",
                 code=Codes.DRAFT_ONLY,
+                detail=f"This challan is {challan.status}.",
             )
 
         challan.status = "Delivered"
         challan.delivered_at = timezone.now()
         challan.save(update_fields=["status", "delivered_at", "updated_at"])
         self.write_audit("confirm-pod", challan, description="Proof of delivery confirmed")
+        return Response(self.get_serializer(challan).data)
+
+    @action(detail=True, methods=["post"], url_path="update-status")
+    @transaction.atomic
+    def update_status(self, request, pk=None):
+        """Advance a dispatched challan through transit states. Stock is posted
+        by dispatch/confirm-pod, never by this action."""
+        challan = DeliveryChallan.objects.select_for_update().get(pk=self.get_object().pk)
+        target = (request.data or {}).get("status")
+        if not target:
+            raise ValidationFailed("Status is required.", field_errors={"status": ["This field is required."]})
+        if challan.status == "Cancelled":
+            raise Conflict("This challan has been cancelled.", code=Codes.ALREADY_CANCELLED)
+        if target == "Delivered":
+            return self.confirm_pod(request, pk=pk)
+        allowed = {
+            "Dispatched": {"In Transit", "Out for Delivery", "Delivered"},
+            "In Transit": {"Out for Delivery", "Delivered"},
+            "Out for Delivery": {"Delivered"},
+        }
+        if challan.status == "Draft":
+            raise Conflict(
+                "Dispatch the challan before updating its delivery status.",
+                code=Codes.DRAFT_ONLY,
+            )
+        if challan.posted_at is None:
+            raise Conflict(
+                "This challan has not been dispatched yet.",
+                code=Codes.NOT_FINALIZED,
+            )
+        if challan.status == target:
+            return Response(self.get_serializer(challan).data)
+        if target not in allowed.get(challan.status, set()):
+            raise Conflict(
+                f"Cannot move a {challan.status} challan to {target}.",
+                code=Codes.ALREADY_DONE,
+            )
+        challan.status = target
+        challan.save(update_fields=["status", "updated_at"])
+        self.write_audit("status", challan, description=f"Status updated to {target}")
         return Response(self.get_serializer(challan).data)
 
     @action(detail=True, methods=["post"])
@@ -2226,6 +2276,7 @@ class PaymentInViewSet(TenantModelViewSet):
     def perform_create(self, serializer):
         data = serializer.validated_data
         allocations = self.request.data.get("allocations") or []
+        discount_allocations = self.request.data.get("discountAllocations") or []
         invoice_id = self.request.data.get("invoiceId")
         invoice = None
         if invoice_id:
@@ -2244,9 +2295,11 @@ class PaymentInViewSet(TenantModelViewSet):
             bank_account=data.get("bank_account"),
             reference_number=data.get("reference_number"),
             notes=data.get("notes"),
+            transaction_reference=self.request.data.get("transactionReference"),
             allocations=allocations,
             invoice=invoice,
             user=self.request.user,
+            discount_allocations=discount_allocations,
         )
         serializer.instance = payment
         self._created_instance = payment

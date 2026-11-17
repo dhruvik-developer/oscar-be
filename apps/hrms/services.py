@@ -2263,7 +2263,11 @@ def get_today_punch_status(client, employee, work_date=None):
     if work_date is None:
         work_date = timezone.localdate()
         # Automatically close any sessions where employee forgot to punch out at day end
-        auto_punch_out_pending_sessions(client=client_id, employee=employee, as_of_date=work_date)
+        try:
+            auto_punch_out_pending_sessions(client=client_id, employee=employee, as_of_date=work_date)
+        except Exception:
+            logger = __import__('logging').getLogger(__name__)
+            logger.exception("Auto punch-out sweep failed while reading punch status")
         # Check if an overnight shift started yesterday is still active
         yesterday = work_date - timedelta(days=1)
         yesterday_in = AttendancePunch.objects.filter(
@@ -2498,7 +2502,10 @@ def record_punch(
     # 1. Action: IN (Punch In)
     if punch_type == "IN":
         # Automatically close any prior days where employee forgot to punch out
-        auto_punch_out_pending_sessions(client=client_id, employee=employee, as_of_date=work_date)
+        try:
+            auto_punch_out_pending_sessions(client=client_id, employee=employee, as_of_date=work_date)
+        except Exception:
+            __import__('logging').getLogger(__name__).exception("Auto punch-out sweep failed before punch-in")
         if is_currently_in:
             time_diff = abs((punch_time - last_punch.punch_time).total_seconds())
             if time_diff < 5:
@@ -3114,14 +3121,19 @@ def auto_punch_out_pending_sessions(
                 should_close = True
 
         if should_close:
-            out_p = auto_punch_out_employee(
-                client=cid,
-                employee=emp,
-                work_date=w_date,
-                user=user,
-            )
-            if out_p:
-                closed_punches.append(out_p)
+            try:
+                out_p = auto_punch_out_employee(
+                    client=cid,
+                    employee=emp,
+                    work_date=w_date,
+                    user=user,
+                )
+                if out_p:
+                    closed_punches.append(out_p)
+            except Exception:
+                __import__('logging').getLogger(__name__).exception(
+                    "Auto punch-out failed for employee=%s date=%s", emp_id, w_date
+                )
 
     return closed_punches
 
