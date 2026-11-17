@@ -7254,45 +7254,47 @@ class TripViewSet(TenantModelViewSet):
         trip = logistics_services.allocate_trip_freight(trip, user=request.user)
         return Response(self.get_serializer(trip).data)
 
-    @action(detail=True, methods=["post"], url_path="sign")
-    @transaction.atomic
-    def sign(self, request, pk=None):
-        """Record (or clear, with ``signature: null``) an LR e-signature."""
-        trip = self.get_object()
-        sig_type = request.data.get("signatoryType")
-        if sig_type not in TRIP_SIGNATORIES:
-            raise ValidationFailed(
-                "Invalid signatory.",
-                field_errors={"signatoryType": [f"Must be one of: {', '.join(TRIP_SIGNATORIES)}."]},
-            )
-        signature = request.data.get("signature")
-        if signature is not None and not isinstance(signature, dict):
-            raise ValidationFailed("Signature must be an object.", field_errors={"signature": ["Expected an object."]})
-        sigs = dict(trip.signatures or {})
-        if signature is None:
-            sigs.pop(sig_type, None)
-        else:
-            sigs[sig_type] = {**signature, "recordedBy": getattr(request.user, "email", None)}
-        trip.signatures = sigs
-        trip.save(update_fields=["signatures", "updated_at"])
-        self.write_audit(
-            "sign", trip,
-            description=f"LR {sig_type} signature {'recorded' if signature is not None else 'removed'}",
-        )
-        return Response(self.get_serializer(trip).data)
+class BatchProfitabilityView(APIView):
+    """
+    GET /inventory/batches/profitability/?search=&fabricType=&status=&sortBy=&from=&to=
+    Returns batch-wise profitability records and aggregate financial summary.
+    """
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_inventory"]
 
-    @action(detail=True, methods=["post"], url_path="confirm-delivery")
-    def confirm_delivery(self, request, pk=None):
-        trip = self.get_object()
-        data = request.data
-        delivery_time = data.get("deliveryTime") or data.get("delivery_time")
-        proof_file_id = data.get("proofFileId") or data.get("proof_file_id") or data.get("proof_file")
-        remarks = data.get("remarks")
-        trip = logistics_services.confirm_trip_delivery(
-            trip,
-            delivery_time=delivery_time,
-            proof_file_id=proof_file_id,
-            remarks=remarks,
-            user=request.user,
+    def get(self, request):
+        from .batch_profitability import get_batch_profitability_list
+        search = request.query_params.get("search") or request.query_params.get("q")
+        fabric_type = request.query_params.get("fabricType") or request.query_params.get("stage")
+        status_filter = request.query_params.get("status")
+        sort_by = request.query_params.get("sortBy") or request.query_params.get("sort")
+        date_from = request.query_params.get("from") or request.query_params.get("startDate")
+        date_to = request.query_params.get("to") or request.query_params.get("endDate")
+
+        data = get_batch_profitability_list(
+            request.client_id,
+            search=search,
+            fabric_type=fabric_type,
+            status=status_filter,
+            sort_by=sort_by,
+            date_from=date_from,
+            date_to=date_to,
         )
-        return Response(self.get_serializer(trip).data)
+        return Response(data)
+
+
+class BatchProfitabilityDetailView(APIView):
+    """
+    GET /inventory/batches/<str:code>/profitability/
+    Returns full audit breakdown for a single batch modal/slideout.
+    """
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_inventory"]
+
+    def get(self, request, code):
+        from .batch_profitability import get_batch_profitability_detail
+        data = get_batch_profitability_detail(request.client_id, code)
+        if not data:
+            return Response({"message": f"No batch found for '{code}'.", "code": "NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
+        return Response(data)
+

@@ -228,6 +228,10 @@ class EmployeeSerializer(BaseModelSerializer):
             attrs["joining_date"] = alias
         if attrs.get("joining_date") is None and self.instance is None:
             attrs["joining_date"] = dj_timezone.localdate()
+        dob = attrs.get("date_of_birth") or getattr(self.instance, "date_of_birth", None)
+        joining = attrs.get("joining_date")
+        if dob and joining and joining <= dob:
+            raise serializers.ValidationError({"joiningDate": ["Joining date must be after date of birth."]})
         return attrs
 
 
@@ -348,6 +352,19 @@ class AttendanceSerializer(BaseModelSerializer):
                     if emp:
                         data["employeeId"] = str(emp.id)
         return super().to_internal_value(data)
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        from django.utils import timezone as dj_timezone
+        work_date = attrs.get("work_date") or getattr(self.instance, "work_date", None)
+        today = dj_timezone.localdate()
+        if work_date and work_date > today:
+            raise serializers.ValidationError({"date": ["Attendance cannot be marked for future dates."]})
+        check_in = attrs.get("check_in") or getattr(self.instance, "check_in", None)
+        check_out = attrs.get("check_out") or getattr(self.instance, "check_out", None)
+        if check_in and check_out and check_out < check_in:
+            raise serializers.ValidationError({"checkOut": ["Check-out time must be after check-in time."]})
+        return attrs
 
 
 class BulkAttendanceSerializer(BaseSerializer):

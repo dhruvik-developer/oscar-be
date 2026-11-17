@@ -120,6 +120,12 @@ class StockTransferLineSerializer(BaseModelSerializer):
         model = StockTransferLine
         fields = ["id", "itemId", "sku", "name", "qty", "received_qty", "takas"]
 
+    def validate_qty(self, value):
+        from decimal import Decimal
+        if value is not None and Decimal(str(value)) <= Decimal("0"):
+            raise serializers.ValidationError("Transfer quantity must be greater than zero.")
+        return value
+
 
 class StockTransferSerializer(BaseModelSerializer):
     """db.md §7.4 standardises on ``items[]`` and keeps the denormalised names
@@ -186,6 +192,9 @@ class StockTransferSerializer(BaseModelSerializer):
             raise serializers.ValidationError(
                 {"destLocationId": ["Must differ from the source location."]}
             )
+        items = attrs.get("items")
+        if self.instance is None and items is not None and len(items) == 0:
+            raise serializers.ValidationError({"items": ["Add at least one item to transfer."]})
         return attrs
 
 

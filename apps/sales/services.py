@@ -1384,9 +1384,12 @@ def record_payment_in(
 
     requested = list(allocations or [])
     if not requested and invoice is not None:
-        requested = [{"invoiceId": invoice.id, "amount": amount}]
+        bal = invoice_outstanding(invoice)["outstanding"]
+        alloc_amt = min(amount, bal)
+        if alloc_amt > ZERO:
+            requested = [{"invoiceId": invoice.id, "amount": alloc_amt}]
 
-    allocate_payment_in(payment, requested, user=user)
+    payment = allocate_payment_in(payment, requested, user=user)
 
     entry = ledger.post_payment_in(payment, user=user)
     if entry is not None:
@@ -1489,6 +1492,16 @@ def allocate_payment_in(payment, allocations, *, user=None):
             amount=requested,
             allocated_by=user if getattr(user, "is_authenticated", False) else None,
         )
+        if payment.journal_entry_id:
+            from apps.accounting.services import post_customer_advance_applied
+            post_customer_advance_applied(
+                client=payment.client,
+                party=payment.party,
+                amount=requested,
+                payment=payment,
+                invoice=invoice,
+                user=user,
+            )
         allocated += requested
         refresh_invoice_payment_status(invoice)
         paid_invoices.append(invoice)
@@ -1509,6 +1522,8 @@ def allocate_payment_in(payment, allocations, *, user=None):
         )
     payment.allocated_amount = total_allocated
     payment.save(update_fields=["allocated_amount", "updated_at"])
+    if payment.journal_entry_id:
+        ledger.recalculate_party_balance(payment.client_id, payment.party_id)
 
     # Money received releases held incentive / grows collection-based
     # incentive on those invoices (PDF §12).
@@ -1857,3 +1872,92 @@ def party_from_manual_quotation(quotation, *, user=None):
         created_by=user if getattr(user, "is_authenticated", False) else None,
 
     )
+
+
+def customer_advance_balance(client_id, party_id):
+    """GET /sales/customers/{id}/advance-balance/ -- unapplied customer advances."""
+    rows = PaymentIn.objects.filter(
+        client_id=client_id, party_id=party_id, status="Active", deleted_at__isnull=True
+    ).aggregate(
+        paid=Coalesce(Sum("amount"), Value(Decimal("0.00")),
+                      output_field=DecimalField(max_digits=18, decimal_places=2)),
+        allocated=Coalesce(Sum("allocated_amount"), Value(Decimal("0.00")),
+                           output_field=DecimalField(max_digits=18, decimal_places=2)),
+    )
+    advance = round2(rows["paid"] - rows["allocated"])
+    return {
+        "partyId": str(party_id),
+        "totalReceived": rows["paid"],
+        "allocated": rows["allocated"],
+        "advanceBalance": advance if advance > ZERO else ZERO,
+    }
+
+
+@transaction.atomic
+def apply_customer_advance(invoice, amount, *, user=None):
+    """Apply unallocated customer advance money across open receipts against this invoice."""
+    invoice = SalesInvoice.objects.select_for_update().get(pk=invoice.pk)
+    amount = round2(amount)
+    if amount <= ZERO:
+        raise ValidationFailed("Enter an amount to apply.", field_errors={"amount": ["Must be greater than zero."]})
+
+    outstanding = invoice_outstanding(invoice)["outstanding"]
+    if amount > outstanding + ROUNDING_TOLERANCE:
+        raise BusinessRuleViolation(
+            f"Only {outstanding} is outstanding on this invoice.",
+            code=Codes.PAYMENT_EXCEEDS_BALANCE,
+        )
+
+    advance_info = customer_advance_balance(invoice.client_id, invoice.party_id)
+    if amount > D(advance_info["advanceBalance"]) + ROUNDING_TOLERANCE:
+        raise BusinessRuleViolation(
+            f"Only {advance_info['advanceBalance']} is available as an advance.",
+            code=Codes.PAYMENT_EXCEEDS_BALANCE,
+            payload=advance_info,
+        )
+
+    remaining = amount
+    payments = PaymentIn.objects.select_for_update().filter(
+        client_id=invoice.client_id, party_id=invoice.party_id, status="Active",
+        deleted_at__isnull=True,
+    ).filter(allocated_amount__lt=F("amount")).order_by("payment_date", "created_at")
+
+    for payment in payments:
+        if remaining <= ZERO:
+            break
+        available = min(payment.unallocated_amount, remaining)
+        if available <= ZERO:
+            continue
+
+        PaymentAllocation.objects.create(
+            client_id=invoice.client_id,
+            payment_id=payment.id,
+            payment_side="in",
+            document_type="SalesInvoice",
+            document_id=invoice.id,
+            amount=available,
+            allocated_by=user if getattr(user, "is_authenticated", False) else None,
+        )
+        payment.allocated_amount = round2(D(payment.allocated_amount) + available)
+        payment.save(update_fields=["allocated_amount", "updated_at"])
+
+        if payment.journal_entry_id:
+            from apps.accounting.services import post_customer_advance_applied
+            post_customer_advance_applied(
+                client=invoice.client,
+                party=invoice.party,
+                amount=available,
+                payment=payment,
+                invoice=invoice,
+                user=user,
+            )
+        remaining -= available
+
+    refresh_invoice_payment_status(invoice)
+    ledger.recalculate_party_balance(invoice.client_id, invoice.party_id)
+    from apps.pms.production_services import sync_incentives_for_invoice
+    from .broker_services import sync_broker_commissions_for_invoice
+    sync_incentives_for_invoice(invoice, user=user)
+    sync_broker_commissions_for_invoice(invoice, user=user)
+    invoice.refresh_from_db()
+    return invoice

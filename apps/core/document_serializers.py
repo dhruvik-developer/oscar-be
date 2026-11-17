@@ -236,6 +236,24 @@ class DocumentLineSerializer(BaseModelSerializer):
             if qty_val > Decimal("999999999"):
                 raise serializers.ValidationError({"qty": ["Quantity exceeds the maximum permissible limit of 99,99,99,999 units."]})
 
+        rate_val = attrs.get("rate")
+        if rate_val is not None:
+            from decimal import Decimal
+            if Decimal(str(rate_val)) < Decimal("0"):
+                raise serializers.ValidationError({"rate": ["Rate cannot be negative."]})
+
+        disc_val = attrs.get("discount_pct")
+        if disc_val is not None:
+            from decimal import Decimal
+            if Decimal(str(disc_val)) < Decimal("0") or Decimal(str(disc_val)) > Decimal("100"):
+                raise serializers.ValidationError({"discount": ["Discount percentage must be between 0 and 100."]})
+
+        tax_val = attrs.get("tax_pct")
+        if tax_val is not None:
+            from decimal import Decimal
+            if Decimal(str(tax_val)) < Decimal("0") or Decimal(str(tax_val)) > Decimal("100"):
+                raise serializers.ValidationError({"tax": ["Tax percentage must be between 0 and 100."]})
+
         item = attrs.get("item")
 
         if item and not attrs.get("fabric_quality"):
@@ -296,7 +314,10 @@ class DocumentSerializer(BaseModelSerializer):
 
     partyId = TenantPrimaryKeyRelatedField(source="party", model="masters.Party")
 
-    partyName = serializers.CharField(source="party_name", read_only=True)
+    partyName = serializers.SerializerMethodField()
+
+    def get_partyName(self, obj):
+        return obj.party_name or (obj.party.name if getattr(obj, "party", None) else "")
 
     date = serializers.DateField(source="doc_date")
 
@@ -437,6 +458,14 @@ class DocumentSerializer(BaseModelSerializer):
     )
 
 
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        doc_date = attrs.get("doc_date") or getattr(self.instance, "doc_date", None)
+        due_date = attrs.get("due_date") or getattr(self.instance, "due_date", None)
+        if doc_date and due_date and due_date < doc_date:
+            raise serializers.ValidationError({"dueDate": ["Due date must be on or after the document date."]})
+        return attrs
 
     # -- write path ---------------------------------------------------------
 

@@ -376,6 +376,11 @@ class PaymentOutSerializer(BaseModelSerializer):
         ]
 
 
+    def validate_amount(self, value):
+        if value is not None and value <= 0:
+            raise serializers.ValidationError("Payment amount must be greater than zero.")
+        return value
+
     def get_unallocatedAmount(self, payment):
         return payment.unallocated_amount
 
@@ -446,6 +451,11 @@ class ExpenseSerializer(BaseModelSerializer):
             "notes", "status", "created_at", "updated_at",
         ]
         read_only_fields = ["expense_number", "total", "created_at", "updated_at"]
+
+    def validate_amount(self, value):
+        if value is not None and value <= 0:
+            raise serializers.ValidationError("Expense amount must be greater than zero.")
+        return value
 
 
 

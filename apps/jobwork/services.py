@@ -159,7 +159,7 @@ def validate_order_row(order, kind, data, instance=None):
         rejected = D(values["rejected"] or 0)
         if rejected < ZERO:
             raise ValidationFailed("Rejected quantity cannot be negative.", field_errors={"rejected": ["Must be ≥ 0."]})
-        if "accepted" not in data and instance is None:
+        if ("accepted" not in data or data.get("accepted") in (None, "", 0, Decimal("0"))) and rejected == ZERO and instance is None:
             data["accepted"] = qty - rejected
             values["accepted"] = data["accepted"]
         accepted = D(values["accepted"] or 0)
