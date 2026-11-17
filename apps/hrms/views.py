@@ -2715,6 +2715,7 @@ class LeaveRequestViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
 
 
 
+    @transaction.atomic
     def perform_create(self, serializer):
 
         employee = serializer.validated_data.get("employee")
@@ -2731,9 +2732,30 @@ class LeaveRequestViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
 
         self.check_own_employee(employee)
 
-        request_row = super().perform_create(serializer)
+        from_date = serializer.validated_data.get("from_date")
+        to_date = serializer.validated_data.get("to_date")
+        client_id = getattr(self.request, "client_id", None) or getattr(employee, "client_id", None)
+        emp_id = getattr(employee, "id", employee)
+        if emp_id and from_date and to_date:
+            clash = LeaveRequest.objects.filter(
+                client_id=client_id,
+                employee_id=emp_id,
+                status__in=["Pending Review", "Delegate Confirmed", "Approved"],
+                from_date__lte=to_date,
+                to_date__gte=from_date,
+                deleted_at__isnull=True,
+            )
+            if clash.exists():
+                existing = clash.first()
+                status_label = "approved" if existing.status == "Approved" else "existing"
+                raise BusinessRuleViolation(
+                    f"This overlaps an {status_label} leave request "
+                    f"({existing.from_date} to {existing.to_date}).",
+                    code="LEAVE_OVERLAP",
+                    payload={"conflictingRequestId": str(existing.id)},
+                )
 
-        services.assert_no_overlap(request_row)
+        request_row = super().perform_create(serializer)
 
         return request_row
 
@@ -2767,11 +2789,13 @@ class LeaveRequestViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
 
             )
 
-            self._concurrency_instance = row
+            instance.refresh_from_db()
 
-            self.write_audit("approve", row, description="Leave approved")
+            self._concurrency_instance = instance
 
-            return row
+            self.write_audit("approve", instance, description="Leave approved")
+
+            return instance
 
 
 
@@ -4019,6 +4043,28 @@ class AppraisalCycleViewSet(TenantModelViewSet):
     ordering = ["-period_start"]
 
     permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        request = getattr(self, "request", None)
+        client_id = getattr(request, "client_id", None)
+        if not client_id and request and hasattr(request, "user"):
+            client_id = getattr(request.user, "client_id", None)
+        if not client_id:
+            from apps.core.serializers import get_current_client_id
+            client_id = get_current_client_id()
+        if client_id and not qs.exists():
+            from datetime import date
+            today = date.today()
+            AppraisalCycle.objects.create(
+                client_id=client_id,
+                name=f"Performance Cycle {today.year}",
+                status="Active",
+                period_start=date(today.year, 1, 1),
+                period_end=date(today.year, 12, 31),
+            )
+            qs = super().get_queryset()
+        return qs
 
 
 

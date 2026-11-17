@@ -1324,6 +1324,7 @@ class AppraisalSerializer(BaseModelSerializer):
             "created_at", "updated_at",
         ]
         read_only_fields = ["created_at", "updated_at"]
+        validators = []
 
 
 class GoalSerializer(BaseModelSerializer):
@@ -2219,6 +2220,7 @@ class SalespersonIncentiveSchemeSerializer(BaseModelSerializer):
             "created_at", "updated_at",
         ]
         read_only_fields = ["created_at", "updated_at"]
+        validators = []
 
 
 class SalespersonIncentiveAccrualSerializer(BaseModelSerializer):
@@ -2238,6 +2240,7 @@ class SalespersonIncentiveAccrualSerializer(BaseModelSerializer):
             "created_at", "updated_at",
         ]
         read_only_fields = ["created_at", "updated_at"]
+        validators = []
 
 
 class BrokerCommissionRecordSerializer(BaseModelSerializer):
@@ -2258,6 +2261,7 @@ class BrokerCommissionRecordSerializer(BaseModelSerializer):
             "created_at", "updated_at",
         ]
         read_only_fields = ["created_at", "updated_at"]
+        validators = []
 
 
 # ---------------------------------------------------------------------------
@@ -2297,6 +2301,7 @@ class EmployeeTransferSerializer(BaseModelSerializer):
             "reason", "status", "created_at", "updated_at",
         ]
         read_only_fields = ["created_at", "updated_at"]
+        validators = []
 
 
 class EmployeePromotionSerializer(BaseModelSerializer):
@@ -2336,6 +2341,7 @@ class EmployeePromotionSerializer(BaseModelSerializer):
             "notes", "status", "created_at", "updated_at",
         ]
         read_only_fields = ["created_at", "updated_at"]
+        validators = []
 
 
 class EmployeeWarningSerializer(BaseModelSerializer):
@@ -2359,6 +2365,7 @@ class EmployeeWarningSerializer(BaseModelSerializer):
             "created_at", "updated_at",
         ]
         read_only_fields = ["created_at", "updated_at"]
+        validators = []
 
 
 class EmployeeAwardSerializer(BaseModelSerializer):
@@ -2381,6 +2388,7 @@ class EmployeeAwardSerializer(BaseModelSerializer):
             "created_at", "updated_at",
         ]
         read_only_fields = ["created_at", "updated_at"]
+        validators = []
 
 
 class HrmsIncentiveSerializer(_PMSIncentiveCalculationSerializer):

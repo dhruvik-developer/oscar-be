@@ -697,20 +697,21 @@ def resolve_leave_type(client_id, name):
     return None
 
 
-def assert_no_overlap(leave_request):
+def assert_no_overlap(leave_request, statuses=("Pending Review", "Delegate Confirmed", "Approved")):
     """db.md §11.3 -- overlapping live requests for the same employee are rejected."""
     clash = LeaveRequest.objects.filter(
         client_id=leave_request.client_id,
         employee_id=leave_request.employee_id,
-        status__in=["Pending Review", "Delegate Confirmed", "Approved"],
+        status__in=statuses,
         from_date__lte=leave_request.to_date,
         to_date__gte=leave_request.from_date,
         deleted_at__isnull=True,
     ).exclude(pk=leave_request.pk)
     if clash.exists():
         existing = clash.first()
+        status_label = "approved" if existing.status == "Approved" else "existing"
         raise BusinessRuleViolation(
-            "This overlaps an existing leave request "
+            f"This overlaps an {status_label} leave request "
             f"({existing.from_date} to {existing.to_date}).",
             code="LEAVE_OVERLAP",
             payload={"conflictingRequestId": str(existing.id)},
@@ -788,7 +789,7 @@ def approve_leave(leave_request, *, user=None, remark=None):
             code=Codes.BAD_TARGET,
         )
 
-    assert_no_overlap(leave_request)
+    assert_no_overlap(leave_request, statuses=("Approved",))
 
     balance = leave_balance_for(
         leave_request.client_id, leave_request.employee_id, leave_request.leave_type_id,
@@ -809,6 +810,22 @@ def approve_leave(leave_request, *, user=None, remark=None):
     leave_request.decided_at = timezone.now()
     leave_request.remark = remark
     leave_request.save()
+
+    # Auto-reject any conflicting pending requests for the same employee/dates
+    overlapping_pending = LeaveRequest.objects.filter(
+        client_id=leave_request.client_id,
+        employee_id=leave_request.employee_id,
+        status__in=["Pending Review", "Delegate Confirmed"],
+        from_date__lte=leave_request.to_date,
+        to_date__gte=leave_request.from_date,
+        deleted_at__isnull=True,
+    ).exclude(pk=leave_request.pk)
+    overlapping_pending.update(
+        status="Rejected",
+        remark=f"Overlapped with approved leave {leave_request.id}",
+        decided_at=timezone.now(),
+        approver=user if getattr(user, "is_authenticated", False) else None,
+    )
 
     # Post attendance for every working day in range.
     # A half-day leave keeps the other half as a worked Half Day.
