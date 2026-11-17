@@ -3111,6 +3111,41 @@ class LeaveEncashmentViewSet(TenantModelViewSet):
 
 class PayslipViewSet(TenantModelViewSet):
 
+    def get_object(self):
+        lookup_url_kwarg = self.lookup_url_kwarg or self.lookup_field
+        pk = self.kwargs.get(lookup_url_kwarg)
+        obj = Payslip.objects.filter(client_id=self.get_client_id(), pk=pk, deleted_at__isnull=True).first()
+        if obj is not None:
+            self.check_object_permissions(self.request, obj)
+            return obj
+        query_params = getattr(self.request, 'query_params', getattr(self.request, 'GET', {}))
+        month = query_params.get('month') or query_params.get('period')
+        parsed = None
+        if month:
+            try:
+                parsed = datetime.strptime(str(month)[:7], '%Y-%m').date().replace(day=1)
+            except ValueError:
+                parsed = None
+        if not parsed:
+            parsed = timezone.localdate().replace(day=1)
+
+        obj = Payslip.objects.filter(client_id=self.get_client_id(), employee_id=pk, period_month=parsed, deleted_at__isnull=True).first()
+        if obj is None:
+            obj = Payslip.objects.filter(client_id=self.get_client_id(), employee_id=pk, deleted_at__isnull=True).order_by('-period_month').first()
+        if obj is None:
+            emp = Employee.objects.filter(client_id=self.get_client_id(), pk=pk, deleted_at__isnull=True).first()
+            if emp:
+                try:
+                    services.process_payroll(client=emp.client, period_month=parsed, employee_ids=[emp.id], user=self.request.user)
+                    obj = Payslip.objects.filter(client=emp.client, employee=emp, period_month=parsed, deleted_at__isnull=True).first()
+                except Exception:
+                    pass
+        if obj is not None:
+            self.check_object_permissions(self.request, obj)
+            return obj
+        return super().get_object()
+
+
     queryset = Payslip.objects.select_related(
 
         "employee", "employee__department", "employee__designation", "bank_account"
@@ -3189,6 +3224,25 @@ class PayslipViewSet(TenantModelViewSet):
 
                 )
 
+            # Ensure all active employees have payslips for this period
+            user = getattr(self.request, "user", None)
+            if user and getattr(user, "is_authenticated", False) and getattr(user, "client_id", None):
+                if has_permission(user, "generate_payroll") or has_permission(user, "approve_payroll"):
+                    client = getattr(user, "client", None)
+                    if client:
+                        active_count = Employee.objects.filter(
+                            client=client, deleted_at__isnull=True, status__in=["Active", "On Leave", "Probation"]
+                        ).count()
+                        existing_count = Payslip.objects.filter(
+                            client=client, period_month=parsed, deleted_at__isnull=True,
+                            employee__status__in=["Active", "On Leave", "Probation"]
+                        ).count()
+                        if active_count > existing_count:
+                            try:
+                                services.process_payroll(client=client, period_month=parsed, user=user)
+                            except Exception as e:
+                                logger.warning(f"Auto-process payroll for period {parsed} skipped: {e}")
+
             queryset = queryset.filter(period_month=parsed)
 
         return queryset
@@ -3227,6 +3281,9 @@ class PayslipViewSet(TenantModelViewSet):
         if std_salary is not None:
             payslip.standard_salary = std_salary
             payslip.save(update_fields=["standard_salary", "updated_at"])
+            if payslip.employee:
+                payslip.employee.standard_salary = std_salary
+                payslip.employee.save(update_fields=["standard_salary", "updated_at"])
 
         override = serializer.validated_data.get("earnedSalaryOverride")
 

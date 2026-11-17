@@ -956,6 +956,8 @@ def compute_salary(
     net_payable = round2(
         earned_salary + D(additional_earnings) - D(deductions) - D(advance)
     )
+    if net_payable < ZERO:
+        net_payable = ZERO
 
     return {
         "perDaySalary": round2(per_day),
@@ -1047,7 +1049,7 @@ def process_payroll(*, client, period_month, employee_ids=None, user=None):
 
     month_end = _month_end(period_month)
     # Auto punch-out any unclosed sessions up to month_end so all attended days are accounted for
-    auto_punch_out_pending_sessions(client=client.id, as_of_date=month_end, force_today=True)
+    auto_punch_out_pending_sessions(client=client.id, as_of_date=month_end, force_today=False)
     working = working_days_in(client.id, period_month, month_end)
     total_days = Decimal(len(working)) or DEFAULT_TOTAL_DAYS
 
@@ -1067,6 +1069,8 @@ def process_payroll(*, client, period_month, employee_ids=None, user=None):
         previous = Payslip.objects.filter(
             payroll_run=run, employee=employee, deleted_at__isnull=True
         ).first()
+        if previous and previous.advance_recovery > ZERO and advance == ZERO:
+            advance = previous.advance_recovery
         # Factor in approved leave encashments for the month
         encashments = LeaveEncashment.objects.filter(
             client=client,
