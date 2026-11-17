@@ -424,32 +424,35 @@ def complete_project(project, *, user=None, force=False):
 def dashboard_kpis(client_id):
     """The seven KPI tiles -- ``computeDashboardMetrics`` moved server-side."""
     now = timezone.now()
-    projects = Project.objects.filter(client_id=client_id, deleted_at__isnull=True)
+    base = Project.objects.filter(client_id=client_id, deleted_at__isnull=True)
 
-    total = projects.count()
-    in_progress = projects.filter(status="In Progress").count()
-    completed = projects.filter(status="Completed").count()
-    delayed = projects.filter(status="Delayed").count()
-    at_risk = projects.filter(status="At Risk").count()
-    on_hold = projects.filter(status="On Hold").count()
-
-    overdue = projects.filter(
-        expected_completion_date__lt=now, actual_completion_date__isnull=True
-    ).exclude(status="Completed").count()
-
-    average = projects.exclude(status="Draft").aggregate(
-        value=Avg("overall_completion_pct")
-    )["value"]
+    agg = base.aggregate(
+        total=Count("id"),
+        in_progress=Count("id", filter=Q(status="In Progress")),
+        completed=Count("id", filter=Q(status="Completed")),
+        delayed=Count("id", filter=Q(status="Delayed")),
+        at_risk=Count("id", filter=Q(status="At Risk")),
+        on_hold=Count("id", filter=Q(status="On Hold")),
+        overdue=Count(
+            "id",
+            filter=Q(
+                expected_completion_date__lt=now,
+                actual_completion_date__isnull=True,
+            )
+            & ~Q(status="Completed"),
+        ),
+        average=Avg("overall_completion_pct", filter=~Q(status="Draft")),
+    )
 
     return {
-        "totalProjects": total,
-        "inProgress": in_progress,
-        "completed": completed,
-        "delayed": delayed,
-        "atRisk": at_risk,
-        "onHold": on_hold,
-        "overdue": overdue,
-        "averageCompletionPct": int(round(average or 0)),
+        "totalProjects": agg["total"],
+        "inProgress": agg["in_progress"],
+        "completed": agg["completed"],
+        "delayed": agg["delayed"],
+        "atRisk": agg["at_risk"],
+        "onHold": agg["on_hold"],
+        "overdue": agg["overdue"],
+        "averageCompletionPct": int(round(agg["average"] or 0)),
     }
 
 

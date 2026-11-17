@@ -28,7 +28,7 @@ from apps.masters.views import (
     UnitViewSet,
 )
 
-from . import views, warehouse_views
+from . import views, warehouse_views, reprocess_views
 
 router = DefaultRouter(trailing_slash=True)
 router.register("items", ItemViewSet, basename="inventory-items")
@@ -100,6 +100,10 @@ urlpatterns = [
     path("qc/work/", views.QCWorkView.as_view(), name="inventory-qc-work"),
     path("qc/entry/", views.QCEntryView.as_view(), name="inventory-qc-entry"),
     path("qc/reprocess-stock/", views.QCReprocessStockView.as_view(), name="inventory-qc-reprocess-stock"),
+    path("reprocess/", reprocess_views.ReprocessListView.as_view(), name="inventory-reprocess-list"),
+    path("reprocess/send/", reprocess_views.ReprocessListView.as_view(), name="inventory-reprocess-send"),
+    path("reprocess/<uuid:pk>/", reprocess_views.ReprocessDetailView.as_view(), name="inventory-reprocess-detail"),
+    path("reprocess/<uuid:pk>/receive-return/", reprocess_views.ReprocessReceiveReturnView.as_view(), name="inventory-reprocess-receive-return"),
     path("qc/pending/", views.QCPendingInspectionsView.as_view(), name="inventory-qc-pending"),
     path("qc/pending/bulk-assign/", views.QCBulkAssignView.as_view(), name="inventory-qc-bulk-assign"),
     path("qc/complete/", views.QCCompleteInspectionView.as_view(), name="inventory-qc-complete"),

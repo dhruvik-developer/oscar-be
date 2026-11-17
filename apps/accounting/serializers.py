@@ -1,4 +1,6 @@
 """Accounts serializers (api.md §8)."""
+from decimal import Decimal
+
 from rest_framework import serializers
 
 from apps.core.money import D, round2
@@ -25,14 +27,19 @@ class AccountSerializer(BaseModelSerializer):
     #: opening + debit - credit; positive = Dr, negative = Cr. Only present
     #: when the queryset annotates the totals (AccountViewSet does).
     balance = serializers.SerializerMethodField()
+    isSystem = serializers.BooleanField(source="is_system", read_only=True)
+    systemKey = serializers.CharField(source="system_key", read_only=True)
+    isActive = serializers.BooleanField(source="is_active", required=False)
+    openingBalance = serializers.DecimalField(source="opening_balance", max_digits=18, decimal_places=2, required=False)
 
     class Meta:
         model = Account
         fields = [
-            "id", "code", "name", "type", "subtype", "parent", "is_system",
-            "system_key", "is_active", "opening_balance", "balance", "created_at", "updated_at",
+            "id", "code", "name", "type", "subtype", "parent", "is_system", "isSystem",
+            "system_key", "systemKey", "is_active", "isActive", "opening_balance", "openingBalance",
+            "balance", "created_at", "updated_at",
         ]
-        read_only_fields = ["is_system", "system_key", "created_at", "updated_at"]
+        read_only_fields = ["is_system", "isSystem", "system_key", "systemKey", "created_at", "updated_at"]
         # Blank on create: the next free number among its siblings (see validate).
         extra_kwargs = {"code": {"required": False, "allow_blank": True}}
 
@@ -74,18 +81,39 @@ class AccountSerializer(BaseModelSerializer):
 class BankAccountSerializer(BaseModelSerializer):
     accountId = TenantPrimaryKeyRelatedField(source="account", queryset=Account.objects.all())
     accountName = serializers.CharField(source="account.name", read_only=True)
+    accountNumber = serializers.CharField(source="account_number", required=False, allow_null=True, allow_blank=True)
+    bankName = serializers.CharField(source="bank_name", required=False, allow_null=True, allow_blank=True)
+    openingBalance = serializers.DecimalField(source="opening_balance", max_digits=18, decimal_places=2, required=False)
+    isDefault = serializers.BooleanField(source="is_default", required=False)
+    isActive = serializers.BooleanField(source="is_active", required=False)
     balance = serializers.SerializerMethodField()
 
     class Meta:
         model = BankAccount
         fields = [
-            "id", "name", "type", "accountId", "accountName", "account_number",
-            "ifsc", "bank_name", "branch", "opening_balance", "balance",
-            "is_default", "is_active", "created_at", "updated_at",
+            "id", "name", "type", "accountId", "accountName", "account_number", "accountNumber",
+            "ifsc", "bank_name", "bankName", "branch", "opening_balance", "openingBalance", "balance",
+            "is_default", "isDefault", "is_active", "isActive", "created_at", "updated_at",
         ]
 
     def get_balance(self, bank_account):
-        return getattr(bank_account, "computed_balance", None)
+        balance = getattr(bank_account, "computed_balance", None)
+        if balance is None:
+            from django.db.models import DecimalField, Sum, Value
+            from django.db.models.functions import Coalesce
+            from decimal import Decimal
+            rows = JournalLine.objects.filter(
+                client_id=bank_account.client_id,
+                account_id=bank_account.account_id,
+                deleted_at__isnull=True,
+            ).exclude(journal_entry__status="Reversed").exclude(
+                journal_entry__reversal_of__isnull=False
+            ).aggregate(
+                net=Coalesce(Sum("debit"), Value(Decimal("0.00")))
+                - Coalesce(Sum("credit"), Value(Decimal("0.00")))
+            )
+            balance = round2(D(bank_account.opening_balance) + D(rows["net"] or Decimal("0.00")))
+        return balance
 
 
 class JournalLineSerializer(BaseModelSerializer):
@@ -106,25 +134,30 @@ class JournalLineSerializer(BaseModelSerializer):
 
 
 class JournalEntrySerializer(BaseModelSerializer):
-    """A manual entry must balance Dr = Cr (api.md §8).
+    """An entry must balance Dr = Cr (api.md §8).
 
     System entries are immutable and reversible only through the parent
     document's cancel (db.md §8), which the viewset enforces.
     """
 
     lines = JournalLineSerializer(many=True)
+    entryDate = serializers.DateField(source="entry_date", required=False)
+    entryNumber = serializers.CharField(source="entry_number", read_only=True)
+    isSystem = serializers.BooleanField(source="is_system", read_only=True)
+    postedAt = serializers.DateTimeField(source="posted_at", read_only=True)
+    sourceDocumentType = serializers.CharField(source="source_document_type", read_only=True)
     sourceDocumentId = serializers.CharField(source="source_document_id", read_only=True)
 
     class Meta:
         model = JournalEntry
         fields = [
-            "id", "entry_number", "entry_date", "narration", "status",
-            "source_document_type", "sourceDocumentId", "is_system",
-            "reversal_of", "posted_at", "lines", "created_at", "updated_at",
+            "id", "entry_number", "entryNumber", "entry_date", "entryDate", "narration", "status",
+            "source_document_type", "sourceDocumentType", "sourceDocumentId", "is_system", "isSystem",
+            "reversal_of", "posted_at", "postedAt", "lines", "created_at", "updated_at",
         ]
         read_only_fields = [
-            "entry_number", "is_system", "reversal_of", "posted_at",
-            "source_document_type", "created_at", "updated_at",
+            "entry_number", "entryNumber", "is_system", "isSystem", "reversal_of", "posted_at", "postedAt",
+            "source_document_type", "sourceDocumentType", "created_at", "updated_at",
         ]
 
     def validate(self, attrs):
@@ -187,13 +220,34 @@ class BudgetSerializer(BaseModelSerializer):
         ]
 
     def get_actual(self, budget):
-        return getattr(budget, "actual_amount", None)
-
-    def get_variance(self, budget):
         actual = getattr(budget, "actual_amount", None)
         if actual is None:
+            from django.db.models import DecimalField, OuterRef, Subquery, Sum, Value
+            from django.db.models.functions import Coalesce
+            from decimal import Decimal
+            sub = (
+                JournalLine.objects.filter(
+                    client_id=budget.client_id,
+                    account_id=budget.account_id,
+                    deleted_at__isnull=True,
+                    journal_entry__entry_date__gte=budget.period_start,
+                    journal_entry__entry_date__lte=budget.period_end,
+                )
+                .exclude(journal_entry__status="Reversed")
+                .exclude(journal_entry__reversal_of__isnull=False)
+                .aggregate(
+                    net=Coalesce(Sum("debit"), Value(Decimal("0.00")))
+                    - Coalesce(Sum("credit"), Value(Decimal("0.00")))
+                )
+            )
+            actual = sub["net"] or Decimal("0.00")
+        return round2(actual)
+
+    def get_variance(self, budget):
+        actual = self.get_actual(budget)
+        if actual is None:
             return None
-        return budget.amount - actual
+        return round2(budget.amount - actual)
 
 
 class ExpenseCategorySerializer(BaseModelSerializer):

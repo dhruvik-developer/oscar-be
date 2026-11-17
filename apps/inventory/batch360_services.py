@@ -600,9 +600,14 @@ def delete_yarn(batch, yarn_id, *, user=None):
 @transaction.atomic
 def set_fabric_type(batch, fabric_type, *, reason=None, user=None):
     """Correct what a batch came in as. The batch code does not change."""
+    from apps.purchase.fabric_flow import check_receipt_fabric_type
+
     from .batch_services import _fabric_type
 
     fabric_type = _fabric_type(fabric_type)
+    # A factory order's batch is what its delivery type says it is.
+    if batch.purchase_order_id and batch.purchase_order.fabric_flow:
+        check_receipt_fabric_type(batch.purchase_order, fabric_type)
     before = batch.fabric_type
     batch.fabric_type = fabric_type
     batch.save(update_fields=["fabric_type", "updated_at"])

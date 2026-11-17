@@ -14,16 +14,21 @@ interesting constraints are in attendance, leave and payroll, which interlock:
 from django.contrib.postgres.constraints import ExclusionConstraint
 from django.contrib.postgres.fields import DateTimeRangeField, RangeOperators
 from django.db import models
-from django.db.models import Func, Q, F, Value
+from django.db.models import Func, Q, F, Value, Sum
+from django.db.models.signals import post_save, post_delete
+from django.dispatch import receiver
 
 from django.utils import timezone
 from apps.core.models import LegacyIdMixin, TenantModel
+from apps.core.money import D
 
 EMPLOYEE_STATUSES = [
     ("Active", "Active"),
+    ("Inactive", "Inactive"),
     ("On Leave", "On Leave"),
     ("Probation", "Probation"),
     ("Resigned", "Resigned"),
+    ("Notice Period", "Notice Period"),
     ("Terminated", "Terminated"),
 ]
 EMPLOYMENT_TYPES = [
@@ -296,14 +301,23 @@ class Attendance(TenantModel):
         ("regularization", "regularization"),
         ("leave", "leave"),
         ("holiday", "holiday"),
+        ("punch", "punch"),
     ]
 
     employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name="attendance")
     work_date = models.DateField()
     check_in = models.DateTimeField(null=True, blank=True)
     check_out = models.DateTimeField(null=True, blank=True)
+    first_punch = models.DateTimeField(null=True, blank=True)
+    last_punch = models.DateTimeField(null=True, blank=True)
+    working_hours = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    late_minutes = models.IntegerField(default=0)
+    early_leaving_minutes = models.IntegerField(default=0)
+    overtime_hours = models.DecimalField(max_digits=6, decimal_places=2, default=0)
     #: DERIVED from check-in/out plus the attendance_flexibility policy.
     hours = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    total_break_minutes = models.IntegerField(default=0)
+    total_attendance_hours = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
     status = models.TextField(choices=ATTENDANCE_STATUSES)
     leave_request = models.ForeignKey(
         "LeaveRequest", null=True, blank=True, on_delete=models.SET_NULL, related_name="attendance_rows"
@@ -446,12 +460,45 @@ class LeaveBalance(TenantModel):
         ]
 
 
+@receiver(post_save, sender="hrms.LeaveRequest")
+@receiver(post_delete, sender="hrms.LeaveRequest")
+def _recompute_leave_balance_used(sender, instance, **kwargs):
+    """Keep LeaveBalance.used in sync with approved LeaveRequest rows so the
+    GeneratedField balance never drifts from the source of truth."""
+    if not instance.pk or not instance.from_date:
+        return
+    try:
+        from .services import leave_balance_for
+        balance = leave_balance_for(
+            instance.client_id, instance.employee_id, instance.leave_type_id,
+            instance.from_date.year,
+        )
+        approved_used = (
+            LeaveRequest.objects.filter(
+                client_id=instance.client_id, employee=instance.employee,
+                leave_type=instance.leave_type, status="Approved",
+                deleted_at__isnull=True, from_date__year=instance.from_date.year,
+            ).aggregate(total=Sum("days"))["total"] or 0
+        )
+        if D(balance.used) != D(approved_used):
+            balance.used = D(approved_used)
+            balance.save(update_fields=["used", "updated_at"])
+    except Exception:
+        # Never let a balance recompute break a leave request save/delete.
+        pass
+
+
 class CompOff(TenantModel):
     employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name="comp_offs")
     worked_date = models.DateField()
     work_type = models.TextField(null=True, blank=True)
     days = models.DecimalField(max_digits=4, decimal_places=2, default=1)
     expiry_date = models.DateField(null=True, blank=True)
+    status = models.TextField(
+        choices=[("Pending", "Pending"), ("Approved", "Approved"), ("Rejected", "Rejected")],
+        default="Pending",
+    )
+    reject_reason = models.TextField(null=True, blank=True)
     used = models.BooleanField(default=False)
     used_leave_request = models.ForeignKey(
         LeaveRequest, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
@@ -612,6 +659,42 @@ class SalaryAdvance(TenantModel):
     @property
     def outstanding(self):
         return (self.amount or 0) - (self.recovered_amount or 0)
+
+
+@receiver(post_save, sender="hrms.Payslip")
+@receiver(post_delete, sender="hrms.Payslip")
+def _recompute_salary_advance_recovered(sender, instance, **kwargs):
+    """Keep SalaryAdvance.recovered_amount derived from payslip advance_recovery
+    rows so it never drifts from the source of truth."""
+    if not instance.employee_id or not instance.period_month:
+        return
+    try:
+        from .models import SalaryAdvance
+        advances = SalaryAdvance.objects.filter(
+            employee_id=instance.employee_id,
+            deleted_at__isnull=True,
+            issued_on__lte=instance.period_month.replace(day=28),
+        ).exclude(status="Written Off").order_by("issued_on")
+
+        for advance in advances:
+            adv_start = advance.issued_on.replace(day=1)
+            total_recovered = (
+                Payslip.objects.filter(
+                    employee_id=instance.employee_id,
+                    period_month__gte=adv_start,
+                    status__in=["Approved", "Paid"],
+                    deleted_at__isnull=True,
+                ).aggregate(total=Sum("advance_recovery"))["total"]
+                or 0
+            )
+            adv_recovered = min(D(total_recovered), D(advance.amount))
+            new_status = "Recovered" if adv_recovered >= D(advance.amount) else "Active"
+            if D(advance.recovered_amount) != adv_recovered or advance.status != new_status:
+                advance.recovered_amount = adv_recovered
+                advance.status = new_status
+                advance.save(update_fields=["recovered_amount", "status", "updated_at"])
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -820,6 +903,15 @@ class PerformanceIndicator(TenantModel):
     department = models.ForeignKey(
         Department, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
+    location = models.ForeignKey(
+        Location, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    target = models.TextField(null=True, blank=True)
+    measurement_type = models.TextField(null=True, blank=True)
+    assigned_employee = models.TextField(null=True, blank=True)
+    designation = models.TextField(null=True, blank=True)
+    description = models.TextField(null=True, blank=True)
+    status = models.TextField(default="Active")
 
     class Meta:
         db_table = "hrms_performance_indicators"
@@ -834,6 +926,10 @@ class Kpi(TenantModel):
     target = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
     unit = models.TextField(null=True, blank=True)
     applies_to = models.TextField(null=True, blank=True)
+    weight = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    status = models.TextField(default="Active")
+    designation = models.TextField(null=True, blank=True)
+    assigned_employee = models.TextField(null=True, blank=True)
 
     class Meta:
         db_table = "hrms_kpis"
@@ -1677,12 +1773,15 @@ class AttendancePunch(TenantModel, LegacyIdMixin):
     PUNCH_TYPES = [
         ("IN", "Punch In"),
         ("OUT", "Punch Out"),
+        ("BREAK_IN", "Break In"),
+        ("BREAK_OUT", "Break Out"),
     ]
     SOURCES = [
         ("web", "Web / Topbar"),
         ("mobile", "Mobile App"),
         ("biometric", "Biometric Device"),
         ("manual", "Manual / Correction"),
+        ("auto_day_end", "Auto Day End / Forgot Punch Out"),
     ]
 
     employee = models.ForeignKey(
@@ -1692,7 +1791,7 @@ class AttendancePunch(TenantModel, LegacyIdMixin):
         Attendance, on_delete=models.CASCADE, related_name="punches", null=True, blank=True
     )
     work_date = models.DateField(db_index=True)
-    punch_type = models.CharField(max_length=10, choices=PUNCH_TYPES)
+    punch_type = models.CharField(max_length=15, choices=PUNCH_TYPES)
     punch_time = models.DateTimeField(db_index=True)
     source = models.CharField(max_length=20, choices=SOURCES, default="web")
     remark = models.TextField(null=True, blank=True)
@@ -1707,6 +1806,39 @@ class AttendancePunch(TenantModel, LegacyIdMixin):
 
     def __str__(self):
         return f"{self.employee} - {self.punch_type} @ {self.punch_time}"
+
+
+class AttendanceBreak(TenantModel, LegacyIdMixin):
+    BREAK_TYPES = [
+        ("general", "General Break"),
+        ("lunch", "Lunch Break"),
+        ("tea", "Tea Break"),
+    ]
+
+    employee = models.ForeignKey(
+        Employee, on_delete=models.CASCADE, related_name="breaks"
+    )
+    attendance = models.ForeignKey(
+        Attendance, on_delete=models.CASCADE, related_name="breaks", null=True, blank=True
+    )
+    work_date = models.DateField(db_index=True)
+    break_in_time = models.DateTimeField(db_index=True)
+    break_out_time = models.DateTimeField(null=True, blank=True)
+    duration_seconds = models.IntegerField(default=0)
+    duration_minutes = models.IntegerField(default=0)
+    break_type = models.CharField(max_length=20, choices=BREAK_TYPES, default="general")
+    remark = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "hrms_attendance_breaks"
+        ordering = ["break_in_time"]
+        indexes = [
+            models.Index(fields=["client", "employee", "work_date"], name="ix_hrms_break_emp_date"),
+            models.Index(fields=["client", "break_in_time"], name="ix_hrms_break_in_time"),
+        ]
+
+    def __str__(self):
+        return f"{self.employee} - Break: {self.break_in_time} -> {self.break_out_time}"
 
 
 # --- Company Meetings & Conference Room Booking ---

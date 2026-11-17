@@ -267,6 +267,30 @@ class DiscountWorkflowTests(EarlyPaymentBase):
         self.assertEqual(self.customer.balance, D("0"))
         self.assertEqual(payment.__class__.objects.get(pk=payment.pk).amount, D("98000"))
 
+    def test_receipt_must_be_before_due_date(self):
+        on_due_invoice = self.invoice(10000, doc_date=self.today - timedelta(days=31))
+        on_due = self.pay(10000, [(on_due_invoice, 10000)], on=on_due_invoice.due_date)
+        on_due_response = self.request_discount(on_due_invoice, on_due, 100, expect=400)
+        self.assertIn("before the invoice due date", on_due_response["message"])
+
+        late_invoice = self.invoice(10000, doc_date=self.today - timedelta(days=31))
+        late = self.pay(10000, [(late_invoice, 10000)], on=self.today)
+        late_response = self.request_discount(late_invoice, late, 100, expect=400)
+        self.assertIn("before the invoice due date", late_response["message"])
+
+    def test_approval_rechecks_the_recorded_early_payment_dates(self):
+        inv, payment = self.early_paid_invoice()
+        req = self.request_discount(inv, payment, 2000)
+        EarlyPaymentDiscountRequest.objects.filter(pk=req["id"]).update(payment_date=inv.due_date)
+
+        response = self.post(
+            f"/sales/discount-requests/{req['id']}/approve/",
+            {"reason": "Long-standing customer, agreed by phone"},
+            user=self.approver,
+        )
+        self.assertEqual(response.status_code, 422, response.content[:400])
+        self.assertEqual(response.json()["code"], "PAYMENT_NOT_EARLY")
+
     def test_partial_payment_with_discount(self):
         inv = self.invoice(100000)
         payment = self.pay(50000, [(inv, 50000)])
@@ -412,6 +436,7 @@ class DashboardAndHistoryTests(EarlyPaymentBase):
         settled = rows[self.refreshed(paid).invoice_number]
         self.assertEqual((settled["paymentStatus"], D(str(settled["paidAmount"])), D(str(settled["approvedDiscount"]))),
                          ("Paid", D("98000"), D("2000")))
+        self.assertTrue(settled["hasEarlyPayment"])
         only_overdue = self.get("/sales/receivables/", {"status": "Overdue"}).json()["results"]
         self.assertEqual([r["invoiceNumber"] for r in only_overdue], [overdue.invoice_number])
         by_status = self.get("/sales/discount-requests/", {"status": "Submitted"}).json()

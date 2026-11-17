@@ -314,7 +314,9 @@ class DocumentSerializer(BaseModelSerializer):
 
     )
 
-    brokerName = serializers.CharField(source="broker_fk.name", read_only=True)
+    brokerName = serializers.CharField(
+        source="broker_fk.name", read_only=True, allow_null=True
+    )
 
     transportResponsibility = serializers.CharField(
 
@@ -632,6 +634,11 @@ class DocumentSerializer(BaseModelSerializer):
 
                         data["shade"] = matched_rate.shade
 
+            if data.get("rate") is None or data["rate"] <= 0:
+                raise serializers.ValidationError({
+                    "rate": ["Unit rate must be greater than zero."]
+                })
+
 
 
             line = self.line_model(
@@ -679,4 +686,3 @@ class DocumentSerializer(BaseModelSerializer):
         if request is not None and isinstance(request.data, dict):
 
             assert_client_totals_match(document, request.data.get("totals"))
-

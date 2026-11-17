@@ -35,5 +35,6 @@ urlpatterns = [
         views.RevokeShareView.as_view(),
         name="pms-share-revoke",
     ),
+    path("loom/", include("apps.pms.loom_urls")),
     path("", include(router.urls)),
 ]

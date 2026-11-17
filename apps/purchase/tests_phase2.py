@@ -234,6 +234,12 @@ class Phase2PurchaseTests(TestCase):
         self.assertEqual(data["vendor"]["name"], self.supplier.name)
         self.assertIn("entries", data)
         self.assertIn("closingBalance", data)
+        self.assertIn("summary", data)
+        self.assertIn("totalDebits", data["summary"])
+        self.assertIn("totalCredits", data["summary"])
+        self.assertIn("pendingBills", data)
+        self.assertIn("payments", data)
+        self.assertIn("notes", data)
 
     def test_purchase_return_with_lot_taka(self):
         bill_res = self.api.post(f"/api/v1/purchase/orders/{self.po.id}/convert-to-bill/", {})

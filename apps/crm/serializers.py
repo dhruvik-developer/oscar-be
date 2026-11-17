@@ -9,6 +9,7 @@ from apps.core.serializers import (
 )
 
 from .models import (
+    lift_attribution,
     Contract,
     CrmProject,
     Deal,
@@ -160,6 +161,7 @@ class LeadSerializer(BaseModelSerializer):
         agreed rate, when given, must be a non-negative number on a known basis."""
         if not isinstance(value, dict):
             return value
+        value = lift_attribution(value)
         rate = value.get("salesperson_commission_rate")
         if rate not in (None, ""):
             try:

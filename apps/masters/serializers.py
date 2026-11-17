@@ -145,6 +145,20 @@ class PartySerializer(BaseModelSerializer):
             raise serializers.ValidationError("A party with this code already exists.")
         return value
 
+    def create(self, validated_data):
+        party = super().create(validated_data)
+        from apps.accounting.services import recalculate_party_balance
+        recalculate_party_balance(party.client_id, party)
+        party.refresh_from_db(fields=["balance"])
+        return party
+
+    def update(self, instance, validated_data):
+        party = super().update(instance, validated_data)
+        from apps.accounting.services import recalculate_party_balance
+        recalculate_party_balance(party.client_id, party)
+        party.refresh_from_db(fields=["balance"])
+        return party
+
 
 class PartySummarySerializer(BaseSerializer):
     """``GET /parties/{id}/summary/`` -- the Customer 360 drawer.

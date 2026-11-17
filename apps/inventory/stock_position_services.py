@@ -107,7 +107,7 @@ def _roll_row(t, include_cost):
         "fabric": t.item.name if t.item_id else None,
         "fabricQuality": t.fabric_quality.name if t.fabric_quality_id else None,
         "design": t.design.name if t.design_id else None,
-        "shade": t.shade.name if t.shade_id else None,
+        "shade": t.shade.name if t.shade_id else (t.batch.dyeing_colour_name if t.batch_id else None),
         "location": t.location.name if t.location_id else None,
         "locationId": str(t.location_id) if t.location_id else None,
         "quantity": str(round4(D(t.available_quantity))),

@@ -4,8 +4,12 @@ Declared field names follow the model (snake_case); the wire renders
 camelCase automatically via ``CamelCaseMixin``. Relations use
 ``TenantPrimaryKeyRelatedField`` so cross-tenant ids fail as "does not exist".
 """
+from decimal import Decimal
+
+from django.db.models import Sum
 from rest_framework import serializers
 
+from apps.core.money import D
 from apps.core.serializers import BaseModelSerializer, BaseSerializer, TenantPrimaryKeyRelatedField
 
 from . import production_services as services
@@ -116,11 +120,19 @@ class ProductionInstructionSerializer(BaseModelSerializer):
             self._completion_cache[key] = services.instruction_completion(instance)
         return self._completion_cache[key]
 
+    def _progress(self, instance):
+        if not hasattr(self, "_progress_cache"):
+            self._progress_cache = {}
+        key = str(instance.pk)
+        if key not in self._progress_cache:
+            self._progress_cache[key] = services.instruction_progress(instance)
+        return self._progress_cache[key]
+
     def get_cumulative(self, instance):
-        return services.instruction_progress(instance)["cumulative"]
+        return self._progress(instance)["cumulative"]
 
     def get_balance(self, instance):
-        return services.instruction_progress(instance)["balance"]
+        return self._progress(instance)["balance"]
 
     def get_totalProduced(self, instance):
         return self._completion(instance)["totalProduced"]
@@ -192,6 +204,50 @@ class DailyProductionEntrySerializer(BaseModelSerializer):
             )
         else:
             raise serializers.ValidationError({"enteredByEmployeeId": ["An active employee is required to record daily production."]})
+
+        # Guard: cumulative meters must not exceed the instruction's order_meter.
+        instruction = attrs.get("instruction", getattr(self.instance, "instruction", None))
+        meters = attrs.get("meters", getattr(self.instance, "meters", None) if self.instance else None)
+        if instruction is not None and meters is not None and D(instruction.order_meter) > 0:
+            already = (
+                DailyProductionEntry.objects.filter(
+                    instruction=instruction, deleted_at__isnull=True
+                )
+                .exclude(pk=self.instance.pk if self.instance else None)
+                .aggregate(total=Sum("meters"))["total"]
+                or Decimal("0")
+            )
+            if already + D(meters) > D(instruction.order_meter):
+                raise serializers.ValidationError(
+                    {
+                        "meters": [
+                            f"Cumulative meters ({already + D(meters)}) would exceed order meters ({instruction.order_meter})."
+                        ]
+                    }
+                )
+
+        # Guard: good + reject + reprocess must not exceed total meters for this entry.
+        good_meter = attrs.get("good_meter")
+        if good_meter is None:
+            good_meter = getattr(self.instance, "good_meter", None) if self.instance else None
+        good_meter = D(good_meter or 0)
+        reject_meter = attrs.get("reject_meter")
+        if reject_meter is None:
+            reject_meter = getattr(self.instance, "reject_meter", None) if self.instance else None
+        reject_meter = D(reject_meter or 0)
+        reprocess_meter = attrs.get("reprocess_meter")
+        if reprocess_meter is None:
+            reprocess_meter = getattr(self.instance, "reprocess_meter", None) if self.instance else None
+        reprocess_meter = D(reprocess_meter or 0)
+        if good_meter + reject_meter + reprocess_meter > D(meters):
+            raise serializers.ValidationError(
+                {
+                    "good_meter": [
+                        f"good_meter ({good_meter}) + reject_meter ({reject_meter}) + reprocess_meter ({reprocess_meter}) "
+                        f"cannot exceed total meters ({meters})."
+                    ]
+                }
+            )
         return attrs
 
 

@@ -185,6 +185,9 @@ class Lead(TenantModel, LegacyIdMixin):
     created_on = models.DateField(auto_now_add=True)
     #: Values captured by a dynamic form (db.md §9.1).
     custom_values = models.JSONField(default=dict, blank=True)
+    #: Created to exercise the system, not a real enquiry. Kept (never
+    #: deleted) but left out of the business registers and their totals.
+    is_test_data = models.BooleanField(default=False)
 
     class Meta:
         db_table = "crm_leads"
@@ -212,6 +215,43 @@ class Lead(TenantModel, LegacyIdMixin):
 
     def __str__(self):
         return f"{self.lead_number} {self.name}"
+
+    def save(self, *args, **kwargs):
+        self.custom_values = lift_attribution(self.custom_values)
+        super().save(*args, **kwargs)
+
+
+#: Broker / salesperson terms the lead form captures. The form nests its
+#: answers under ``custom_values["fields"]``, but commissions, incentives and
+#: reports read them at the top level, so they are mirrored there on save.
+LEAD_ATTRIBUTION_KEYS = (
+    "broker_id", "broker_name", "broker_code",
+    "commission_basis", "commission_rate", "commission_notes",
+    "salesperson_id", "salesperson_name", "salesperson_notes",
+    "salesperson_commission_basis", "salesperson_commission_rate",
+    "expected_meters", "expected_takas", "fabric_quality",
+)
+
+
+def lift_attribution(values):
+    """Copy the attribution keys from ``values["fields"]`` to the top level.
+
+    The form is where these are edited, so its copy wins; a key cleared on the
+    form is cleared at the top level too.
+    """
+    if not isinstance(values, dict):
+        return values
+    fields = values.get("fields")
+    if not isinstance(fields, dict):
+        return values
+    lifted = dict(values)
+    for key in LEAD_ATTRIBUTION_KEYS:
+        if key in fields:
+            if fields[key] in (None, ""):
+                lifted.pop(key, None)
+            else:
+                lifted[key] = fields[key]
+    return lifted
 
 
 class LeadSubResource(TenantModel):

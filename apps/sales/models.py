@@ -45,16 +45,16 @@ NON_RESERVING_STAGES = [
 ]
 PAYMENT_STATUSES = ["Unpaid", "Partially Paid", "Paid"]
 PROFORMA_STATUSES = ["Draft", "Sent", "Accepted", "Converted", "Expired", "Cancelled"]
-CHALLAN_STATUSES = ["Draft", "Dispatched", "In Transit", "Delivered", "Cancelled"]
+CHALLAN_STATUSES = ["Draft", "Dispatched", "In Transit", "Out for Delivery", "Delivered", "Cancelled"]
 #: Challan statuses after the stock has left -- the ones that may be billed.
-CHALLAN_BILLABLE_STATUSES = ["Dispatched", "In Transit", "Delivered"]
+CHALLAN_BILLABLE_STATUSES = ["Dispatched", "In Transit", "Out for Delivery", "Delivered"]
 INVOICE_STATUSES = ["Draft", "Unpaid", "Partially Paid", "Paid", "Cancelled"]
 # The strings the UI's <select> actually emits (api.md §0: where code and
 # spec disagree, the frontend code is the fact). PaymentInPage, PaymentOutPage,
 # PurchaseBillsPage and SalesInvoicesView between them offer all of these.
 PAYMENT_MODES = [
     "Cash", "Bank", "UPI", "Cheque", "Card",
-    "Bank Transfer", "Bank Wire", "ACH", "Corporate Card",
+    "Bank Transfer", "Bank Wire", "Bank Wire Direct", "ACH", "Corporate Card",
 ]
 
 
@@ -193,13 +193,35 @@ class QuotationActivity(models.Model):
 # Sales orders (api.md §5.4)
 # ---------------------------------------------------------------------------
 def order_lead(order):
-    """The CRM lead behind a sales order: its own link, else its quotation's."""
+    """The CRM lead behind a sales order or document: its own link, quotation's, deal's, or linked document's."""
     if order is None:
         return None
-    if getattr(order, "crm_lead_id", None):
+    if getattr(order, "crm_lead_id", None) and getattr(order, "crm_lead", None):
         return order.crm_lead
     quotation = getattr(order, "quotation", None)
-    return quotation.crm_lead if quotation is not None else None
+    if quotation is not None:
+        if getattr(quotation, "crm_lead_id", None) and getattr(quotation, "crm_lead", None):
+            return quotation.crm_lead
+        if getattr(quotation, "crm_deal_id", None) and getattr(quotation, "crm_deal", None) and getattr(quotation.crm_deal, "lead_id", None):
+            return quotation.crm_deal.lead
+    if getattr(order, "crm_deal_id", None) and getattr(order, "crm_deal", None) and getattr(order.crm_deal, "lead_id", None):
+        return order.crm_deal.lead
+    # Linked sales order / delivery challan on invoice or challan
+    so = getattr(order, "sales_order", None)
+    if so is not None and so is not order:
+        so_lead = order_lead(so)
+        if so_lead is not None:
+            return so_lead
+    dc = getattr(order, "delivery_challan", None)
+    if dc is not None and dc is not order:
+        dc_lead = order_lead(dc)
+        if dc_lead is not None:
+            return dc_lead
+    # Only an explicit link counts. Never fall back to "the customer's latest
+    # lead": that pinned every invoice of a customer -- old and unrelated ones
+    # too -- on whichever lead was converted to it last, and each of them then
+    # accrued that lead's broker commission.
+    return None
 
 
 class SalesOrder(DocumentHeader):
@@ -572,6 +594,18 @@ class PaymentAllocation(TenantModel):
 DISCOUNT_OPEN_STATUSES = ["Draft", "Submitted", "Under Review"]
 DISCOUNT_STATUSES = DISCOUNT_OPEN_STATUSES + ["Approved", "Rejected", "Cancelled"]
 
+#: Discount types that may be granted when a customer receipt is recorded.
+#: Kept as a model-level constant so both the receipt form and the posting
+#: service agree on the allowed values. Historical rows (created before this
+#: field existed) are "Early Payment Discount", the only type that existed.
+DISCOUNT_TYPES = [
+    "Early Payment Discount",
+    "Special Discount",
+    "Settlement Discount",
+    "Other Approved Discount",
+]
+DISCOUNT_TYPE_DEFAULT = DISCOUNT_TYPES[0]
+
 
 class EarlyPaymentDiscountRequest(TenantModel):
     """A customer's request for a discount for paying an invoice early.
@@ -609,6 +643,11 @@ class EarlyPaymentDiscountRequest(TenantModel):
     #: due_date - payment_date; zero or negative when the payment was not early.
     days_paid_early = models.IntegerField(default=0)
 
+    #: Why the discount was granted (see DISCOUNT_TYPES). Stored so a settlement
+    #: or special discount is not mislabelled as an early-payment discount.
+    discount_type = models.TextField(
+        choices=choices(DISCOUNT_TYPES), default=DISCOUNT_TYPE_DEFAULT
+    )
     requested_amount = models.DecimalField(max_digits=18, decimal_places=2)
     proposed_amount = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
     approved_amount = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
@@ -836,9 +875,11 @@ class BrokerCommission(TenantModel, LegacyIdMixin):
     """Broker commission ledger per invoice (PDF §12)."""
 
     STATUSES = [
+        ("Awaiting Collection", "Awaiting Collection"),
         ("Accrued", "Accrued"),
         ("Approved", "Approved"),
         ("Payable", "Payable"),
+        ("Partially Paid", "Partially Paid"),
         ("Paid", "Paid"),
         ("Hold", "Hold"),
         ("Cancelled", "Cancelled"),
@@ -875,7 +916,7 @@ class BrokerCommission(TenantModel, LegacyIdMixin):
     rate = models.DecimalField(max_digits=9, decimal_places=2, default=0)
     commission_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     paid_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
-    status = models.TextField(choices=STATUSES, default="Accrued")
+    status = models.TextField(choices=STATUSES, default="Awaiting Collection")
     approved_by = models.ForeignKey(
         "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
@@ -886,10 +927,22 @@ class BrokerCommission(TenantModel, LegacyIdMixin):
     )
     payment_reference = models.TextField(null=True, blank=True)
     notes = models.TextField(null=True, blank=True)
+    #: Raised off a test lead (``crm.Lead.is_test_data``): kept, but left out
+    #: of the commission registers, statements and analytics.
+    is_test_data = models.BooleanField(default=False)
 
     class Meta:
         db_table = "broker_commissions"
         ordering = ["-invoice_date", "-created_at"]
+        constraints = [
+            # One live commission per invoice and broker; re-processing an
+            # invoice or a payment updates it rather than adding another.
+            models.UniqueConstraint(
+                fields=["client", "invoice", "broker"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_broker_commission_invoice",
+            )
+        ]
         indexes = [
             models.Index(fields=["client", "broker", "status"], name="ix_broker_comm_status"),
             models.Index(fields=["client", "invoice"], name="ix_broker_comm_inv"),
@@ -897,4 +950,3 @@ class BrokerCommission(TenantModel, LegacyIdMixin):
 
     def __str__(self):
         return f"{self.commission_number or self.id} ({self.status}): {self.commission_amount}"
-
