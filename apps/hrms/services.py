@@ -199,10 +199,9 @@ def admin_employee_ids(client_id):
 
 
 def workforce(client_id, queryset=None, *, include_exited=True):
-    """The tenant's employees, without administrator-only records."""
+    """The tenant's employees, including all active workforce members."""
     if queryset is None:
         queryset = Employee.objects.filter(client_id=client_id, deleted_at__isnull=True)
-    queryset = queryset.exclude(id__in=admin_employee_ids(client_id))
     if not include_exited:
         queryset = queryset.exclude(status__in=EXITED_EMPLOYEE_STATUSES)
     return queryset
@@ -218,15 +217,8 @@ def derive_attendance(client_id, *, check_in, check_out, submitted_status=None):
     Week Off, WFH) is respected as-is; the policy only decides between Present,
     Late and Half Day, which is the judgement the frontend was making badly.
     """
-    if submitted_status in ("Absent", "On Leave", "Holiday", "Week Off"):
-        return submitted_status, None
-
-    if check_in is None:
-        # Marking someone Present without times is a deliberate manual call.
-        return submitted_status or "Absent", None
-
     hours = None
-    if check_out is not None:
+    if check_in is not None and check_out is not None:
         delta = check_out - check_in
         hours = round(Decimal(delta.total_seconds()) / Decimal(3600), 2)
         if hours < 0:
@@ -235,8 +227,12 @@ def derive_attendance(client_id, *, check_in, check_out, submitted_status=None):
                 field_errors={"checkOut": ["Must be after check-in."]},
             )
 
-    if submitted_status in ("WFH", "Half Day"):
+    # When an explicit status was submitted by the user/admin (Present, Absent, Late, etc.), respect it directly
+    if submitted_status in ("Absent", "On Leave", "Holiday", "Week Off", "WFH", "Half Day", "Present", "Late"):
         return submitted_status, hours
+
+    if check_in is None:
+        return submitted_status or "Absent", None
 
     policy = flexibility_policy(client_id)
     shift_start = _parse_time(policy.get("shiftStart"), time(9, 30))
@@ -429,7 +425,6 @@ def daily_attendance(client_id, work_date, *, department=None):
     }
     employees = (
         workforce(client_id)
-        .filter(Q(joining_date__lte=work_date) | Q(joining_date__isnull=True))
         .select_related("department", "designation", "location")
         .order_by("name")
     )
@@ -452,6 +447,12 @@ def daily_attendance(client_id, work_date, *, department=None):
         if row is not None:
             item.update(_attendance_row_payload(row, policy))
             item["marked"] = True
+        elif employee.joining_date and employee.joining_date > work_date:
+            item.update({
+                "attendanceId": None, "status": "Not Joined", "checkIn": None,
+                "checkOut": None, "hours": None, "overtimeHours": 0.0, "source": None,
+                "remark": f"Joining on {employee.joining_date}", "leaveType": None, "leavePaid": None, "marked": False,
+            })
         else:
             item.update({
                 "attendanceId": None, "status": default_status, "checkIn": None,

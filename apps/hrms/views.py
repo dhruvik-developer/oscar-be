@@ -3199,6 +3199,11 @@ class PayslipViewSet(TenantModelViewSet):
 
         payslip = super().perform_update(serializer)
 
+        std_salary = serializer.validated_data.get("standardSalary") or serializer.validated_data.get("standard_salary")
+        if std_salary is not None:
+            payslip.standard_salary = std_salary
+            payslip.save(update_fields=["standard_salary", "updated_at"])
+
         override = serializer.validated_data.get("earnedSalaryOverride")
 
         services.recompute_payslip(
@@ -6230,8 +6235,7 @@ class SalespersonIncentiveViewSet(TenantModelViewSet):
         """
 
         import calendar
-
-
+        import re
 
         from apps.pms import production_services
 
@@ -6243,9 +6247,13 @@ class SalespersonIncentiveViewSet(TenantModelViewSet):
 
         fy_start = today.year if today.month >= 4 else today.year - 1
 
-        quarter = int(request.data.get("quarter") or ((today.month - 4) % 12) // 3 + 1)
+        raw_q = str(request.data.get("quarter") or "")
+        match_q = re.search(r"[1-4]", raw_q)
+        quarter = int(match_q.group(0)) if match_q else (((today.month - 4) % 12) // 3 + 1)
 
-        year = int(request.data.get("year") or fy_start)
+        raw_y = str(request.data.get("year") or "")
+        match_y = re.search(r"\d{4}", raw_y)
+        year = int(match_y.group(0)) if match_y else fy_start
 
         if quarter not in (1, 2, 3, 4):
 

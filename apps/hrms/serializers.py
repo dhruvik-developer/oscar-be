@@ -123,6 +123,8 @@ class DepartmentSerializer(BaseModelSerializer):
 
 
 class DesignationSerializer(BaseModelSerializer):
+    name = serializers.CharField(required=False)
+    title = serializers.CharField(source="name", required=False)
     department = serializers.CharField(source="department.name", read_only=True)
     departmentId = TenantPrimaryKeyRelatedField(
         source="department", model="hrms.Department", required=False, allow_null=True
@@ -130,7 +132,12 @@ class DesignationSerializer(BaseModelSerializer):
 
     class Meta:
         model = Designation
-        fields = ["id", "name", "level", "department", "departmentId", "created_at"]
+        fields = ["id", "name", "title", "level", "department", "departmentId", "created_at"]
+
+    def validate(self, attrs):
+        if not attrs.get("name") and self.initial_data.get("title"):
+            attrs["name"] = self.initial_data["title"]
+        return super().validate(attrs)
 
 
 class LocationSerializer(BaseModelSerializer):
@@ -507,6 +514,25 @@ class LeaveRequestSerializer(BaseModelSerializer):
         if start and end and end < start:
             raise serializers.ValidationError({"toDate": ["Must be on or after the start date."]})
 
+        request = self.context.get("request")
+        client_id = getattr(request, "client_id", None) or getattr(
+            getattr(request, "user", None), "client_id", None
+        )
+        emp = attrs.get("employee") or getattr(self.instance, "employee", None)
+        if client_id and emp and start and end:
+            overlap = LeaveRequest.objects.filter(
+                client_id=client_id,
+                employee=emp,
+                deleted_at__isnull=True,
+                status__in=["pending", "approved", "Pending", "Approved"],
+                from_date__lte=end,
+                to_date__gte=start,
+            )
+            if self.instance:
+                overlap = overlap.exclude(pk=self.instance.pk)
+            if overlap.exists():
+                raise serializers.ValidationError({"fromDate": ["A leave request already exists covering this date range for this employee."]})
+
         type_name = attrs.pop("leaveTypeName", None)
         if self.instance is None:
             request = self.context.get("request")
@@ -649,7 +675,7 @@ class PayslipSerializer(BaseModelSerializer):
     role = serializers.CharField(source="employee.designation.name", read_only=True)
     department = serializers.CharField(source="employee.department.name", read_only=True)
     month = serializers.DateField(source="period_month", read_only=True)
-    standardSalary = MoneyField(source="standard_salary", read_only=True)
+    standardSalary = MoneyField(source="standard_salary", required=False)
     earnedSalary = MoneyField(source="earned_salary", read_only=True)
     earnedSalaryOverride = MoneyField(write_only=True, required=False, allow_null=True)
     additionalEarnings = MoneyField(source="additional_earnings", required=False)
@@ -727,10 +753,22 @@ class PayrollRunSerializer(BaseModelSerializer):
 
 
 class ProcessPayrollSerializer(BaseSerializer):
-    month = serializers.DateField()
+    month = serializers.CharField()
     employeeIds = serializers.ListField(
         child=serializers.CharField(), required=False, default=list
     )
+
+    def validate_month(self, value):
+        from datetime import datetime, date
+        if isinstance(value, date):
+            return value.replace(day=1)
+        text = str(value).strip()
+        try:
+            if len(text) == 7:  # YYYY-MM
+                return datetime.strptime(text, "%Y-%m").date().replace(day=1)
+            return datetime.strptime(text[:10], "%Y-%m-%d").date().replace(day=1)
+        except ValueError:
+            raise serializers.ValidationError("Expected format YYYY-MM or YYYY-MM-DD.")
 
 
 class SalaryAdvanceSerializer(BaseModelSerializer):

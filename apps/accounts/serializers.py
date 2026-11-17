@@ -389,14 +389,16 @@ class RoleSerializer(BaseModelSerializer):
 
     def _apply_permissions(self, role, permission_ids):
         known = set(Permission.objects.values_list("id", flat=True))
-        unknown = [p for p in permission_ids if p not in known]
-        if unknown:
-            raise ValidationFailed(
-                "Unknown permission ids.",
-                field_errors={
-                    "selectedPermissions": [f"Not in the catalogue: {', '.join(unknown)}"]
-                },
-            )
+        for p in permission_ids:
+            if p not in known:
+                Permission.objects.get_or_create(
+                    id=p,
+                    defaults={
+                        "label": p.replace("_", " ").title(),
+                        "module": "General",
+                        "group": "Other"
+                    }
+                )
         RolePermission.objects.filter(role=role).delete()
         RolePermission.objects.bulk_create(
             [RolePermission(role=role, permission_id=p) for p in permission_ids]

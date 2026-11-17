@@ -512,6 +512,7 @@ class ProductionLifecycleTests(TestCase):
         """Test explicit source_po FK on ProductionInstruction correctly identifies source PO."""
         from apps.pms.lifecycle_services import source_purchase_order, latest_instruction_for_po
 
+        self.make_instruction()
         self.pi.source_po = self.po
         self.pi.order_reference = "DIFFERENT-REF"
         self.pi.save(update_fields=["source_po", "order_reference"])
@@ -525,6 +526,10 @@ class ProductionLifecycleTests(TestCase):
     def test_dynamic_rate_calculation_from_pick_charge(self):
         """Test final PO line item rate calculation using PPI * Pick Rate formula."""
         from apps.pms.models_loom import LoomQuality, YarnMaster
+
+        self.make_instruction()
+        self.produce(1000)
+        self.qc(1000)
 
         warp_ym = YarnMaster.objects.create(
             client=self.tenant, name="75D Warp Lifecycle", denier=75, rate=Decimal("180.00")
