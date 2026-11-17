@@ -90,4 +90,10 @@ public_urlpatterns = [
         public_views.PublicUploadUrlView.as_view(),
         name="public-career-upload-url",
     ),
+    # Public Batch Passport (QR code scanning without login)
+    path(
+        "batches/<str:token>/",
+        public_views.PublicBatchPassportView.as_view(),
+        name="public-batch-passport",
+    ),
 ]

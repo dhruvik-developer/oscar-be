@@ -1814,6 +1814,25 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
     def outstanding(self, request, pk=None):
         return Response(services.invoice_outstanding(self.get_object()))
 
+    @action(detail=True, methods=["post"], url_path="apply-advance")
+    @transaction.atomic
+    def apply_advance(self, request, pk=None):
+        """Apply unallocated customer advance money against this invoice."""
+        invoice = self.get_object()
+        amount = round2(request.data.get("amount"))
+        if amount <= ZERO:
+            raise ValidationFailed(
+                "Enter an amount to apply.",
+                field_errors={"amount": ["Must be greater than zero."]},
+            )
+        invoice = services.apply_customer_advance(invoice, amount, user=request.user)
+        return Response(self.get_serializer(invoice).data)
+
+    @action(detail=True, methods=["get"], url_path="advance-balance")
+    def advance_balance(self, request, pk=None):
+        invoice = self.get_object()
+        return Response(services.customer_advance_balance(request.client_id, invoice.party_id))
+
     @action(detail=False, methods=["get"], url_path="payment-term-options")
     def payment_term_options(self, request):
         from .early_payment import PAYMENT_TERM_OPTIONS

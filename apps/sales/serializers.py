@@ -302,6 +302,18 @@ class SalesInvoiceSerializer(DocumentSerializer):
     challanId = serializers.CharField(source="delivery_challan_id", read_only=True)
     challanNumber = serializers.CharField(source="delivery_challan.challan_number", read_only=True)
     settlementDiscount = MoneyField(source="settlement_discount", read_only=True)
+    customerId = serializers.SerializerMethodField()
+    customer = serializers.SerializerMethodField()
+    customerName = serializers.SerializerMethodField()
+
+    def get_customerId(self, invoice):
+        return str(invoice.party_id) if invoice.party_id else None
+
+    def get_customer(self, invoice):
+        return invoice.party_name or (invoice.party.name if getattr(invoice, "party", None) else "")
+
+    def get_customerName(self, invoice):
+        return invoice.party_name or (invoice.party.name if getattr(invoice, "party", None) else "")
 
     #: ``Overdue`` is layered on at read time, never stored (db.md §12).
     displayStatus = serializers.SerializerMethodField()
@@ -309,7 +321,7 @@ class SalesInvoiceSerializer(DocumentSerializer):
     class Meta:
         model = SalesInvoice
         fields = HEADER_FIELDS + [
-            "invoice_number", "status", "displayStatus", "due_date", "settlementDiscount",
+            "invoice_number", "status", "displayStatus", "due_date", "settlementDiscount", "customerId", "customer", "customerName",
             "sales_order", "salesOrderId", "salesOrderNumber", "delivery_challan", "challanId", "challanNumber", "proforma_invoice", "location",
             "irn", "eway_bill_number", "ewayBillNumber",
             "ack_no", "ackNo", "ack_date", "ackDate", "signed_qrcode", "signedQrcode",
@@ -522,8 +534,9 @@ class PaymentInSerializer(BaseModelSerializer):
     discounts = serializers.SerializerMethodField()
     discountTotal = serializers.SerializerMethodField()
     totalSettled = serializers.SerializerMethodField()
+    allocatedAmount = serializers.DecimalField(source="allocated_amount", read_only=True, max_digits=18, decimal_places=2)
     referenceNumber = serializers.CharField(source="reference_number", required=False, allow_null=True, allow_blank=True)
-    transactionReference = serializers.CharField(source="transaction_reference", read_only=True, allow_null=True)
+    transactionReference = serializers.CharField(source="transaction_reference", required=False, allow_null=True, allow_blank=True)
     #: Write-only: the target invoice(s) this payment settles.
     invoiceId = serializers.CharField(required=False, allow_null=True, write_only=True)
     allocationsInput = serializers.ListField(
@@ -538,13 +551,18 @@ class PaymentInSerializer(BaseModelSerializer):
         fields = [
             "id", "payment_number", "customerId", "customerName", "date", "amount",
             "mode", "bankAccountId", "reference_number", "referenceNumber", "transactionReference", "notes",
-            "allocated_amount", "unallocatedAmount", "allocations", "discounts",
+            "allocated_amount", "allocatedAmount", "unallocatedAmount", "allocations", "discounts",
             "discountTotal", "totalSettled", "status",
             "invoiceId", "allocationsInput", "discountAllocationsInput", "created_at", "updated_at",
         ]
         read_only_fields = [
             "payment_number", "allocated_amount", "status", "created_at", "updated_at",
         ]
+
+    def validate_amount(self, value):
+        if value is not None and value <= 0:
+            raise serializers.ValidationError("Payment amount must be greater than zero.")
+        return value
 
 
     def to_internal_value(self, data):
@@ -556,6 +574,8 @@ class PaymentInSerializer(BaseModelSerializer):
                 mutable_data["customerId"] = str(inv.party_id)
         if "referenceNumber" in mutable_data and "reference_number" not in mutable_data:
             mutable_data["reference_number"] = mutable_data["referenceNumber"]
+        if "transactionReference" in mutable_data and "transaction_reference" not in mutable_data:
+            mutable_data["transaction_reference"] = mutable_data["transactionReference"]
         return super().to_internal_value(mutable_data)
 
     def get_allocations(self, payment):

@@ -88,7 +88,12 @@ class TenantMiddleware:
     def __call__(self, request):
         clear_current_client_id(push_to_db=False)
         try:
-            return self.get_response(request)
+            response = self.get_response(request)
+            if request.path.startswith("/api/"):
+                response["Cache-Control"] = "no-cache, no-store, must-revalidate"
+                response["Pragma"] = "no-cache"
+                response["Expires"] = "0"
+            return response
         finally:
             clear_current_client_id()
 

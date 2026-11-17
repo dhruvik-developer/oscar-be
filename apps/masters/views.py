@@ -104,8 +104,8 @@ class PartyViewSet(TenantModelViewSet):
     def get_aggregates(self, queryset):
         rows = queryset.aggregate(
             total=Count("id"),
-            customers=Count("id", filter=Q(type__in=["Customer", "Both"])),
-            vendors=Count("id", filter=Q(type__in=["Vendor", "Both"])),
+            customers=Count("id", filter=Q(type__iexact="Customer") | Q(type__iexact="Both")),
+            vendors=Count("id", filter=Q(type__iexact="Vendor") | Q(type__iexact="Both")),
             receivable=money_sum("balance"),
         )
         return rows
@@ -142,14 +142,14 @@ class PartyViewSet(TenantModelViewSet):
                     "leads", filter=Q(leads__deleted_at__isnull=True), distinct=True
                 )
             )
-        ).filter(type__in=["Customer", "Both"])
+        ).filter(Q(type__iexact="Customer") | Q(type__iexact="Both"))
         page = self.paginate_queryset(queryset)
         return self.get_paginated_response(self.get_serializer(page, many=True).data)
 
     @action(detail=False, methods=["get"])
     def vendors(self, request):
         queryset = self.filter_queryset(self.get_queryset()).filter(
-            type__in=["Vendor", "Both", "Processor"]
+            Q(type__iexact="Vendor") | Q(type__iexact="Both") | Q(type__iexact="Processor")
         )
         page = self.paginate_queryset(queryset)
         return self.get_paginated_response(self.get_serializer(page, many=True).data)
@@ -162,6 +162,16 @@ class PartyViewSet(TenantModelViewSet):
         )
         page = self.paginate_queryset(queryset)
         return self.get_paginated_response(self.get_serializer(page, many=True).data)
+
+    @action(detail=True, methods=["get"], url_path="advance-balance")
+    def advance_balance(self, request, pk=None):
+        party = self.get_object()
+        if party.type in ("Customer", "Both"):
+            from apps.sales.services import customer_advance_balance
+            return Response(customer_advance_balance(request.client_id, party.id))
+        else:
+            from apps.purchase.services import vendor_advance_balance
+            return Response(vendor_advance_balance(request.client_id, party.id))
 
     @action(detail=True, methods=["get"])
     def ledger(self, request, pk=None):

@@ -126,6 +126,8 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
         "bulk_delete": ["delete_lead"],
         "mark_lost": ["edit_lead"],
         "bulk_mark_lost": ["edit_lead"],
+        "reopen": ["edit_lead"],
+        "bulk_reopen": ["edit_lead"],
     }
 
     def filter_queryset(self, queryset):
@@ -407,6 +409,117 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
             total_moved += len(moved_deals)
             marked.append(str(lead.id))
         return Response({"marked": marked, "markedCount": len(marked), "dealsMoved": total_moved})
+
+    @action(detail=True, methods=["post"], url_path="reopen")
+    @transaction.atomic
+    def reopen(self, request, pk=None):
+        """Move a lost lead back to an active stage and restore its deals."""
+        lead = self.get_object()
+        stage_id = (request.data or {}).get("stageId") or (request.data or {}).get("stage_id")
+        target_stage = None
+        if stage_id:
+            target_stage = Stage.objects.filter(
+                client_id=self.get_client_id(), pk=stage_id, is_active=True, deleted_at__isnull=True
+            ).first()
+        if target_stage is None:
+            target_stage = Stage.objects.filter(
+                client_id=self.get_client_id(),
+                is_lost=False,
+                is_active=True,
+                deleted_at__isnull=True,
+            ).order_by("sequence").first()
+
+        if target_stage is None:
+            raise ValidationFailed("No active pipeline stage available to restore lead.")
+
+        previous_stage = lead.stage.name if lead.stage_id else ""
+        lead.stage = target_stage
+        lead.lost_reason = None
+        lead.save(update_fields=["stage", "lost_reason", "updated_at"])
+
+        restored_deals = []
+        target_deal_stage = (request.data or {}).get("dealStage") or "Draft"
+        for deal in lead.deals.filter(deleted_at__isnull=True, stage="Lost"):
+            deal.stage = target_deal_stage
+            deal.closed_at = None
+            deal.lost_reason = None
+            deal.save(update_fields=["stage", "closed_at", "lost_reason", "updated_at"])
+            DealActivity.objects.create(
+                deal=deal,
+                type="stage_change",
+                description=f"Deal reopened to {target_deal_stage} as lead {lead.lead_number} was restored to {target_stage.name}.",
+                actor=request.user if getattr(request.user, "is_authenticated", False) else None,
+            )
+            restored_deals.append(str(deal.id))
+
+        lead.refresh_from_db()
+        services.annotate_lead_counters(request.client_id, [lead])
+        self.write_audit(
+            "reopen_lead",
+            lead,
+            description=f"Restored to active stage {target_stage.name} (from {previous_stage or 'Lost'})",
+        )
+        return Response(
+            {
+                "lead": LeadSerializer(lead).data,
+                "restoredDeals": restored_deals,
+                "dealsRestored": len(restored_deals),
+                "message": f"Lead '{lead.name}' restored to {target_stage.name}.",
+            }
+        )
+
+    @action(detail=False, methods=["post"], url_path="bulk-reopen")
+    @transaction.atomic
+    def bulk_reopen(self, request):
+        """Move multiple lost leads back to active pipeline."""
+        ids = (request.data or {}).get("ids") or []
+        if not isinstance(ids, list) or not ids:
+            raise ValidationFailed("Select at least one lead to restore.")
+
+        stage_id = (request.data or {}).get("stageId") or (request.data or {}).get("stage_id")
+        target_stage = None
+        if stage_id:
+            target_stage = Stage.objects.filter(
+                client_id=self.get_client_id(), pk=stage_id, is_active=True, deleted_at__isnull=True
+            ).first()
+        if target_stage is None:
+            target_stage = Stage.objects.filter(
+                client_id=self.get_client_id(),
+                is_lost=False,
+                is_active=True,
+                deleted_at__isnull=True,
+            ).order_by("sequence").first()
+
+        if target_stage is None:
+            raise ValidationFailed("No active pipeline stage available to restore lead.")
+
+        target_deal_stage = (request.data or {}).get("dealStage") or "Draft"
+        leads = list(self.get_queryset().filter(pk__in=ids))
+        restored_lead_ids = []
+        all_restored_deals = []
+
+        for lead in leads:
+            lead.stage = target_stage
+            lead.lost_reason = None
+            lead.save(update_fields=["stage", "lost_reason", "updated_at"])
+            restored_lead_ids.append(str(lead.id))
+
+            for deal in lead.deals.filter(deleted_at__isnull=True, stage="Lost"):
+                deal.stage = target_deal_stage
+                deal.closed_at = None
+                deal.lost_reason = None
+                deal.save(update_fields=["stage", "closed_at", "lost_reason", "updated_at"])
+                all_restored_deals.append(str(deal.id))
+
+        return Response(
+            {
+                "restoredLeadIds": restored_lead_ids,
+                "leadsRestored": len(restored_lead_ids),
+                "restoredDeals": all_restored_deals,
+                "dealsRestored": len(all_restored_deals),
+                "message": f"{len(restored_lead_ids)} lead(s) restored to {target_stage.name}.",
+            }
+        )
 
     @action(detail=False, methods=["get"])
     def stats(self, request):
@@ -1331,10 +1444,40 @@ class DealViewSet(TenantModelViewSet):
             self.request.user.client, "DEAL"
         )
         deal = super().perform_create(serializer)
+        if deal.stage == "Lost" and deal.lead:
+            self._sync_lead_lost_stage(deal)
         DealActivity.objects.create(
             deal=deal, type="created", description="Deal created", actor=self.request.user
         )
         return deal
+
+    def _sync_lead_lost_stage(self, deal):
+        if not deal or not deal.lead:
+            return
+        lost_stage = Stage.objects.filter(
+            client_id=self.get_client_id(),
+            is_lost=True,
+            deleted_at__isnull=True,
+        ).first() or Stage.objects.filter(
+            client_id=self.get_client_id(),
+            name__iexact="Lost",
+            deleted_at__isnull=True,
+        ).first()
+        if lost_stage is None:
+            last_seq = Stage.objects.filter(
+                client_id=self.get_client_id(), deleted_at__isnull=True
+            ).aggregate(m=Max("sequence"))["m"] or 0
+            lost_stage = Stage.objects.create(
+                client_id=self.get_client_id(),
+                name="Lost",
+                sequence=last_seq + 1,
+                is_lost=True,
+                is_active=True,
+            )
+        deal.lead.stage = lost_stage
+        if deal.lost_reason:
+            deal.lead.lost_reason = deal.lost_reason
+        deal.lead.save(update_fields=["stage", "lost_reason", "updated_at"])
 
     def perform_update(self, serializer):
         previous = serializer.instance.stage
@@ -1343,6 +1486,20 @@ class DealViewSet(TenantModelViewSet):
             if deal.stage in ("Won", "Lost") and deal.closed_at is None:
                 deal.closed_at = timezone.now()
                 deal.save(update_fields=["closed_at", "updated_at"])
+            if deal.stage == "Lost" and deal.lead:
+                self._sync_lead_lost_stage(deal)
+            elif previous == "Lost" and deal.stage != "Lost":
+                deal.closed_at = None
+                deal.lost_reason = None
+                deal.save(update_fields=["closed_at", "lost_reason", "updated_at"])
+                if deal.lead and deal.lead.stage and deal.lead.stage.is_lost:
+                    active_stage = Stage.objects.filter(
+                        client_id=self.get_client_id(), is_lost=False, is_active=True, deleted_at__isnull=True
+                    ).order_by("sequence").first()
+                    if active_stage:
+                        deal.lead.stage = active_stage
+                        deal.lead.lost_reason = None
+                        deal.lead.save(update_fields=["stage", "lost_reason", "updated_at"])
             DealActivity.objects.create(
                 deal=deal,
                 type="stage_change",
