@@ -661,7 +661,7 @@ def generate_final_job_work_po(instruction, *, user=None, custom_data=None):
     instruction = instruction.__class__.objects.select_for_update().get(pk=instruction.pk)
     custom_data = custom_data or {}
 
-    allowed_statuses = ("PO Pending", "Verified", "PO Created", "Running", "In Progress", "Completed", "Draft")
+    allowed_statuses = ("PO Pending", "Verified", "PO Created", "Running", "In Progress", "Completed", "Draft", "Partially Completed")
     action = custom_data.get("action")
     if instruction.status not in allowed_statuses and not custom_data.get("force"):
         raise ValidationFailed(
@@ -674,8 +674,22 @@ def generate_final_job_work_po(instruction, *, user=None, custom_data=None):
 
     completion = instruction_completion(instruction)
     raw_billable = custom_data.get("billableQty") or custom_data.get("acceptedQty")
-    accepted_qty = round4(D(str(raw_billable))) if raw_billable is not None else round4(D(completion["acceptedQty"]))
+    if (raw_billable is None or D(str(raw_billable)) <= ZERO) and custom_data.get("items"):
+        item_qty_sum = sum((D(str(it.get("billableQty") or it.get("qty") or 0)) for it in custom_data["items"]), ZERO)
+        if item_qty_sum > ZERO:
+            raw_billable = item_qty_sum
+
+    if raw_billable is not None:
+        accepted_qty = round4(D(str(raw_billable)))
+    else:
+        accepted_qty = round4(D(completion.get("acceptedQty") or completion.get("totalProduced") or 0))
+
     raw_rate = custom_data.get("rate") or custom_data.get("agreedJobRate")
+    if (raw_rate is None or D(str(raw_rate)) <= ZERO) and custom_data.get("items"):
+        for it in custom_data["items"]:
+            if it.get("rate"):
+                raw_rate = it["rate"]
+                break
     rate = D(str(raw_rate)) if raw_rate is not None else D(instruction.agreed_rate or instruction.agreed_job_rate or 0)
     if rate <= ZERO:
         ppi = D(str(custom_data.get("ppi") or 0))

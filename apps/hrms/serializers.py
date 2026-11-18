@@ -140,15 +140,43 @@ class DesignationSerializer(BaseModelSerializer):
         return super().validate(attrs)
 
 
+class LocationAddressField(serializers.Field):
+    """The screens edit an address as one line; stored as dict or string."""
+
+    def to_representation(self, value):
+        if isinstance(value, dict):
+            if value.get("line"):
+                return value["line"]
+            parts = [value.get(k) for k in ("line1", "line2", "city", "state", "pincode", "country")]
+            joined = ", ".join(str(p) for p in parts if p)
+            if joined:
+                return joined
+            vals = [str(v) for v in value.values() if v and isinstance(v, (str, int))]
+            return ", ".join(vals) if vals else ""
+        return str(value or "")
+
+    def to_internal_value(self, data):
+        if isinstance(data, dict):
+            return data
+        text = str(data or "").strip()
+        return {"line": text} if text else {}
+
+
 class LocationSerializer(BaseModelSerializer):
+    address = LocationAddressField(required=False)
+    employees = serializers.SerializerMethodField()
     employeeCount = serializers.SerializerMethodField()
+    type = serializers.CharField(default="Branch", required=False)
 
     class Meta:
         model = Location
-        fields = ["id", "name", "address", "timezone", "employeeCount", "created_at"]
+        fields = ["id", "name", "type", "address", "timezone", "employees", "employeeCount", "created_at"]
+
+    def get_employees(self, location):
+        return location.employees.filter(deleted_at__isnull=True).count()
 
     def get_employeeCount(self, location):
-        return location.employees.filter(deleted_at__isnull=True).count()
+        return self.get_employees(location)
 
 
 class EmployeeSerializer(BaseModelSerializer):

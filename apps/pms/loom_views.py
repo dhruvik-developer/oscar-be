@@ -68,6 +68,31 @@ class LoomFactoryViewSet(TenantModelViewSet):
     queryset = LoomFactory.objects.select_related("coord", "warehouse", "job_worker_party").all()
     serializer_class = LoomFactorySerializer
 
+    @transaction.atomic
+    def perform_create(self, serializer):
+        factory = super().perform_create(serializer)
+        client_id = getattr(self.request, "client_id", None)
+        # Ensure factory is synced as a Vendor in Parties master
+        if not factory.job_worker_party:
+            from apps.masters.models import Party
+            party = Party.objects.filter(
+                client_id=client_id,
+                name__iexact=factory.name.strip(),
+                deleted_at__isnull=True,
+            ).first()
+            if not party:
+                user = getattr(self.request, "user", None)
+                party = Party.objects.create(
+                    client_id=client_id,
+                    name=factory.name.strip(),
+                    type="Vendor",
+                    vendor_type="Manufacturing",
+                    created_by=user if getattr(user, "is_authenticated", False) else None,
+                )
+            factory.job_worker_party = party
+            factory.save(update_fields=["job_worker_party"])
+        return factory
+
     @action(detail=True, methods=["get"])
     def status(self, request, pk=None):
         factory = self.get_object()
@@ -105,12 +130,26 @@ class LoomMachineViewSet(TenantModelViewSet):
 
         created = []
         for no in range(from_no, to_no + 1):
-            m, was_created = LoomMachine.objects.get_or_create(
+            m = LoomMachine.objects.filter(
                 client_id=client_id,
                 factory_id=factory_id,
                 no=no,
-                defaults={"reed": reed},
-            )
+            ).first()
+            if m:
+                m.reed = reed
+                if m.deleted_at is not None:
+                    m.deleted_at = None
+                    m.deleted_by = None
+                m.is_active = True
+                m.save()
+            else:
+                m = LoomMachine.objects.create(
+                    client_id=client_id,
+                    factory_id=factory_id,
+                    no=no,
+                    reed=reed,
+                    is_active=True,
+                )
             created.append(m)
         return Response({"created": len(created)}, status=status.HTTP_201_CREATED)
 

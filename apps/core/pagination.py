@@ -15,6 +15,8 @@ exactly what the mock frontend does today and what server pagination breaks
 """
 from collections import OrderedDict
 
+from django.core.paginator import EmptyPage, InvalidPage, Page
+from rest_framework.exceptions import NotFound
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
 
@@ -43,7 +45,21 @@ class EnvelopePagination(PageNumberPagination):
     def paginate_queryset(self, queryset, request, view=None):
         self._view = view
         self._unpaginated = queryset
-        return super().paginate_queryset(queryset, request, view)
+        try:
+            return super().paginate_queryset(queryset, request, view)
+        except (NotFound, InvalidPage):
+            page_size = self.get_page_size(request)
+            if not page_size:
+                return None
+            paginator = self.django_paginator_class(queryset, page_size)
+            self.paginator = paginator
+            self.request = request
+            target_page = paginator.num_pages if paginator.num_pages > 0 else 1
+            try:
+                self.page = paginator.page(target_page)
+            except (EmptyPage, InvalidPage):
+                self.page = Page([], 1, paginator)
+            return list(self.page)
 
     def get_paginated_response(self, data):
         aggregates = {}
