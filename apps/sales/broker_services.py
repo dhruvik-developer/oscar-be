@@ -537,13 +537,59 @@ def _resolve_bank_account(bank_account, client_id):
 
 
 @transaction.atomic
+@transaction.atomic
+def hold_broker_commission(commission, *, reason=None, user=None):
+    """Put commission on hold (PDF §12)."""
+    commission = BrokerCommission.objects.select_for_update().get(pk=commission.pk)
+    if commission.status == "Paid":
+        raise Conflict("Cannot hold a commission that has already been paid.")
+    commission.status = "Hold"
+    note = f" [Placed on Hold: {reason or 'Administrative hold per §12'}]"
+    commission.notes = (commission.notes or "") + note
+    commission.save(update_fields=["status", "notes", "updated_at"])
+    return commission
+
+
+@transaction.atomic
+def release_broker_commission_hold(commission, *, user=None):
+    """Release a commission from hold back to its appropriate status (PDF §12)."""
+    commission = BrokerCommission.objects.select_for_update().get(pk=commission.pk)
+    if commission.status != "Hold":
+        return commission
+    if D(commission.paid_amount) > ZERO:
+        commission.status = "Partially Paid"
+    elif commission.approved_by_id or commission.approved_at:
+        commission.status = "Payable"
+    else:
+        commission.status = "Accrued"
+    commission.notes = (commission.notes or "") + " [Hold released]"
+    commission.save(update_fields=["status", "notes", "updated_at"])
+    return commission
+
+
 def pay_broker_commission(commission, amount=None, *, payment_ref=None, payment_method=None, bank_account=None, user=None, remarks=None):
     """Record broker payment and post Dr Brokerage Payable / Cr Bank."""
     commission = BrokerCommission.objects.select_for_update().get(pk=commission.pk)
+    if commission.status == "Hold":
+        raise BusinessRuleViolation(
+            "Commission payout is currently on Hold. Please release the hold before paying.",
+            code="COMMISSION_ON_HOLD",
+        )
     if commission.status not in ("Approved", "Payable", "Partially Paid"):
         raise Conflict(
             f"Commission is {commission.status}; only an approved / payable commission can be paid."
         )
+
+    # Overdue invoice hold per PDF §12: do not pay if linked invoice is unpaid and past due date
+    inv = commission.invoice
+    if inv:
+        is_unpaid = inv.status not in ("Paid",) and (D(inv.total or 0) - D(inv.amount_paid or 0)) > ZERO
+        is_overdue = bool(inv.due_date and timezone.localdate() > inv.due_date)
+        if is_overdue and is_unpaid:
+            raise BusinessRuleViolation(
+                f"Commission payout is held: linked sales invoice {inv.invoice_number or inv.id} is overdue (due {inv.due_date}) and unpaid (balance ₹{round2(D(inv.total or 0) - D(inv.amount_paid or 0)):,}). Payout cannot be released until invoice is settled per Oscar Letter Pad §12.",
+                code="INVOICE_OVERDUE_HOLD",
+            )
     lead = order_lead(commission.invoice.sales_order)
     if lead is not None and lead.stage and lead.stage.is_lost:
         raise Conflict("A lost broker lead is not eligible for commission.")

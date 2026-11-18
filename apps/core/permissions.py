@@ -86,7 +86,7 @@ class HasModulePermission(IsAuthenticatedInTenant):
         super().has_permission(request, view)
 
         required = self._required_for(view, getattr(view, "action", None), request.method)
-        if not required:
+        if required is None:
             if getattr(view, "allow_any_authenticated", False) or getattr(view, "__class__", None).__name__ == "APIRootView":
                 return True
             raise PermissionDenied(
@@ -94,6 +94,9 @@ class HasModulePermission(IsAuthenticatedInTenant):
                 code="PERMISSION_DENIED",
                 detail="No permissions declared for this view or action.",
             )
+
+        if not required:
+            return True
 
         user = request.user
         granted = getattr(user, "permission_ids", None)
@@ -134,7 +137,7 @@ class HasModulePermission(IsAuthenticatedInTenant):
             return permission_map["write"]
         if method in ("GET", "HEAD", "OPTIONS") and "read" in permission_map:
             return permission_map["read"]
-        return getattr(view, "required_permissions", None) or []
+        return getattr(view, "required_permissions", None)
 
 
 def require_permission(user, permission_id, message=None):

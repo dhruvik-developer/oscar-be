@@ -2695,7 +2695,7 @@ class BrokerCommissionViewSet(TenantModelViewSet):
         """Every register, statement and analytic reads this one set: live
         commissions, test data left out unless ``includeTestData=1``."""
         queryset = super().get_queryset()
-        if self.action not in ("retrieve", "pay", "approve", "make_payable") and not self._include_test_data():
+        if self.action not in ("retrieve", "pay", "approve", "make_payable", "toggle_hold") and not self._include_test_data():
             queryset = queryset.filter(is_test_data=False)
         return queryset
 
@@ -2762,6 +2762,17 @@ class BrokerCommissionViewSet(TenantModelViewSet):
             user=request.user,
             remarks=remarks,
         )
+        return Response(self.get_serializer(comm).data)
+
+    @action(detail=True, methods=["post"], url_path="toggle-hold")
+    def toggle_hold(self, request, pk=None):
+        """Toggle commission Hold status per PDF §12."""
+        comm = self.get_object()
+        reason = request.data.get("reason")
+        if comm.status == "Hold":
+            comm = broker_services.release_broker_commission_hold(comm, user=request.user)
+        else:
+            comm = broker_services.hold_broker_commission(comm, reason=reason, user=request.user)
         return Response(self.get_serializer(comm).data)
 
     @action(detail=False, methods=["get"], url_path="statement")
