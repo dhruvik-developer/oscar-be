@@ -199,10 +199,9 @@ def admin_employee_ids(client_id):
 
 
 def workforce(client_id, queryset=None, *, include_exited=True):
-    """The tenant's employees, without administrator-only records."""
+    """The tenant's employees, including all active workforce members."""
     if queryset is None:
         queryset = Employee.objects.filter(client_id=client_id, deleted_at__isnull=True)
-    queryset = queryset.exclude(id__in=admin_employee_ids(client_id))
     if not include_exited:
         queryset = queryset.exclude(status__in=EXITED_EMPLOYEE_STATUSES)
     return queryset
@@ -218,15 +217,8 @@ def derive_attendance(client_id, *, check_in, check_out, submitted_status=None):
     Week Off, WFH) is respected as-is; the policy only decides between Present,
     Late and Half Day, which is the judgement the frontend was making badly.
     """
-    if submitted_status in ("Absent", "On Leave", "Holiday", "Week Off"):
-        return submitted_status, None
-
-    if check_in is None:
-        # Marking someone Present without times is a deliberate manual call.
-        return submitted_status or "Absent", None
-
     hours = None
-    if check_out is not None:
+    if check_in is not None and check_out is not None:
         delta = check_out - check_in
         hours = round(Decimal(delta.total_seconds()) / Decimal(3600), 2)
         if hours < 0:
@@ -235,8 +227,12 @@ def derive_attendance(client_id, *, check_in, check_out, submitted_status=None):
                 field_errors={"checkOut": ["Must be after check-in."]},
             )
 
-    if submitted_status in ("WFH", "Half Day"):
+    # When an explicit status was submitted by the user/admin (Present, Absent, Late, etc.), respect it directly
+    if submitted_status in ("Absent", "On Leave", "Holiday", "Week Off", "WFH", "Half Day", "Present", "Late"):
         return submitted_status, hours
+
+    if check_in is None:
+        return submitted_status or "Absent", None
 
     policy = flexibility_policy(client_id)
     shift_start = _parse_time(policy.get("shiftStart"), time(9, 30))
@@ -429,7 +425,6 @@ def daily_attendance(client_id, work_date, *, department=None):
     }
     employees = (
         workforce(client_id)
-        .filter(Q(joining_date__lte=work_date) | Q(joining_date__isnull=True))
         .select_related("department", "designation", "location")
         .order_by("name")
     )
@@ -452,6 +447,12 @@ def daily_attendance(client_id, work_date, *, department=None):
         if row is not None:
             item.update(_attendance_row_payload(row, policy))
             item["marked"] = True
+        elif employee.joining_date and employee.joining_date > work_date:
+            item.update({
+                "attendanceId": None, "status": "Not Joined", "checkIn": None,
+                "checkOut": None, "hours": None, "overtimeHours": 0.0, "source": None,
+                "remark": f"Joining on {employee.joining_date}", "leaveType": None, "leavePaid": None, "marked": False,
+            })
         else:
             item.update({
                 "attendanceId": None, "status": default_status, "checkIn": None,
@@ -696,20 +697,21 @@ def resolve_leave_type(client_id, name):
     return None
 
 
-def assert_no_overlap(leave_request):
+def assert_no_overlap(leave_request, statuses=("Pending Review", "Delegate Confirmed", "Approved")):
     """db.md §11.3 -- overlapping live requests for the same employee are rejected."""
     clash = LeaveRequest.objects.filter(
         client_id=leave_request.client_id,
         employee_id=leave_request.employee_id,
-        status__in=["Pending Review", "Delegate Confirmed", "Approved"],
+        status__in=statuses,
         from_date__lte=leave_request.to_date,
         to_date__gte=leave_request.from_date,
         deleted_at__isnull=True,
     ).exclude(pk=leave_request.pk)
     if clash.exists():
         existing = clash.first()
+        status_label = "approved" if existing.status == "Approved" else "existing"
         raise BusinessRuleViolation(
-            "This overlaps an existing leave request "
+            f"This overlaps an {status_label} leave request "
             f"({existing.from_date} to {existing.to_date}).",
             code="LEAVE_OVERLAP",
             payload={"conflictingRequestId": str(existing.id)},
@@ -787,7 +789,7 @@ def approve_leave(leave_request, *, user=None, remark=None):
             code=Codes.BAD_TARGET,
         )
 
-    assert_no_overlap(leave_request)
+    assert_no_overlap(leave_request, statuses=("Approved",))
 
     balance = leave_balance_for(
         leave_request.client_id, leave_request.employee_id, leave_request.leave_type_id,
@@ -808,6 +810,22 @@ def approve_leave(leave_request, *, user=None, remark=None):
     leave_request.decided_at = timezone.now()
     leave_request.remark = remark
     leave_request.save()
+
+    # Auto-reject any conflicting pending requests for the same employee/dates
+    overlapping_pending = LeaveRequest.objects.filter(
+        client_id=leave_request.client_id,
+        employee_id=leave_request.employee_id,
+        status__in=["Pending Review", "Delegate Confirmed"],
+        from_date__lte=leave_request.to_date,
+        to_date__gte=leave_request.from_date,
+        deleted_at__isnull=True,
+    ).exclude(pk=leave_request.pk)
+    overlapping_pending.update(
+        status="Rejected",
+        remark=f"Overlapped with approved leave {leave_request.id}",
+        decided_at=timezone.now(),
+        approver=user if getattr(user, "is_authenticated", False) else None,
+    )
 
     # Post attendance for every working day in range.
     # A half-day leave keeps the other half as a worked Half Day.
@@ -938,6 +956,8 @@ def compute_salary(
     net_payable = round2(
         earned_salary + D(additional_earnings) - D(deductions) - D(advance)
     )
+    if net_payable < ZERO:
+        net_payable = ZERO
 
     return {
         "perDaySalary": round2(per_day),
@@ -1029,7 +1049,7 @@ def process_payroll(*, client, period_month, employee_ids=None, user=None):
 
     month_end = _month_end(period_month)
     # Auto punch-out any unclosed sessions up to month_end so all attended days are accounted for
-    auto_punch_out_pending_sessions(client=client.id, as_of_date=month_end, force_today=True)
+    auto_punch_out_pending_sessions(client=client.id, as_of_date=month_end, force_today=False)
     working = working_days_in(client.id, period_month, month_end)
     total_days = Decimal(len(working)) or DEFAULT_TOTAL_DAYS
 
@@ -1049,6 +1069,8 @@ def process_payroll(*, client, period_month, employee_ids=None, user=None):
         previous = Payslip.objects.filter(
             payroll_run=run, employee=employee, deleted_at__isnull=True
         ).first()
+        if previous and previous.advance_recovery > ZERO and advance == ZERO:
+            advance = previous.advance_recovery
         # Factor in approved leave encashments for the month
         encashments = LeaveEncashment.objects.filter(
             client=client,
@@ -1175,6 +1197,37 @@ def process_payroll(*, client, period_month, employee_ids=None, user=None):
                     for component in split["components"]
                 ]
             )
+
+        # Connection 12: Attach PMS Incentive Calculations
+        try:
+            from apps.pms.models import IncentiveCalculation
+            incentives = IncentiveCalculation.objects.filter(
+                client=client,
+                employee=employee,
+                status="Posted",
+                payslip__isnull=True,
+                period_start__year=period_month.year,
+                period_start__month=period_month.month,
+            )
+            for inc in incentives:
+                p_amt = inc.incentive_amount - inc.hold_amount
+                if p_amt > ZERO:
+                    PayslipComponent.objects.create(
+                        client=client,
+                        payslip=payslip,
+                        name=f"PMS Incentive ({inc.calc_number or inc.period_label})",
+                        amount=p_amt,
+                        kind="earning",
+                    )
+                    payslip.additional_earnings += p_amt
+                    payslip.net_payable += p_amt
+                    payslip.save(update_fields=["additional_earnings", "net_payable", "updated_at"])
+                    inc.payslip = payslip
+                    inc.payroll_run = run
+                    inc.save(update_fields=["payslip", "payroll_run", "updated_at"])
+        except Exception:
+            pass
+
         payslips.append(payslip)
 
     run.status = "Ready for Review"

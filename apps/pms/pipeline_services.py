@@ -327,7 +327,8 @@ def evaluate_stock_and_route(project):
 
 
 @transaction.atomic
-def sync_project_pipeline_stages(project):
+def sync_project_pipeline_stages(project, read_only=False):
+    from uuid import uuid4
     stock_eval = evaluate_stock_and_route(project)
     branch = stock_eval["route_branch"]
     req_qty = stock_eval["required_meters"]
@@ -341,18 +342,19 @@ def sync_project_pipeline_stages(project):
     stage_defs = get_project_stage_definitions(project, stock_eval)
     allowed_names = [s["name"] for s in stage_defs]
 
-    _carry_over_legacy_production_stages(project, allowed_names)
+    if not read_only:
+        _carry_over_legacy_production_stages(project, allowed_names)
 
-    ProjectStage.objects.filter(project=project).filter(
-        Q(name__iexact="dyeing")
-        | Q(name__iexact="vbvb")
-        | Q(name__icontains="customer requirement")
-        | ~Q(name__in=allowed_names)
-    ).delete()
+        ProjectStage.objects.filter(project=project).filter(
+            Q(name__iexact="dyeing")
+            | Q(name__iexact="vbvb")
+            | Q(name__icontains="customer requirement")
+            | ~Q(name__in=allowed_names)
+        ).delete()
 
-    for st in ProjectStage.objects.filter(project=project):
-        st.sequence = st.sequence + 1000
-        st.save(update_fields=["sequence"])
+        for st in ProjectStage.objects.filter(project=project):
+            st.sequence = st.sequence + 1000
+            st.save(update_fields=["sequence"])
 
     from apps.purchase.models import PurchaseOrder
     from apps.jobwork.models import JobWorkOrder, ProcessPlan
@@ -1125,12 +1127,16 @@ def sync_project_pipeline_stages(project):
 
         elif name == "Customer Dispatch":
             quantities["dispatched"] = float(dispatched_qty)
-            if dispatched_qty >= req_qty and req_qty > Decimal("0"):
+            if (dispatched_qty >= req_qty and req_qty > Decimal("0")) or (req_qty <= Decimal("0") and dispatched_qty > Decimal("0")):
                 status = "Completed"
                 pct = 100
             elif dispatched_qty > Decimal("0"):
-                status = "In Progress"
-                pct = min(99, int(round((float(dispatched_qty) / float(req_qty)) * 100)))
+                if req_qty > Decimal("0"):
+                    status = "In Progress"
+                    pct = min(99, int(round((float(dispatched_qty) / float(req_qty)) * 100)))
+                else:
+                    status = "Completed"
+                    pct = 100
             else:
                 status = "Pending"
                 pct = 0
@@ -1141,7 +1147,7 @@ def sync_project_pipeline_stages(project):
                     "url": f"/sales/delivery-challans?id={dc_doc.id}",
                     "label": f"DC: {dc_doc.challan_number}",
                 }
-            if dispatched_qty >= req_qty and req_qty > Decimal("0"):
+            if (dispatched_qty >= req_qty and req_qty > Decimal("0")) or (req_qty <= Decimal("0") and dispatched_qty > Decimal("0")):
                 remarks = f"Dispatched {int(dispatched_qty):,} m"
             elif dispatched_qty > Decimal("0"):
                 remarks = f"Dispatched {int(dispatched_qty):,} m"
@@ -1197,31 +1203,47 @@ def sync_project_pipeline_stages(project):
 
         stage_obj = ProjectStage.objects.filter(project=project, name=name).first()
         if not stage_obj:
-            stage_obj = ProjectStage.objects.create(
-                project=project,
-                sequence=seq,
-                client_id=client_id,
-                name=name,
-                department=dept,
-                weight_pct=weight,
-                status=status,
-                completion_pct=pct,
-                start_datetime=stage_start,
-                expected_completion_datetime=stage_expected,
-            )
+            if not read_only:
+                stage_obj = ProjectStage.objects.create(
+                    project=project,
+                    sequence=seq,
+                    client_id=client_id,
+                    name=name,
+                    department=dept,
+                    weight_pct=weight,
+                    status=status,
+                    completion_pct=pct,
+                    start_datetime=stage_start,
+                    expected_completion_datetime=stage_expected,
+                )
+            else:
+                stage_obj = ProjectStage(
+                    id=uuid4(),
+                    project=project,
+                    sequence=seq,
+                    client_id=client_id,
+                    name=name,
+                    department=dept,
+                    weight_pct=weight,
+                    status=status,
+                    completion_pct=pct,
+                    start_datetime=stage_start,
+                    expected_completion_datetime=stage_expected,
+                )
         else:
-            stage_obj.sequence = seq
-            stage_obj.weight_pct = weight
-            stage_obj.status = status
-            stage_obj.completion_pct = pct
-            if dept:
-                stage_obj.department = dept
-            if status == "Pending" and not stage_obj.actual_start_datetime:
-                stage_obj.start_datetime = None
-                stage_obj.expected_completion_datetime = None
-            elif not stage_obj.start_datetime and status != "Pending":
-                stage_obj.start_datetime = stage_start
-            stage_obj.save(update_fields=["sequence", "name", "weight_pct", "status", "completion_pct", "department", "start_datetime", "expected_completion_datetime", "updated_at"])
+            if not read_only:
+                stage_obj.sequence = seq
+                stage_obj.weight_pct = weight
+                stage_obj.status = status
+                stage_obj.completion_pct = pct
+                if dept:
+                    stage_obj.department = dept
+                if status == "Pending" and not stage_obj.actual_start_datetime:
+                    stage_obj.start_datetime = None
+                    stage_obj.expected_completion_datetime = None
+                elif not stage_obj.start_datetime and status != "Pending":
+                    stage_obj.start_datetime = stage_start
+                stage_obj.save(update_fields=["sequence", "name", "weight_pct", "status", "completion_pct", "department", "start_datetime", "expected_completion_datetime", "updated_at"])
 
         stages_data.append({
             "id": str(stage_obj.id),
@@ -1241,8 +1263,6 @@ def sync_project_pipeline_stages(project):
             "actualCompletionDateTime": stage_obj.actual_completion_datetime.isoformat() if stage_obj.actual_completion_datetime else None,
         })
 
-    ProjectStage.objects.filter(project=project, sequence__gte=1000).delete()
-
     active_stages = [s for s in stages_data if s["status"] != "Not Required"]
     total_active_weight = sum(s["weightPct"] for s in active_stages) or 100
     weighted_progress = sum(s["completionPct"] * s["weightPct"] for s in active_stages)
@@ -1251,9 +1271,14 @@ def sync_project_pipeline_stages(project):
     project.overall_completion_pct = min(100, max(0, overall_pct))
     if overall_pct >= 100 and project.status != "Completed":
         project.status = "Completed"
+        if not project.actual_completion_date:
+            project.actual_completion_date = timezone.now()
     elif overall_pct > 0 and project.status in ("Draft", "Pending"):
         project.status = "In Progress"
-    project.save(update_fields=["overall_completion_pct", "status", "updated_at"])
+
+    if not read_only:
+        ProjectStage.objects.filter(project=project, sequence__gte=1000).delete()
+        project.save(update_fields=["overall_completion_pct", "status", "actual_completion_date", "updated_at"])
 
     return {
         "stockEvaluation": stock_eval,

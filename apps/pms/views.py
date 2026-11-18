@@ -296,7 +296,7 @@ def create_project_from_order(order, *, project_manager_id=None, priority="Mediu
         code=allocate_number(order.client, "PRJ"),
         sales_order=order,
         party=order.party,
-        customer_name=order.party_name or order.party.name,
+        customer_name=order.party_name or (getattr(order.party, "name", None) if order.party else None) or "Customer",
         product_name=first_line.item_name if first_line else None,
         order_value=order.total,
         quantity=first_line.qty if first_line else None,
@@ -446,8 +446,32 @@ class ProjectViewSet(TenantModelViewSet):
         "write": ["create_pms_project"],
         "complete": ["complete_project"],
         "apply_stage_template": ["assign_stage"],
+        "sync_pipeline": ["assign_stage"],
         # Production permissions are checked per method inside the action.
         "production_link": ["view_pms"],
+        "customer_returns": {"read": ["view_pms"], "write": ["create_invoice"]},
+        "purchase_orders": {"read": ["view_pms"], "write": ["create_purchase_order"]},
+        "grey_stock_allocation": {"read": ["view_pms"], "write": ["adjust_stock"]},
+        "release_grey_stock_allocation": ["adjust_stock"],
+        "qc_stock_allocation": {"read": ["view_pms"], "write": ["adjust_stock"]},
+        "customer_dispatch": {"read": ["view_pms"], "write": ["create_sales_order"]},
+        "invoice_payment": {"read": ["view_pms"], "write": ["record_payment_in"]},
+        "closure_audit": {"read": ["view_pms"], "write": ["complete_project"]},
+        "close": ["complete_project"],
+        "stages": {"read": ["view_pms"], "write": ["assign_stage"]},
+        "stage_detail": ["assign_stage"],
+        "assign_stage": ["assign_stage"],
+        "start_stage": ["assign_stage"],
+        "stage_progress": ["assign_stage"],
+        "stage_status": ["assign_stage"],
+        "complete_stage": ["assign_stage"],
+        "handoff": ["handoff_stage"],
+        "handoff_check": ["view_pms"],
+        "stage_tasks": {"read": ["view_pms"], "write": ["create_pms_project"]},
+        "stage_task_detail": ["create_pms_project"],
+        "stage_documents": {"read": ["view_pms"], "write": ["approve_document"]},
+        "document_detail": ["approve_document"],
+        "stage_delay": {"read": ["view_pms"], "write": ["log_delay"]},
     }
     #: The UI uses ``code`` in URLs, so both a uuid and a code resolve.
     lookup_value_regex = "[^/]+"
@@ -459,7 +483,7 @@ class ProjectViewSet(TenantModelViewSet):
         if project is None:
             try:
                 project = queryset.filter(pk=lookup).first()
-            except (ValueError, TypeError, Exception):
+            except Exception:
                 project = None
         if project is None:
             raise NotFound("That project no longer exists.")
@@ -503,11 +527,18 @@ class ProjectViewSet(TenantModelViewSet):
         project = self.get_object()
         self._concurrency_instance = project
         from .pipeline_services import sync_project_pipeline_stages
-        pipeline_res = sync_project_pipeline_stages(project)
+        pipeline_res = sync_project_pipeline_stages(project, read_only=True)
         context = self._detail_context(project)
         context["pipeline_summary"] = pipeline_res["stockEvaluation"]
         context["pipeline_stages_map"] = {s["sequence"]: s for s in pipeline_res["stages"]}
         return Response(ProjectDetailSerializer(project, context=context).data)
+
+    @action(detail=True, methods=["post"], url_path="sync-pipeline")
+    def sync_pipeline(self, request, pk=None):
+        project = self.get_object()
+        from .pipeline_services import sync_project_pipeline_stages
+        pipeline_res = sync_project_pipeline_stages(project, read_only=False)
+        return Response(pipeline_res)
 
     def _detail_context(self, project):
         """One round trip per child table, assembled here (db.md §15)."""
@@ -675,8 +706,7 @@ class ProjectViewSet(TenantModelViewSet):
         if (
             getattr(request.user, "is_authenticated", False)
             and not getattr(request.user, "is_superuser", False)
-            and project.created_by_id is not None
-            and project.created_by_id != request.user.id
+            and (project.created_by_id is None or project.created_by_id != request.user.id)
         ):
             raise PermissionDenied("Only the project creator can modify stage percentages.")
 
@@ -806,8 +836,6 @@ class ProjectViewSet(TenantModelViewSet):
         from apps.pms.pipeline_services import sync_project_pipeline_stages
 
         order = getattr(project, "sales_order", None)
-        if not order and project.crm_order_id:
-            order = SalesOrder.objects.filter(client_id=client_id, order_number=project.crm_order_id).first()
 
         main_wh = Location.objects.filter(client_id=client_id, code="WH-MAIN").first() or Location.objects.filter(client_id=client_id, is_active=True).exclude(code__startswith="SYS-").first()
         qc_hold_loc = stock_svc.system_location(client_id, "QC_HOLD")
@@ -844,7 +872,10 @@ class ProjectViewSet(TenantModelViewSet):
                 return_reason = (request.data.get("return_reason") or request.data.get("returnReason") or "Fabric Damaged / Defective").strip()
                 customer_remarks = (request.data.get("remarks") or request.data.get("customerRemarks") or "").strip()
                 doc_date_str = request.data.get("doc_date") or request.data.get("docDate")
-                doc_date = timezone.datetime.strptime(doc_date_str, "%Y-%m-%d").date() if doc_date_str else timezone.localdate()
+                try:
+                    doc_date = timezone.datetime.strptime(doc_date_str, "%Y-%m-%d").date() if doc_date_str else timezone.localdate()
+                except (ValueError, TypeError):
+                    raise ValidationFailed("Invalid doc_date format. Expected YYYY-MM-DD.", field_errors={"doc_date": ["Expected YYYY-MM-DD."]})
 
                 raw_lines = request.data.get("lines") or []
                 if not raw_lines:
@@ -955,7 +986,10 @@ class ProjectViewSet(TenantModelViewSet):
                     raise Conflict("Physical receipt has already been recorded for this return.", code="ALREADY_RECEIVED")
 
                 receipt_date_str = request.data.get("receipt_date") or request.data.get("receiptDate")
-                receipt_date = timezone.datetime.strptime(receipt_date_str, "%Y-%m-%d").date() if receipt_date_str else timezone.localdate()
+                try:
+                    receipt_date = timezone.datetime.strptime(receipt_date_str, "%Y-%m-%d").date() if receipt_date_str else timezone.localdate()
+                except (ValueError, TypeError):
+                    raise ValidationFailed("Invalid receipt_date format. Expected YYYY-MM-DD.", field_errors={"receipt_date": ["Expected YYYY-MM-DD."]})
                 receiving_employee = (request.data.get("receiving_employee") or request.data.get("receivingEmployee") or getattr(request.user, "get_full_name", lambda: "")() or "Store Incharge").strip()
                 condition_on_arrival = (request.data.get("condition_on_arrival") or request.data.get("condition") or "Received in Good Packaging").strip()
 
@@ -1039,7 +1073,10 @@ class ProjectViewSet(TenantModelViewSet):
                     raise BusinessRuleViolation("Physical receipt must be recorded before conducting QC inspection.", code="RECEIPT_REQUIRED")
 
                 inspection_date_str = request.data.get("inspection_date") or request.data.get("inspectionDate")
-                inspection_date = timezone.datetime.strptime(inspection_date_str, "%Y-%m-%d").date() if inspection_date_str else timezone.localdate()
+                try:
+                    inspection_date = timezone.datetime.strptime(inspection_date_str, "%Y-%m-%d").date() if inspection_date_str else timezone.localdate()
+                except (ValueError, TypeError):
+                    raise ValidationFailed("Invalid inspection_date format. Expected YYYY-MM-DD.", field_errors={"inspection_date": ["Expected YYYY-MM-DD."]})
                 method = (request.data.get("inspection_method") or request.data.get("inspectionMethod") or "ASTM 4-Point Inspection (D5430)").strip()
                 inspector_name = (request.data.get("inspector_name") or request.data.get("inspectorName") or getattr(request.user, "get_full_name", lambda: "")() or "QC Inspector").strip()
                 shift = (request.data.get("shift") or "General Shift").strip()
@@ -1380,7 +1417,10 @@ class ProjectViewSet(TenantModelViewSet):
                     raise Conflict("Credit note has already been issued for this return.", code="ALREADY_ISSUED")
 
                 credit_date_str = request.data.get("credit_date") or request.data.get("creditDate")
-                credit_date = timezone.datetime.strptime(credit_date_str, "%Y-%m-%d").date() if credit_date_str else timezone.localdate()
+                try:
+                    credit_date = timezone.datetime.strptime(credit_date_str, "%Y-%m-%d").date() if credit_date_str else timezone.localdate()
+                except (ValueError, TypeError):
+                    raise ValidationFailed("Invalid credit_date format. Expected YYYY-MM-DD.", field_errors={"credit_date": ["Expected YYYY-MM-DD."]})
                 approval_notes = (request.data.get("approval_notes") or request.data.get("notes") or "").strip()
 
                 cn_number = allocate_number(client_id, "CN", credit_date)
@@ -1435,18 +1475,24 @@ class ProjectViewSet(TenantModelViewSet):
         # 2. GET WORKSPACE DATASET (Dashboard KPIs + Register + Modals)
         # -------------------------------------------------------------
         # Gather all returns for this project
+        inv_q = Q(notes__icontains=project.code)
+        if order:
+            inv_q |= Q(sales_order=order)
         invoices_for_project = list(SalesInvoice.objects.filter(
             client_id=client_id, deleted_at__isnull=True
-        ).filter(Q(sales_order=order) | Q(notes__icontains=project.code)).distinct())
+        ).filter(inv_q).distinct())
         invoice_ids = [inv.id for inv in invoices_for_project]
+
+        ret_q = Q(reason__icontains=project.code) | Q(notes__icontains=project.code)
+        if invoices_for_project:
+            ret_q |= Q(sales_invoice__in=invoices_for_project)
+        if order:
+            ret_q |= Q(sales_invoice__sales_order=order)
 
         returns_qs = SalesReturn.objects.filter(
             client_id=client_id, deleted_at__isnull=True
         ).filter(
-            Q(sales_invoice__in=invoices_for_project) |
-            Q(sales_invoice__sales_order=order) |
-            Q(reason__icontains=project.code) |
-            Q(notes__icontains=project.code)
+            ret_q
         ).select_related("party", "sales_invoice", "sales_invoice__delivery_challan", "location", "journal_entry").prefetch_related("line_items", "line_items__lot_taka").distinct().order_by("-doc_date", "-created_at")
 
         returns_list = []
@@ -2423,8 +2469,10 @@ class ProjectViewSet(TenantModelViewSet):
                     payload={"blockers": blockers}
                 )
             project.status = "Completed"
+            if not project.actual_completion_date:
+                project.actual_completion_date = timezone.now()
             project.overall_completion_pct = 100
-            project.save(update_fields=["status", "overall_completion_pct", "updated_at"])
+            project.save(update_fields=["status", "actual_completion_date", "overall_completion_pct", "updated_at"])
 
             closure_stage = project.stages.filter(name="Project Closure").first()
             if closure_stage:
@@ -3086,7 +3134,10 @@ class ProjectViewSet(TenantModelViewSet):
                     raise ValidationFailed("At least one taka must be selected for customer dispatch.", field_errors={"selectedTakas": ["Required."]})
 
                 dispatch_date_str = request.data.get("dispatch_date") or request.data.get("dispatchDate")
-                dispatch_date = timezone.datetime.strptime(dispatch_date_str, "%Y-%m-%d").date() if dispatch_date_str else timezone.localdate()
+                try:
+                    dispatch_date = timezone.datetime.strptime(dispatch_date_str, "%Y-%m-%d").date() if dispatch_date_str else timezone.localdate()
+                except (ValueError, TypeError):
+                    raise ValidationFailed("Invalid dispatch_date format. Expected YYYY-MM-DD.", field_errors={"dispatch_date": ["Expected YYYY-MM-DD."]})
 
                 loc_id = request.data.get("location_id") or request.data.get("locationId")
                 dispatch_location = Location.objects.filter(client_id=client_id, id=loc_id).first() if loc_id else main_wh
@@ -3562,10 +3613,16 @@ class ProjectViewSet(TenantModelViewSet):
                     raise ValidationFailed("Rate per unit must be greater than zero.", field_errors={"rate": ["Must be > 0."]})
 
                 doc_date_str = request.data.get("doc_date") or request.data.get("docDate")
-                doc_date = timezone.datetime.strptime(doc_date_str, "%Y-%m-%d").date() if doc_date_str else timezone.localdate()
+                try:
+                    doc_date = timezone.datetime.strptime(doc_date_str, "%Y-%m-%d").date() if doc_date_str else timezone.localdate()
+                except (ValueError, TypeError):
+                    raise ValidationFailed("Invalid doc_date format. Expected YYYY-MM-DD.", field_errors={"doc_date": ["Expected YYYY-MM-DD."]})
 
                 valid_until_str = request.data.get("valid_until") or request.data.get("validUntil")
-                valid_until = timezone.datetime.strptime(valid_until_str, "%Y-%m-%d").date() if valid_until_str else (doc_date + timezone.timedelta(days=30))
+                try:
+                    valid_until = timezone.datetime.strptime(valid_until_str, "%Y-%m-%d").date() if valid_until_str else (doc_date + timezone.timedelta(days=30))
+                except (ValueError, TypeError):
+                    raise ValidationFailed("Invalid valid_until format. Expected YYYY-MM-DD.", field_errors={"valid_until": ["Expected YYYY-MM-DD."]})
 
                 tax_pct = round2(D(request.data.get("tax_pct") or request.data.get("taxPct") or 5.0))
                 notes = request.data.get("notes") or request.data.get("remarks") or ""
@@ -3745,7 +3802,10 @@ class ProjectViewSet(TenantModelViewSet):
                     raise ValidationFailed("Rate per unit must be greater than zero.", field_errors={"rate": ["Must be > 0."]})
 
                 doc_date_str = request.data.get("doc_date") or request.data.get("docDate")
-                doc_date = timezone.datetime.strptime(doc_date_str, "%Y-%m-%d").date() if doc_date_str else timezone.localdate()
+                try:
+                    doc_date = timezone.datetime.strptime(doc_date_str, "%Y-%m-%d").date() if doc_date_str else timezone.localdate()
+                except (ValueError, TypeError):
+                    raise ValidationFailed("Invalid doc_date format. Expected YYYY-MM-DD.", field_errors={"doc_date": ["Expected YYYY-MM-DD."]})
 
                 tax_pct = round2(D(request.data.get("tax_pct") or request.data.get("taxPct") or 5.0))
                 notes = request.data.get("notes") or request.data.get("remarks") or ""
@@ -3864,7 +3924,10 @@ class ProjectViewSet(TenantModelViewSet):
                     )
 
                 pay_date_str = request.data.get("payment_date") or request.data.get("paymentDate")
-                payment_date = timezone.datetime.strptime(pay_date_str, "%Y-%m-%d").date() if pay_date_str else timezone.localdate()
+                try:
+                    payment_date = timezone.datetime.strptime(pay_date_str, "%Y-%m-%d").date() if pay_date_str else timezone.localdate()
+                except (ValueError, TypeError):
+                    raise ValidationFailed("Invalid payment_date format. Expected YYYY-MM-DD.", field_errors={"payment_date": ["Expected YYYY-MM-DD."]})
 
                 mode = request.data.get("mode") or "Bank"
                 if mode not in ["Cash", "Bank", "UPI", "Cheque", "Card", "NEFT/RTGS"]:
@@ -4721,8 +4784,7 @@ class ProjectViewSet(TenantModelViewSet):
         if (
             getattr(request.user, "is_authenticated", False)
             and not getattr(request.user, "is_superuser", False)
-            and project.created_by_id is not None
-            and project.created_by_id != request.user.id
+            and (project.created_by_id is None or project.created_by_id != request.user.id)
         ):
             raise PermissionDenied("Only the project creator can add stages to this project.")
 

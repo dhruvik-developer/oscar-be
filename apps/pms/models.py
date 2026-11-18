@@ -631,6 +631,13 @@ class ProductionInstruction(TenantModel):
         "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
     verified_at = models.DateTimeField(null=True, blank=True)
+    source_po = models.ForeignKey(
+        "purchase.PurchaseOrder",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="source_production_instructions",
+    )
     final_po = models.ForeignKey(
         "purchase.PurchaseOrder", null=True, blank=True, on_delete=models.SET_NULL, related_name="production_instructions"
     )
@@ -798,6 +805,20 @@ class IncentiveCalculation(TenantModel):
         blank=True,
         on_delete=models.SET_NULL,
         related_name="+",
+    )
+    payroll_run = models.ForeignKey(
+        "hrms.PayrollRun",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="incentive_calculations",
+    )
+    payslip = models.ForeignKey(
+        "hrms.Payslip",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="incentive_calculations",
     )
     reversed_at = models.DateTimeField(null=True, blank=True)
     reversal_reason = models.TextField(null=True, blank=True)

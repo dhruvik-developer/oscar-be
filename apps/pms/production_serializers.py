@@ -39,6 +39,10 @@ class ProductionInstructionSerializer(BaseModelSerializer):
     greyLotNo = serializers.ReadOnlyField(source="grey_lot.lot_number")
     finalPoId = serializers.PrimaryKeyRelatedField(source="final_po", read_only=True)
     finalPoNumber = serializers.ReadOnlyField(source="final_po.po_number")
+    sourcePoId = TenantPrimaryKeyRelatedField(
+        source="source_po", model="purchase.PurchaseOrder", required=False, allow_null=True
+    )
+    sourcePoNumber = serializers.ReadOnlyField(source="source_po.po_number")
     employeeCode = serializers.ReadOnlyField(source="employee.employee_code")
     employeeName = serializers.ReadOnlyField(source="employee.name")
     supervisorName = serializers.ReadOnlyField(source="supervisor.name")
@@ -65,6 +69,7 @@ class ProductionInstructionSerializer(BaseModelSerializer):
             "special_terms", "expected_start_date", "expectedStartDate", "expected_completion_date", "expectedCompletionDate",
             "pi_date", "fabric", "process_type", "agreed_job_rate", "rejected_qty",
             "verification_remarks", "completed_at", "greyLotId", "greyLotNo", "finalPoId", "finalPoNumber",
+            "sourcePoId", "sourcePoNumber",
             "employeeId", "employeeCode", "employeeName", "supervisorId", "supervisorName",
             "status", "verified_by", "verified_at", "notes",
             "cumulative", "balance", "totalProduced", "acceptedQty", "rejectedQty", "reprocessQty",
@@ -75,7 +80,7 @@ class ProductionInstructionSerializer(BaseModelSerializer):
             "completed_at", "rejected_qty", "verification_remarks",
             "employeeCode", "employeeName", "cumulative", "balance",
             "totalProduced", "acceptedQty", "rejectedQty", "reprocessQty", "shortageQty", "finalAmount",
-            "agencyCode", "greyLotNo", "finalPoNumber",
+            "agencyCode", "greyLotNo", "finalPoNumber", "sourcePoNumber",
             # Status only moves through approve/start/complete/verify/generate-po.
             "status",
             "created_at", "updated_at",
@@ -271,19 +276,30 @@ class IncentiveCalculationSerializer(BaseModelSerializer):
     )
     employeeCode = serializers.ReadOnlyField(source="employee.employee_code")
     employeeName = serializers.ReadOnlyField(source="employee.name")
+    payrollRunId = serializers.UUIDField(source="payroll_run_id", read_only=True)
+    payslipId = serializers.UUIDField(source="payslip_id", read_only=True)
+    payslipNumber = serializers.SerializerMethodField()
+    payslipStatus = serializers.CharField(source="payslip.status", read_only=True, default=None)
+
+    def get_payslipNumber(self, obj):
+        if not obj.payslip:
+            return None
+        return getattr(obj.payslip, "code", None) or f"PS-{obj.payslip.period_month.strftime('%Y%m')}"
 
     class Meta:
         model = IncentiveCalculation
         fields = [
             "id", "calc_number", "schemeId", "employeeId", "employeeCode",
-            "employeeName", "period_label", "period_start", "period_end",
+            "employeeName", "payrollRunId", "payslipId", "payslipNumber",
+            "payslipStatus", "period_label", "period_start", "period_end",
             "basis", "net_sales", "returns_total", "incentive_amount",
             "hold_amount", "paid_amount", "status", "approved_by",
             "approved_at", "paid_at", "detail", "journal_entry",
             "reversed_at", "reversal_reason",
         ]
         read_only_fields = [
-            "id", "calc_number", "net_sales", "returns_total", "incentive_amount",
+            "id", "calc_number", "payrollRunId", "payslipId", "payslipNumber",
+            "payslipStatus", "net_sales", "returns_total", "incentive_amount",
             "status", "detail", "journal_entry", "reversed_at", "reversal_reason",
         ]
 

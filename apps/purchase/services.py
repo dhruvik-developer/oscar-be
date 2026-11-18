@@ -2468,6 +2468,12 @@ def create_standalone_grn(
 
     if po is not None:
         refresh_po_receipt_status(po)
+
+    try:
+        from apps.pms import loom_services
+        loom_services.sync_yarn_receipt_to_loom_stock(receipt)
+    except Exception:
+        pass
     return receipt
 
 

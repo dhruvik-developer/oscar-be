@@ -507,3 +507,121 @@ class ProductionLifecycleTests(TestCase):
         self.assertIn("Processing", names)
         self.assertNotIn("Processing (Dyeing)", names)
         self.assertEqual(ProcessPlan.objects.filter(client=self.tenant).count(), 1)
+
+    def test_source_po_fk_and_lifecycle_derivation(self):
+        """Test explicit source_po FK on ProductionInstruction correctly identifies source PO."""
+        from apps.pms.lifecycle_services import source_purchase_order, latest_instruction_for_po
+
+        self.make_instruction()
+        self.pi.source_po = self.po
+        self.pi.order_reference = "DIFFERENT-REF"
+        self.pi.save(update_fields=["source_po", "order_reference"])
+
+        resolved_po = source_purchase_order(self.pi)
+        self.assertEqual(resolved_po.id, self.po.id)
+
+        latest_inst = latest_instruction_for_po(self.po)
+        self.assertEqual(latest_inst.id, self.pi.id)
+
+    def test_dynamic_rate_calculation_from_pick_charge(self):
+        """Test final PO line item rate calculation using PPI * Pick Rate formula."""
+        from apps.pms.models_loom import LoomQuality, YarnMaster
+
+        self.make_instruction()
+        self.produce(1000)
+        self.qc(1000)
+
+        warp_ym = YarnMaster.objects.create(
+            client=self.tenant, name="75D Warp Lifecycle", denier=75, rate=Decimal("180.00")
+        )
+        weft_ym = YarnMaster.objects.create(
+            client=self.tenant, name="150D Weft Lifecycle", denier=150, rate=Decimal("140.00")
+        )
+        LoomQuality.objects.create(
+            client=self.tenant,
+            name=self.fabric.name,
+            warp_yarn=warp_ym,
+            ends=3600,
+            weft_yarn=weft_ym,
+            reed=68,
+            reed_w=Decimal("58.00"),
+            ppi=Decimal("68.00"),
+            pick_charge=Decimal("0.2200"),
+        )
+
+        self.pi.fabric = self.fabric.name
+        self.pi.agreed_job_rate = Decimal("0.00")
+        self.pi.agreed_rate = Decimal("0.00")
+        self.pi.status = "In Progress"
+        self.pi.save()
+
+        verified_inst = production_services.verify_instruction(
+            self.pi, user=self.admin, reason="Quality Passed"
+        )
+        self.assertEqual(verified_inst.status, "PO Pending")
+
+        updated_inst = production_services.generate_final_job_work_po(
+            verified_inst, user=self.admin, custom_data={"vendorId": str(self.agency_party.id)}
+        )
+        self.assertIsNotNone(updated_inst.final_po)
+        line = updated_inst.final_po.line_items.first()
+        self.assertEqual(line.rate, Decimal("14.9600"))
+
+    def test_sync_yarn_receipt_to_loom_stock(self):
+        """Test auto-crediting Yarn PO GoodsReceipt into Loom YarnDelivery ledger."""
+        from apps.masters.models import ItemCategory, Location
+        from apps.pms.models_loom import LoomFactory
+        from apps.pms import loom_services
+        from apps.purchase.models import GoodsReceipt, GoodsReceiptLine
+
+        factory = LoomFactory.objects.create(client=self.tenant, name="Lifecycle Loom Factory")
+        cat_yarn, _ = ItemCategory.objects.get_or_create(client=self.tenant, code="YARN", defaults={"name": "Yarn"})
+        yarn_item = Item.objects.create(
+            client=self.tenant,
+            sku="YARN-LC-150D",
+            name="150D Yarn Lifecycle",
+            category=cat_yarn,
+            tax_pct=Decimal("12.00"),
+            uom="Kg",
+        )
+        loc = Location.objects.create(
+            client=self.tenant, code="WH-LC-YARN", name="Yarn LC Godown", type="Warehouse", is_active=True
+        )
+        po_yarn = PurchaseOrder.objects.create(
+            client=self.tenant,
+            po_number="PO-YARN-LC-001",
+            party=self.agency_party,
+            doc_date=date(2026, 11, 1),
+            status="Approved",
+        )
+        po_line = PurchaseOrderLine.objects.create(
+            client=self.tenant,
+            purchase_order=po_yarn,
+            line_no=1,
+            item=yarn_item,
+            qty=Decimal("1000.00"),
+            rate=Decimal("130.00"),
+            uom="Kg",
+        )
+        grn = GoodsReceipt.objects.create(
+            client=self.tenant,
+            grn_number="GRN-YARN-LC-01",
+            purchase_order=po_yarn,
+            party=self.agency_party,
+            receipt_date=date(2026, 11, 3),
+            location=loc,
+        )
+        GoodsReceiptLine.objects.create(
+            client=self.tenant,
+            goods_receipt=grn,
+            purchase_order_line=po_line,
+            item=yarn_item,
+            received_qty=Decimal("1000.00"),
+            stock_qty=Decimal("1000.00"),
+            uom="Kg",
+        )
+        deliveries = loom_services.sync_yarn_receipt_to_loom_stock(grn)
+        self.assertEqual(len(deliveries), 1)
+        self.assertEqual(deliveries[0].status, "Received")
+        self.assertEqual(deliveries[0].recd_kgs, Decimal("1000.00"))
+        self.assertEqual(deliveries[0].factory_id, factory.id)
