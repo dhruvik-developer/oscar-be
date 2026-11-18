@@ -51,8 +51,13 @@ class LoomCoordinatorSerializer(serializers.ModelSerializer):
                 attrs["phone"] = emp.phone
             if not attrs.get("email") and emp.email:
                 attrs["email"] = emp.email
-            if not attrs.get("user") and getattr(emp, "user", None):
-                attrs["user"] = emp.user
+            if not attrs.get("user"):
+                from apps.accounts.models import User
+                user_match = User.objects.filter(employee=emp, deleted_at__isnull=True).first()
+                if not user_match and emp.email:
+                    user_match = User.objects.filter(email__iexact=emp.email, deleted_at__isnull=True).first()
+                if user_match:
+                    attrs["user"] = user_match
         return attrs
 
 
@@ -72,6 +77,8 @@ class LoomFactorySerializer(serializers.ModelSerializer):
     job_worker_party_details = serializers.SerializerMethodField()
     machines = serializers.SerializerMethodField()
     machines_count = serializers.SerializerMethodField()
+    assigned_employee_names = serializers.SerializerMethodField()
+    assigned_user_names = serializers.SerializerMethodField()
 
     class Meta:
         model = LoomFactory
@@ -80,7 +87,15 @@ class LoomFactorySerializer(serializers.ModelSerializer):
             "factory_type", "warehouse", "warehouse_name", "warehouse_details",
             "job_worker_party", "job_worker_party_name", "job_worker_party_details",
             "is_active", "machines", "machines_count",
+            "assigned_employees", "assigned_users",
+            "assigned_employee_names", "assigned_user_names",
         ]
+
+    def get_assigned_employee_names(self, obj):
+        return [e.name for e in obj.assigned_employees.all() if e.name]
+
+    def get_assigned_user_names(self, obj):
+        return [u.name for u in obj.assigned_users.all() if u.name]
 
     def get_warehouse_details(self, obj):
         if not obj.warehouse:

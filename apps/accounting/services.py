@@ -1273,7 +1273,7 @@ def account_ledger(client_id, account_id, *, date_from=None, date_to=None):
 
 
 @transaction.atomic
-def write_off_customer_receivable(client_id, party_id, amount, reason="Bad debt write-off", user=None, invoice_id=None):
+def write_off_customer_receivable(client_id, party_id=None, amount=None, reason="Bad debt write-off", user=None, invoice_id=None, party=None):
     """Write off uncollectible customer balance / invoice (PDF §14, §16).
     
     Posts:
@@ -1285,6 +1285,9 @@ def write_off_customer_receivable(client_id, party_id, amount, reason="Bad debt 
     from apps.core.audit import record_audit
     from apps.core.exceptions import ValidationFailed
     
+    if party_id is None and party is not None:
+        party_id = getattr(party, "id", party)
+
     party = Party.objects.select_for_update().filter(pk=party_id, client_id=client_id, deleted_at__isnull=True).first()
     if not party:
         raise ValidationFailed("Customer party not found.")
@@ -1301,50 +1304,30 @@ def write_off_customer_receivable(client_id, party_id, amount, reason="Bad debt 
         credit(debtors_acc, writeoff_amount, party=party, description=f"Bad debt write-off against {party.name}"),
     ]
     
-    today_str = timezone.localdate().strftime('%Y%m%d')
-    ref_doc = f"WO-{party.code or 'CUST'}-{today_str}"
-    entry = post_journal_entry(
-        client_id,
-        postings,
-        date=timezone.localdate(),
+    entry = post_entry(
+        client=client_id,
+        postings=postings,
+        narration=f"Customer bad debt written off for {party.name}: {reason}",
         source_document_type="CustomerWriteOff",
         source_document_id=party.id,
-        source_document_number=ref_doc,
-        description=f"Bad debt write-off for {party.name}: {reason}",
         user=user,
     )
     
-    # Update party balance
-    party.balance = round2(D(party.balance or ZERO) - writeoff_amount)
-    party.save(update_fields=["balance", "updated_at"])
-    
-    # If specific invoice was provided, update its amount_paid / status
     if invoice_id:
-        invoice_obj = SalesInvoice.objects.filter(pk=invoice_id, client_id=client_id, deleted_at__isnull=True).first()
-        if invoice_obj:
-            invoice_obj.amount_paid = round2(D(invoice_obj.amount_paid or ZERO) + writeoff_amount)
-            if invoice_obj.amount_paid >= D(invoice_obj.total or ZERO):
-                invoice_obj.payment_status = "Written Off"
-            invoice_obj.notes = f"{(invoice_obj.notes or '')} [Written off: ₹{writeoff_amount} on {timezone.localdate()} - {reason}]"
-            invoice_obj.save(update_fields=["amount_paid", "payment_status", "notes", "updated_at"])
+        invoice = SalesInvoice.objects.select_for_update().filter(pk=invoice_id, client_id=client_id).first()
+        if invoice:
+            invoice.notes = (invoice.notes or "") + f" [Bad debt written off: ₹{writeoff_amount} ({reason})]"
+            invoice.save(update_fields=["notes", "updated_at"])
     
     record_audit(
         client=client_id,
         actor=user,
-        action="customer_bad_debt_writeoff",
+        action="write_off",
         entity_type="Party",
         entity_id=party.id,
-        entity_label=party.name,
-        description=f"Wrote off ₹{writeoff_amount} bad debt for customer {party.name}. Ref: {ref_doc}",
-        after={"balance": str(party.balance), "writtenOff": str(writeoff_amount), "journalEntryId": str(entry.id)},
+        description=f"Wrote off bad debt ₹{writeoff_amount:,.2f} for customer {party.name}: {reason}",
     )
-    return {
-        "success": True,
-        "journalEntryId": str(entry.id),
-        "referenceNumber": ref_doc,
-        "amount": str(writeoff_amount),
-        "partyId": str(party.id),
-        "partyName": party.name,
-        "newBalance": str(party.balance),
-        "message": f"Successfully written off ₹{writeoff_amount} to Bad Debts Expense.",
-    }
+    return entry
+
+
+

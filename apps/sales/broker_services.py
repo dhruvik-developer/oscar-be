@@ -543,8 +543,9 @@ def hold_broker_commission(commission, *, reason=None, user=None):
     commission = BrokerCommission.objects.select_for_update().get(pk=commission.pk)
     if commission.status == "Paid":
         raise Conflict("Cannot hold a commission that has already been paid.")
+    prev_status = commission.status
     commission.status = "Hold"
-    note = f" [Placed on Hold: {reason or 'Administrative hold per §12'}]"
+    note = f" [Placed on Hold: {reason or 'Administrative hold per §12'}][PreviousStatus:{prev_status}]"
     commission.notes = (commission.notes or "") + note
     commission.save(update_fields=["status", "notes", "updated_at"])
     return commission
@@ -558,8 +559,10 @@ def release_broker_commission_hold(commission, *, user=None):
         return commission
     if D(commission.paid_amount) > ZERO:
         commission.status = "Partially Paid"
-    elif commission.approved_by_id or commission.approved_at:
+    elif "[PreviousStatus:Payable]" in (commission.notes or "") or commission.approved_by_id or commission.approved_at:
         commission.status = "Payable"
+    elif "[PreviousStatus:Approved]" in (commission.notes or ""):
+        commission.status = "Approved"
     else:
         commission.status = "Accrued"
     commission.notes = (commission.notes or "") + " [Hold released]"
