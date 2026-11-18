@@ -42,6 +42,26 @@ class AllowPublic(BasePermission):
         return True
 
 
+class IsAdminOrDebug(BasePermission):
+    """Allows access if DEBUG is True or caller is an authenticated staff/superuser/admin."""
+
+    def has_permission(self, request, view):
+        from django.conf import settings
+
+        if getattr(settings, "DEBUG", False):
+            return True
+        user = getattr(request, "user", None)
+        if user and getattr(user, "is_authenticated", False):
+            if getattr(user, "is_superuser", False) or getattr(user, "is_staff", False):
+                return True
+            perms = getattr(user, "permission_ids", None)
+            if perms is None and hasattr(user, "effective_permissions"):
+                perms = user.effective_permissions()
+            if perms and ("manage_company_profile" in perms or "view_audit_logs" in perms):
+                return True
+        return False
+
+
 class HasModulePermission(IsAuthenticatedInTenant):
     """Checks the permission ids a view declares.
 
@@ -58,9 +78,8 @@ class HasModulePermission(IsAuthenticatedInTenant):
             "cancel": ["cancel_invoice"],
         }
 
-    A missing entry means the action is open to any authenticated tenant user;
-    that is deliberate, because api.md Appendix B has no ids for several
-    read-only screens and inventing them would break the seeded roles.
+    A view with NO declared permissions fails closed (denied with code PERMISSION_DENIED)
+    unless it explicitly sets allow_any_authenticated = True.
     """
 
     def has_permission(self, request, view):
@@ -68,7 +87,13 @@ class HasModulePermission(IsAuthenticatedInTenant):
 
         required = self._required_for(view, getattr(view, "action", None), request.method)
         if not required:
-            return True
+            if getattr(view, "allow_any_authenticated", False) or getattr(view, "__class__", None).__name__ == "APIRootView":
+                return True
+            raise PermissionDenied(
+                "Access to this resource is restricted.",
+                code="PERMISSION_DENIED",
+                detail="No permissions declared for this view or action.",
+            )
 
         user = request.user
         granted = getattr(user, "permission_ids", None)

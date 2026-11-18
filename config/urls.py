@@ -100,7 +100,7 @@ api_v1 += [
 
 urlpatterns = [
     path("api/v1/", include(api_v1)),
-    path("django-admin/", admin.site.urls),
+    path(getattr(settings, "DJANGO_ADMIN_URL", "django-admin/"), admin.site.urls),
 ]
 
 if settings.DEBUG:

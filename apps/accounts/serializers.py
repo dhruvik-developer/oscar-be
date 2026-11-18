@@ -3,6 +3,7 @@ import re
 
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.utils import timezone
 from rest_framework import serializers
 
 from apps.core.exceptions import ValidationFailed
@@ -284,12 +285,28 @@ class UserSerializer(BaseModelSerializer):
             raw_role = self.initial_data.get("role") or self.initial_data.get("roleName")
             if raw_role:
                 client_id = self.context.get("client_id") or getattr(instance, "client_id", None)
-                matched_role = Role.objects.filter(client_id=client_id, name__iexact=str(raw_role).strip()).first()
+                matched_role = None
+                try:
+                    matched_role = Role.objects.filter(client_id=client_id, pk=raw_role).first()
+                except Exception:
+                    pass
+                if not matched_role:
+                    matched_role = Role.objects.filter(client_id=client_id, name__iexact=str(raw_role).strip()).first()
                 if not matched_role:
                     matched_role = Role.objects.filter(client_id=client_id, code__iexact=str(raw_role).strip()).first()
                 if matched_role:
                     validated_data["role"] = matched_role
+        old_role_id = instance.role_id
+        old_status = instance.status
         user = super().update(instance, validated_data)
+        if user.role_id != old_role_id:
+            UserSession.objects.filter(user=user, revoked_at__isnull=True).update(
+                revoked_at=timezone.now(), revoked_reason="role_changed"
+            )
+        if user.status != "Active" and old_status == "Active":
+            UserSession.objects.filter(user=user, revoked_at__isnull=True).update(
+                revoked_at=timezone.now(), revoked_reason="user_deactivated"
+            )
         if password:
             request = self.context.get("request")
             set_by_self = bool(request and getattr(request.user, "pk", None) == user.pk)
@@ -402,6 +419,9 @@ class RoleSerializer(BaseModelSerializer):
         RolePermission.objects.filter(role=role).delete()
         RolePermission.objects.bulk_create(
             [RolePermission(role=role, permission_id=p) for p in permission_ids]
+        )
+        UserSession.objects.filter(user__role=role, revoked_at__isnull=True).update(
+            revoked_at=timezone.now(), revoked_reason="role_permissions_changed"
         )
 
     def create(self, validated_data):

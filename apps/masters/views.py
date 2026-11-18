@@ -89,6 +89,8 @@ class PartyViewSet(TenantModelViewSet):
     serializer_class = PartySerializer
     audit_entity_type = "Party"
     audit_label_field = "name"
+    required_permissions = ["view_masters"]
+    permission_map = {"read": ["view_masters"], "write": ["view_masters"]}
     search_fields = ["name", "code", "phone", "email", "gstin"]
     ordering_fields = ["name", "code", "balance", "created_at"]
     ordering = ["name"]
@@ -371,7 +373,7 @@ class ItemViewSet(TenantModelViewSet):
         "fabricColor": "fabric_color",
         "fabric_color": "fabric_color",
     }
-    permission_map = {"write": ["view_inventory"]}
+    permission_map = {"read": ["view_inventory"], "write": ["view_inventory"]}
 
     def filter_queryset(self, queryset):
         queryset = super().filter_queryset(queryset)
@@ -805,6 +807,8 @@ class ItemCategoryViewSet(TenantModelViewSet):
     serializer_class = ItemCategorySerializer
     audit_entity_type = "ItemCategory"
     audit_label_field = "name"
+    required_permissions = ["view_masters"]
+    permission_map = {"read": ["view_masters"], "write": ["view_masters"]}
     search_fields = ["name", "code", "description", "parent__name", "parent__code"]
     ordering = ["code", "name"]
     status_field = None
@@ -859,6 +863,8 @@ class UnitViewSet(TenantModelViewSet):
     serializer_class = UnitSerializer
     audit_entity_type = "Unit"
     audit_label_field = "code"
+    required_permissions = ["view_masters"]
+    permission_map = {"read": ["view_masters"], "write": ["view_masters"]}
     search_fields = ["code", "label", "uom_type", "description"]
     ordering = ["code"]
     status_field = None
@@ -893,6 +899,8 @@ class LocationViewSet(TenantModelViewSet):
     serializer_class = LocationSerializer
     audit_entity_type = "Location"
     audit_label_field = "name"
+    required_permissions = ["view_masters"]
+    permission_map = {"read": ["view_masters"], "write": ["view_masters"]}
     search_fields = ["name", "code", "manager", "description"]
     ordering = ["name"]
     status_field = None
@@ -1112,6 +1120,8 @@ class TextileMasterViewSet(TenantModelViewSet):
     ordering = ["name"]
     status_field = None
     filter_map = {"isActive": "is_active", "is_active": "is_active"}
+    required_permissions = ["view_masters"]
+    permission_map = {"read": ["view_masters"], "write": ["view_masters"]}
 
 
 class VariantPartViewSet(TextileMasterViewSet):
@@ -1236,6 +1246,8 @@ class FabricViewSet(TenantModelViewSet):
     ordering = ["name"]
     status_field = None
     filter_map = {"isActive": "is_active", "is_active": "is_active"}
+    required_permissions = ["view_masters"]
+    permission_map = {"read": ["view_masters"], "write": ["view_masters"]}
 
     def check_delete_allowed(self, fabric):
         """Block archiving while an active Fabric-kind item references it."""

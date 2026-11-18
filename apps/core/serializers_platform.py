@@ -24,7 +24,27 @@ class FileSerializer(BaseModelSerializer):
         ]
 
     def get_url(self, file_row):
-        return public_url(file_row, self.context.get("request"))
+        request = self.context.get("request")
+        if request and hasattr(request, "user"):
+            user = request.user
+            if not getattr(user, "is_superuser", False):
+                perms = getattr(user, "permission_ids", None)
+                if perms is None:
+                    perms = (
+                        user.effective_permissions()
+                        if hasattr(user, "effective_permissions")
+                        else set()
+                    )
+                admin_perms = {
+                    "manage_company_profile",
+                    "view_audit_logs",
+                    "system_backup",
+                }
+                if not (perms & admin_perms) and file_row.uploaded_by_id != getattr(
+                    user, "id", None
+                ):
+                    return None
+        return public_url(file_row, request)
 
 
 class AuditLogSerializer(BaseModelSerializer):

@@ -106,6 +106,11 @@ class LoginRoleTests(TestCase):
         admin.save(update_fields=["is_active"])
         self.assertNotIn(ADMIN_CODE, self.codes())
 
+    def test_invalid_tenant_slug_format_is_rejected(self):
+        resp = APIClient().get("/api/v1/auth/login-roles/?tenant=' OR 1=1--")
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["code"], "VALIDATION_FAILED")
+
     # -- sign-in ----------------------------------------------------------------
 
     def test_own_role_signs_in(self):
