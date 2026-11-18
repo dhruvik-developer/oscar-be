@@ -70,7 +70,7 @@ class LoomFactorySerializer(serializers.ModelSerializer):
     job_worker_party_name = serializers.CharField(source="job_worker_party.name", read_only=True, default="")
     warehouse_details = serializers.SerializerMethodField()
     job_worker_party_details = serializers.SerializerMethodField()
-    machines = LoomMachineSerializer(many=True, read_only=True)
+    machines = serializers.SerializerMethodField()
     machines_count = serializers.SerializerMethodField()
 
     class Meta:
@@ -101,6 +101,10 @@ class LoomFactorySerializer(serializers.ModelSerializer):
             "code": getattr(obj.job_worker_party, "code", ""),
             "phone": getattr(obj.job_worker_party, "phone", ""),
         }
+
+    def get_machines(self, obj):
+        active_machines = obj.machines.filter(deleted_at__isnull=True).order_by("no")
+        return LoomMachineSerializer(active_machines, many=True).data
 
     def get_machines_count(self, obj):
         return obj.machines.filter(deleted_at__isnull=True).count()
@@ -240,7 +244,7 @@ class YarnBookingSerializer(serializers.ModelSerializer):
     yarn_name = serializers.CharField(source="yarn.name", read_only=True)
     supplier_party_name = serializers.CharField(source="supplier_party.name", read_only=True, default="")
     supplier_party_details = serializers.SerializerMethodField()
-    deliveries = YarnDeliverySerializer(many=True, read_only=True)
+    deliveries = serializers.SerializerMethodField()
     scheduled_kgs = serializers.SerializerMethodField()
     delivered_kgs = serializers.SerializerMethodField()
     unscheduled_kgs = serializers.SerializerMethodField()
@@ -277,6 +281,10 @@ class YarnBookingSerializer(serializers.ModelSerializer):
         if sp and not attrs.get("supplier"):
             attrs["supplier"] = sp.name
         return attrs
+
+    def get_deliveries(self, obj):
+        active_deliveries = obj.deliveries.filter(deleted_at__isnull=True).order_by("due", "-created_at")
+        return YarnDeliverySerializer(active_deliveries, many=True).data
 
     def get_scheduled_kgs(self, obj):
         from django.db.models import Sum
