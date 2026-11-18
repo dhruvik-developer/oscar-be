@@ -10,11 +10,12 @@ Implements the global conventions of api.md §1 and db.md §1:
 from datetime import timedelta
 from pathlib import Path
 import os
+import sys
 
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-load_dotenv(BASE_DIR / ".env", override=True)
+load_dotenv(BASE_DIR / ".env", override=False)
 
 
 def env(key, default=None):
@@ -34,7 +35,7 @@ def env_list(key, default=""):
 
 
 SECRET_KEY = env("DJANGO_SECRET_KEY", "dev-insecure-key-do-not-use-in-production")
-DEBUG = env_bool("DJANGO_DEBUG", True)
+DEBUG = env_bool("DJANGO_DEBUG", False)
 # JWTs and password-reset codes are signed with this key; a short or default
 # one makes them forgeable. Development may run with it, production may not.
 if not DEBUG and (len(SECRET_KEY) < 32 or "insecure" in SECRET_KEY or "change-me" in SECRET_KEY):
@@ -45,6 +46,7 @@ if not DEBUG and (len(SECRET_KEY) < 32 or "insecure" in SECRET_KEY or "change-me
         "when DJANGO_DEBUG=False."
     )
 ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1,0.0.0.0,testserver")
+DJANGO_ADMIN_URL = env("DJANGO_ADMIN_URL", "django-admin/").strip("/") + "/"
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -209,6 +211,8 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 # --------------------------------------------------------------------------
 # DRF (api.md §1.3 - §1.5)
 # --------------------------------------------------------------------------
+NUM_PROXIES = int(env("NUM_PROXIES", "0"))
+
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": (
         "apps.accounts.authentication.TenantJWTAuthentication",
@@ -226,6 +230,7 @@ REST_FRAMEWORK = {
     "DEFAULT_RENDERER_CLASSES": ("rest_framework.renderers.JSONRenderer",),
     # api.md §1.6 -- money is a number with 2 decimals, never a formatted string.
     "COERCE_DECIMAL_TO_STRING": False,
+    "NUM_PROXIES": NUM_PROXIES,
     "DEFAULT_THROTTLE_RATES": {
         # Public/unauthenticated surfaces: quotation links, proof links, careers,
         # public lead forms (api.md §5.3, §9.7, §10.6, §11.5).
@@ -239,7 +244,7 @@ REST_FRAMEWORK = {
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(minutes=int(env("ACCESS_TOKEN_MINUTES", "60"))),
     "REFRESH_TOKEN_LIFETIME": timedelta(days=int(env("REFRESH_TOKEN_DAYS", "14"))),
-    "ROTATE_REFRESH_TOKENS": False,
+    "ROTATE_REFRESH_TOKENS": True,
     "AUTH_HEADER_TYPES": ("Bearer",),
     "USER_ID_FIELD": "id",
     "USER_ID_CLAIM": "user_id",
@@ -253,6 +258,7 @@ SPECTACULAR_SETTINGS = {
     "SERVE_INCLUDE_SCHEMA": False,
     "SCHEMA_PATH_PREFIX": "/api/v1",
     "COMPONENT_SPLIT_REQUEST": True,
+    "SERVE_PERMISSIONS": ["apps.core.permissions.IsAdminOrDebug"],
 }
 
 # --------------------------------------------------------------------------
@@ -296,7 +302,7 @@ PMS_PROOF_MAX_BYTES = int(env("PMS_PROOF_MAX_BYTES", str(50 * 1024 * 1024)))
 UPLOAD_URL_TTL_SECONDS = 900
 #: Signed file download/preview URLs (``previewUrl`` on PMS documents). Long
 #: enough that a cached project still previews after days, not just an hour.
-FILE_DOWNLOAD_TTL_SECONDS = int(env("FILE_DOWNLOAD_TTL_SECONDS", str(7 * 24 * 3600)))
+FILE_DOWNLOAD_TTL_SECONDS = int(env("FILE_DOWNLOAD_TTL_SECONDS", "3600"))
 PUBLIC_SHARE_DEFAULT_EXPIRY_DAYS = 14
 EXCHANGE_RATE_URL = env("EXCHANGE_RATE_URL", "https://open.er-api.com/v6/latest/USD")
 EXCHANGE_RATE_CACHE_SECONDS = 24 * 60 * 60
@@ -319,20 +325,40 @@ EMAIL_USE_SSL = env("EMAIL_USE_SSL", "False").strip().lower() in ("1", "true", "
 DEFAULT_FROM_EMAIL = env("DEFAULT_FROM_EMAIL", "")
 EMAIL_TIMEOUT = int(env("EMAIL_TIMEOUT", "20"))
 
-CACHES = {
-    "default": {
-        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
-        "LOCATION": "evenmore-erp",
+REDIS_URL = env("REDIS_URL", "")
+if REDIS_URL:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.redis.RedisCache",
+            "LOCATION": REDIS_URL,
+        }
     }
-}
+else:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+            "LOCATION": "evenmore-erp",
+        }
+    }
 
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
+    "filters": {
+        "sensitive_data_filter": {
+            "()": "apps.core.logging_filters.SensitiveDataFilter",
+        },
+    },
     "formatters": {
         "simple": {"format": "{levelname} {asctime} {name} {message}", "style": "{"}
     },
-    "handlers": {"console": {"class": "logging.StreamHandler", "formatter": "simple"}},
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "simple",
+            "filters": ["sensitive_data_filter"],
+        }
+    },
     "root": {"handlers": ["console"], "level": "INFO"},
     "loggers": {
         "django.db.backends": {
@@ -342,6 +368,72 @@ LOGGING = {
         },
     },
 }
+
+# --------------------------------------------------------------------------
+# Production-Only Security Hardening (active when DEBUG is False)
+# --------------------------------------------------------------------------
+IS_TESTING = "test" in sys.argv
+
+if not DEBUG:
+    SECURE_SSL_REDIRECT = env_bool("SECURE_SSL_REDIRECT", True)
+    _proxy_ssl_header = env("SECURE_PROXY_SSL_HEADER", "HTTP_X_FORWARDED_PROTO,https")
+    if _proxy_ssl_header:
+        parts = [p.strip() for p in _proxy_ssl_header.split(",", 1)]
+        if len(parts) == 2:
+            SECURE_PROXY_SSL_HEADER = (parts[0], parts[1])
+    SECURE_HSTS_SECONDS = int(env("SECURE_HSTS_SECONDS", "31536000"))
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = env_bool("SECURE_HSTS_INCLUDE_SUBDOMAINS", True)
+    SECURE_HSTS_PRELOAD = env_bool("SECURE_HSTS_PRELOAD", True)
+    SESSION_COOKIE_SECURE = env_bool("SESSION_COOKIE_SECURE", True)
+    CSRF_COOKIE_SECURE = env_bool("CSRF_COOKIE_SECURE", True)
+    SESSION_COOKIE_HTTPONLY = env_bool("SESSION_COOKIE_HTTPONLY", True)
+    SECURE_REFERRER_POLICY = env("SECURE_REFERRER_POLICY", "same-origin")
+    SECURE_CONTENT_TYPE_NOSNIFF = env_bool("SECURE_CONTENT_TYPE_NOSNIFF", True)
+    X_FRAME_OPTIONS = env("X_FRAME_OPTIONS", "DENY")
+else:
+    SECURE_SSL_REDIRECT = env_bool("SECURE_SSL_REDIRECT", False)
+    _proxy_ssl_header = env("SECURE_PROXY_SSL_HEADER", None)
+    if _proxy_ssl_header:
+        parts = [p.strip() for p in _proxy_ssl_header.split(",", 1)]
+        if len(parts) == 2:
+            SECURE_PROXY_SSL_HEADER = (parts[0], parts[1])
+    SECURE_HSTS_SECONDS = int(env("SECURE_HSTS_SECONDS", "0"))
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = env_bool("SECURE_HSTS_INCLUDE_SUBDOMAINS", False)
+    SECURE_HSTS_PRELOAD = env_bool("SECURE_HSTS_PRELOAD", False)
+    SESSION_COOKIE_SECURE = env_bool("SESSION_COOKIE_SECURE", False)
+    CSRF_COOKIE_SECURE = env_bool("CSRF_COOKIE_SECURE", False)
+    SESSION_COOKIE_HTTPONLY = env_bool("SESSION_COOKIE_HTTPONLY", True)
+    SECURE_REFERRER_POLICY = env("SECURE_REFERRER_POLICY", "same-origin")
+    SECURE_CONTENT_TYPE_NOSNIFF = env_bool("SECURE_CONTENT_TYPE_NOSNIFF", True)
+    X_FRAME_OPTIONS = env("X_FRAME_OPTIONS", "DENY")
+
+DATA_UPLOAD_MAX_MEMORY_SIZE = int(env("DATA_UPLOAD_MAX_MEMORY_SIZE", str(50 * 1024 * 1024)))
+FILE_UPLOAD_MAX_MEMORY_SIZE = int(env("FILE_UPLOAD_MAX_MEMORY_SIZE", str(50 * 1024 * 1024)))
+
+# Refuse to start in production if security prerequisites are not met
+if not DEBUG and not IS_TESTING:
+    from django.core.exceptions import ImproperlyConfigured
+
+    if "*" in ALLOWED_HOSTS:
+        raise ImproperlyConfigured("ALLOWED_HOSTS cannot contain '*' when DJANGO_DEBUG=False.")
+
+    localhost_defaults = {"localhost", "127.0.0.1", "0.0.0.0", "testserver", "::1"}
+    if not ALLOWED_HOSTS or set(ALLOWED_HOSTS).issubset(localhost_defaults):
+        raise ImproperlyConfigured(
+            "ALLOWED_HOSTS must specify production domains and cannot use localhost-only defaults when DJANGO_DEBUG=False."
+        )
+
+    db_pass = DATABASES["default"].get("PASSWORD", "")
+    if db_pass == "postgres" or len(db_pass) < 12:
+        raise ImproperlyConfigured(
+            "DB_PASSWORD must not be the default 'postgres' and must be at least 12 characters when DJANGO_DEBUG=False."
+        )
+
+    for origin in CORS_ALLOWED_ORIGINS:
+        if origin.startswith("http://") or "localhost" in origin.lower():
+            raise ImproperlyConfigured(
+                f"CORS_ALLOWED_ORIGINS cannot contain 'http://' or 'localhost' when DJANGO_DEBUG=False (got: '{origin}')."
+            )
 
 # Stock adjustments whose value (qty x cost) exceeds this are not posted: they
 # wait in the approvals inbox and post once approved (apps/inventory/adjustments.py).

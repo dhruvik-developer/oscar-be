@@ -100,10 +100,21 @@ def _coerce_uuid(value):
 def request_ip(request):
     if request is None:
         return None
+    from django.conf import settings
+
+    rf_settings = getattr(settings, "REST_FRAMEWORK", {}) or {}
+    num_proxies = rf_settings.get("NUM_PROXIES")
+    if num_proxies is None:
+        num_proxies = getattr(settings, "NUM_PROXIES", None)
+
+    remote_addr = request.META.get("REMOTE_ADDR")
     forwarded = request.META.get("HTTP_X_FORWARDED_FOR")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.META.get("REMOTE_ADDR")
+
+    if forwarded and num_proxies is not None and num_proxies > 0:
+        parts = [p.strip() for p in forwarded.split(",") if p.strip()]
+        if len(parts) >= num_proxies:
+            return parts[-num_proxies]
+    return remote_addr
 
 
 # ---------------------------------------------------------------------------

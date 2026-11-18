@@ -287,3 +287,20 @@ Stated plainly rather than stubbed silently:
   > **Statutory Compliance Note (PDF §20)**: Applicable GST tax rates (CGST/SGST/IGST slabs) and the mandatory e-invoicing applicability threshold (turnover > ₹5 Cr or prevailing GST notification limit) must be validated with the client's Chartered Accountant (CA) prior to production deployment. Live NIC / GSP production credentials (`EINVOICE_CLIENT_ID`, `EINVOICE_CLIENT_SECRET`, portal username/password) must be procured through the client's registered GSP (e.g. ClearTax, Masters India, or direct NIC ASP gateway).
 - **ITC-04 Statutory GST Return**: Quarterly job-work reporting at `/job-work/itc-04` covering Table 4 (goods sent to job workers), Table 5A (goods received back from job workers), and direct CSV export for GST portal submission.
 
+---
+
+## Security & Production Hardening
+
+- **Django Admin & IP Whitelisting**: The Django admin route is configurable via `DJANGO_ADMIN_URL` (default: `django-admin/`). In production, change this to an unguessable path and restrict HTTP access at the reverse proxy (Nginx / Cloudflare) to internal corporate VPN / authorized static IPs only:
+  ```nginx
+  location /custom-admin-path/ {
+      allow 10.0.0.0/8;       # Internal VPN / office network
+      deny all;
+      proxy_pass http://backend;
+  }
+  ```
+- **API Documentation**: Interactive documentation (`/api/v1/docs/`, `/api/v1/redoc/`, `/api/v1/schema/`) is automatically disabled in production (`DJANGO_DEBUG=False`) unless accessed by an authenticated administrator.
+- **Reverse Proxy & Throttling**: Configure `NUM_PROXIES` in `.env` to match the proxy chain length so DRF throttling and audit IP resolution cannot be bypassed via spoofed `X-Forwarded-For` headers.
+- **Production Prerequisites**: With `DJANGO_DEBUG=False`, the application refuses to start if `DJANGO_ALLOWED_HOSTS` contains wildcard `*` or localhost defaults, if `DB_PASSWORD` is `postgres` or under 12 characters, or if `CORS_ALLOWED_ORIGINS` contains `http://` or `localhost`.
+- **Log Sanitation**: `SensitiveDataFilter` masks `Authorization` headers, passwords, OTPs, and JWT tokens across all log levels.
+

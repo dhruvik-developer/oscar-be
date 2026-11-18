@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 class ApprovalRuleViewSet(viewsets.ModelViewSet):
     # Anyone may read the rules (the inbox shows them); only rule admins change them.
     permission_classes = [HasModulePermission]
-    permission_map = {"write": ["manage_approval_rules"]}
+    permission_map = {"read": ["view_approvals"], "write": ["manage_approval_rules"]}
     serializer_class = ApprovalRuleSerializer
 
     def get_queryset(self):
@@ -32,7 +32,15 @@ class ApprovalRuleViewSet(viewsets.ModelViewSet):
 
 
 class ApprovalRequestViewSet(viewsets.ModelViewSet):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [HasModulePermission]
+    permission_map = {
+        "read": ["view_approvals"],
+        "badge": ["view_approvals"],
+        "create": ["view_approvals"],
+        "approve": ["manage_approvals"],
+        "reject": ["manage_approvals"],
+        "return_correction": ["return_approval"],
+    }
     serializer_class = ApprovalRequestSerializer
 
     def get_queryset(self):
@@ -248,6 +256,9 @@ class AlertIncidentViewSet(viewsets.ModelViewSet):
     # raised by the alert engine and are never edited directly.
     permission_classes = [HasModulePermission]
     permission_map = {
+        "read": ["view_alerts"],
+        "badge": ["view_alerts"],
+        "acknowledge": ["view_alerts"],
         "create": ["manage_alerts"],
         "run": ["manage_alerts"],
         "resolve": ["resolve_alerts"],
@@ -328,7 +339,7 @@ class AlertSettingViewSet(viewsets.ModelViewSet):
     # Anyone may read the settings (the Alert Center shows them); only alert
     # admins change thresholds or switch a rule off.
     permission_classes = [HasModulePermission]
-    permission_map = {"write": ["manage_alerts"]}
+    permission_map = {"read": ["view_alerts"], "write": ["manage_alerts"]}
     serializer_class = AlertSettingSerializer
 
     def get_queryset(self):

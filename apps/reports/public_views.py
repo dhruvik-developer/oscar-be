@@ -848,8 +848,9 @@ class PublicUploadUrlView(PublicWriteView):
         if job is None:
             raise NotFound("This role is no longer open.")
 
+        clean_file_name = file_service.sanitize_filename(request.data.get("fileName"))
         content_type, size = file_service.validate_upload_request(
-            file_name=request.data.get("fileName"),
+            file_name=clean_file_name,
             content_type=request.data.get("contentType"),
             size=request.data.get("size"),
             scope="resume",
@@ -858,9 +859,9 @@ class PublicUploadUrlView(PublicWriteView):
             client_id=job.client_id,
             scope="resume",
             storage_key=file_service.build_storage_key(
-                job.client_id, "resume", request.data.get("fileName")
+                job.client_id, "resume", clean_file_name
             ),
-            file_name=request.data.get("fileName"),
+            file_name=clean_file_name,
             content_type=content_type,
             file_size=size,
             status="pending",

@@ -48,14 +48,16 @@ from .viewsets import BaseViewSet, ReadOnlyTenantViewSet, TenantModelViewSet
 # ---------------------------------------------------------------------------
 class UploadUrlView(APIView):
     """``POST /files/upload-url/`` -> ``{ uploadUrl, fileId, expiresAt }``."""
+    allow_any_authenticated = True
 
     def post(self, request):
         serializer = UploadUrlRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+        clean_file_name = file_service.sanitize_filename(data["fileName"])
 
         content_type, size = file_service.validate_upload_request(
-            file_name=data["fileName"],
+            file_name=clean_file_name,
             content_type=data.get("contentType"),
             size=data["size"],
             scope=data["scope"],
@@ -65,9 +67,9 @@ class UploadUrlView(APIView):
             client_id=request.client_id,
             scope=data["scope"],
             storage_key=file_service.build_storage_key(
-                request.client_id, data["scope"], data["fileName"]
+                request.client_id, data["scope"], clean_file_name
             ),
-            file_name=data["fileName"],
+            file_name=clean_file_name,
             content_type=content_type,
             file_size=size,
             status="pending",
@@ -90,13 +92,25 @@ class UploadUrlView(APIView):
         )
 
 
+class SafeUploadParser(FileUploadParser):
+    """Permissive file upload parser that doesn't fail on raw binary PUTs
+    lacking Content-Disposition headers."""
+
+    def get_filename(self, stream, mime, parser_context):
+        try:
+            filename = super().get_filename(stream, mime, parser_context)
+        except Exception:
+            filename = None
+        return filename or "upload"
+
+
 class FileUploadView(APIView):
     """The ``PUT <uploadUrl>`` step. Authenticated by the signed token alone,
     so the browser can upload without re-sending the bearer token."""
 
     authentication_classes = []
     permission_classes = [AllowPublic]
-    parser_classes = [MultiPartParser, FileUploadParser]
+    parser_classes = [MultiPartParser, SafeUploadParser]
 
     def put(self, request, pk):
         token = request.query_params.get("token")
@@ -119,6 +133,15 @@ class FileUploadView(APIView):
                 field_errors={"file": [f"Exceeds {limit // (1024 * 1024)} MB."]},
             )
 
+        if row.file_size and len(data) != row.file_size:
+            raise ValidationFailed(
+                "Uploaded file size does not match declared size.",
+                code="FILE_SIZE_MISMATCH",
+                field_errors={"file": [f"Expected {row.file_size} bytes, got {len(data)} bytes."]},
+            )
+
+        file_service.validate_file_content(data, row.content_type)
+
         file_service.write_bytes(row.storage_key, data)
         row.file_size = len(data)
         row.checksum_sha256 = hashlib.sha256(data).hexdigest()
@@ -128,6 +151,7 @@ class FileUploadView(APIView):
 
 class FileCommitView(APIView):
     """``POST /files/{fileId}/commit/`` -- flips ``pending`` to ``committed``."""
+    allow_any_authenticated = True
 
     def post(self, request, pk):
         row = File.objects.filter(
@@ -166,15 +190,36 @@ class FileDownloadView(APIView):
             raise NotFound("That file no longer exists.")
 
         path = file_service.local_path(row.storage_key)
-        if not path.exists():
+        if not path.exists() or not path.is_file():
             raise NotFound("That file is no longer available.")
 
         response = FileResponse(open(path, "rb"), content_type=row.content_type)
-        response["Content-Disposition"] = f'inline; filename="{row.file_name}"'
-        # The PMS proof viewer renders PDFs in an <iframe> on the same origin
-        # (vite dev proxy / same deployment), which the global DENY policy
-        # would block. Relax clickjacking protection for this response only.
-        response["X-Frame-Options"] = "SAMEORIGIN"
+        inline_requested = (
+            request.query_params.get("inline") in ("true", "1")
+            or request.query_params.get("disposition") == "inline"
+        )
+        safe_inline_types = {
+            "application/pdf",
+            "image/png",
+            "image/jpeg",
+            "image/webp",
+            "image/gif",
+        }
+        from django.utils.http import content_disposition_header
+
+        if inline_requested and row.content_type in safe_inline_types:
+            response["Content-Disposition"] = content_disposition_header(
+                as_attachment=False, filename=row.file_name
+            )
+            response["X-Frame-Options"] = "SAMEORIGIN"
+        else:
+            response["Content-Disposition"] = content_disposition_header(
+                as_attachment=True, filename=row.file_name
+            )
+            response["X-Frame-Options"] = "DENY"
+
+        response["X-Content-Type-Options"] = "nosniff"
+        response["Content-Security-Policy"] = "default-src 'none'; sandbox"
         return response
 
 
@@ -186,6 +231,22 @@ class FileViewSet(ReadOnlyTenantViewSet):
     status_field = "status"
     search_fields = ["file_name"]
     ordering = ["-created_at"]
+    allow_any_authenticated = True
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = getattr(self.request, "user", None)
+        if not user or not user.is_authenticated:
+            return qs.none()
+        if getattr(user, "is_superuser", False):
+            return qs
+        perms = getattr(user, "permission_ids", None)
+        if perms is None:
+            perms = user.effective_permissions() if hasattr(user, "effective_permissions") else set()
+        admin_perms = {"manage_company_profile", "view_audit_logs", "system_backup"}
+        if perms & admin_perms:
+            return qs
+        return qs.filter(uploaded_by=user)
 
 
 # ---------------------------------------------------------------------------
@@ -198,8 +259,8 @@ class NotificationViewSet(ReadOnlyTenantViewSet):
     status_field = None
     filter_map = {"category": "category", "type": "type"}
     ordering = ["-created_at"]
-
     search_fields = ["title", "body"]
+    allow_any_authenticated = True
 
     def get_queryset(self):
         """The recipient's own notifications. ``?view=`` picks the box:
@@ -356,6 +417,9 @@ class NotificationViewSet(ReadOnlyTenantViewSet):
         )
 
 
+MAX_CONCURRENT_SSE_PER_USER = 3
+
+
 class EventStreamView(APIView):
     """``GET /events/stream/`` -- SSE for live badges and toasts (api.md §1.13).
 
@@ -368,40 +432,64 @@ class EventStreamView(APIView):
     the client's EventSource reconnects.
     """
 
+    allow_any_authenticated = True
+
     def get(self, request):
         client_id = request.client_id
-        user_id = request.user.id
+        user_id = str(request.user.id)
+        cache_key = f"sse_active_{user_id}"
+
+        current_streams = cache.get(cache_key, 0)
+        if current_streams >= MAX_CONCURRENT_SSE_PER_USER:
+            return Response(
+                {
+                    "message": "Too many concurrent event streams. Please close inactive tabs.",
+                    "code": "TOO_MANY_STREAMS",
+                },
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+        try:
+            cache.incr(cache_key)
+        except ValueError:
+            cache.set(cache_key, 1, timeout=120)
+
         deadline = time.monotonic() + 55
 
         def events():
-            last_seen = timezone.now()
-            yield "retry: 5000\n\n"
-            while time.monotonic() < deadline:
-                fresh = list(
-                    Notification.objects.filter(
-                        client_id=client_id,
-                        recipient_id=user_id,
-                        created_at__gt=last_seen,
-                    ).order_by("created_at")[:20]
-                )
-                for notification in fresh:
-                    last_seen = max(last_seen, notification.created_at)
-                    payload = json.dumps(
-                        {
-                            "id": str(notification.id),
-                            "type": notification.type,
-                            "category": notification.category,
-                            "title": notification.title,
-                            "body": notification.body,
-                            "entityType": notification.entity_type,
-                            "entityId": str(notification.entity_id)
-                            if notification.entity_id
-                            else None,
-                        }
+            try:
+                last_seen = timezone.now()
+                yield "retry: 5000\n\n"
+                while time.monotonic() < deadline:
+                    fresh = list(
+                        Notification.objects.filter(
+                            client_id=client_id,
+                            recipient_id=user_id,
+                            created_at__gt=last_seen,
+                        ).order_by("created_at")[:20]
                     )
-                    yield f"event: notification\ndata: {payload}\n\n"
-                yield ": keep-alive\n\n"
-                time.sleep(3)
+                    for notification in fresh:
+                        last_seen = max(last_seen, notification.created_at)
+                        payload = json.dumps(
+                            {
+                                "id": str(notification.id),
+                                "type": notification.type,
+                                "category": notification.category,
+                                "title": notification.title,
+                                "body": notification.body,
+                                "entityType": notification.entity_type,
+                                "entityId": str(notification.entity_id)
+                                if notification.entity_id
+                                else None,
+                            }
+                        )
+                        yield f"event: notification\ndata: {payload}\n\n"
+                    yield ": keep-alive\n\n"
+                    time.sleep(3)
+            finally:
+                try:
+                    cache.decr(cache_key)
+                except Exception:
+                    pass
 
         response = StreamingHttpResponse(events(), content_type="text/event-stream")
         response["Cache-Control"] = "no-cache"
@@ -531,6 +619,7 @@ class SupportTicketViewSet(TenantModelViewSet):
     audit_label_field = "subject"
     status_field = "status"
     ordering = ["-created_at"]
+    allow_any_authenticated = True
 
     def get_queryset(self):
         """api.md §12.3 -- ``GET /support/tickets/`` is "the caller's own tickets"."""
@@ -550,6 +639,8 @@ class ExchangeRatesView(APIView):
     third-party rate limits, and two users seeing different rates for the same
     document. Cached for a day (api.md §12.4).
     """
+
+    allow_any_authenticated = True
 
     def get(self, request):
         cached = cache.get("exchange_rates")
@@ -604,6 +695,8 @@ class GlobalSearchView(APIView):
     (api-integration.md §9.1.3).
     """
 
+    allow_any_authenticated = True
+
     def get(self, request):
         query = (request.query_params.get("q") or "").strip()
         if len(query) < 2:
@@ -616,7 +709,21 @@ class GlobalSearchView(APIView):
         client_id = request.client_id
         results = []
 
-        if "item" in wanted:
+        user = request.user
+        if getattr(user, "is_superuser", False):
+            user_perms = None
+        else:
+            user_perms = getattr(user, "permission_ids", None)
+            if user_perms is None and hasattr(user, "effective_permissions"):
+                user_perms = user.effective_permissions()
+            user_perms = set(user_perms or [])
+
+        def can_view(*required):
+            if user_perms is None:
+                return True
+            return any(p in user_perms for p in required)
+
+        if "item" in wanted and can_view("view_inventory", "view_masters"):
             from apps.masters.models import Item
 
             for row in Item.objects.filter(
@@ -634,7 +741,9 @@ class GlobalSearchView(APIView):
                     }
                 )
 
-        if wanted & {"customer", "vendor", "party"}:
+        if (wanted & {"customer", "vendor", "party"}) and can_view(
+            "view_masters", "view_sales", "view_purchase"
+        ):
             from apps.masters.models import Party
 
             for row in Party.objects.filter(
@@ -654,17 +763,19 @@ class GlobalSearchView(APIView):
                 )
 
         document_sources = [
-            ("salesOrder", "apps.sales.models", "SalesOrder", "order_number", "/sales/orders/"),
-            ("invoice", "apps.sales.models", "SalesInvoice", "invoice_number", "/sales/invoices/"),
-            ("challan", "apps.sales.models", "DeliveryChallan", "challan_number", "/sales/challans/"),
+            ("salesOrder", "apps.sales.models", "SalesOrder", "order_number", "/sales/orders/", ["view_sales"]),
+            ("invoice", "apps.sales.models", "SalesInvoice", "invoice_number", "/sales/invoices/", ["view_sales"]),
+            ("challan", "apps.sales.models", "DeliveryChallan", "challan_number", "/sales/challans/", ["view_sales"]),
             # [Quotation & Proforma Invoice modules are commented out]
             # ("proforma", "apps.sales.models", "ProformaInvoice", "proforma_number",
-             # "/sales/proforma-invoices/"),
+             # "/sales/proforma-invoices/", ["view_sales"]),
             ("purchaseOrder", "apps.purchase.models", "PurchaseOrder", "po_number",
-             "/purchase/orders/"),
+             "/purchase/orders/", ["view_purchase"]),
         ]
-        for kind, module_path, model_name, number_field, url_prefix in document_sources:
+        for kind, module_path, model_name, number_field, url_prefix, req_perms in document_sources:
             if kind not in wanted:
+                continue
+            if not can_view(*req_perms):
                 continue
             import importlib
 
@@ -685,7 +796,7 @@ class GlobalSearchView(APIView):
                     }
                 )
 
-        if "lead" in wanted:
+        if "lead" in wanted and can_view("view_lead"):
             from apps.crm.models import Lead
 
             for row in Lead.objects.filter(
@@ -704,7 +815,7 @@ class GlobalSearchView(APIView):
                     }
                 )
 
-        if "project" in wanted:
+        if "project" in wanted and can_view("view_projects", "view_pms"):
             from apps.pms.models import Project
 
             for row in Project.objects.filter(
@@ -723,7 +834,7 @@ class GlobalSearchView(APIView):
                     }
                 )
 
-        if "employee" in wanted:
+        if "employee" in wanted and can_view("view_staff"):
             from apps.hrms.models import Employee
 
             for row in Employee.objects.filter(
@@ -763,6 +874,7 @@ class DocumentSignatureView(APIView):
     """
 
     permission_classes = [IsAuthenticatedInTenant]
+    allow_any_authenticated = True
 
     @staticmethod
     def _slot_args(source):

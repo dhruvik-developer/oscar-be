@@ -4229,7 +4229,14 @@ class ProjectViewSet(TenantModelViewSet):
                 if not stage:
                     raise NotFound("Stage not found on this project.")
 
-                file_name = (request.data.get("file_name") or request.data.get("fileName") or "document.pdf").strip()
+                raw_name = (request.data.get("file_name") or request.data.get("fileName") or "document.pdf").strip()
+                from apps.core.files import (
+                    sanitize_filename,
+                    validate_file_content,
+                    EXTENSION_TO_CONTENT_TYPES,
+                    write_bytes,
+                )
+                file_name = sanitize_filename(raw_name)
                 file_size = int(request.data.get("file_size") or request.data.get("fileSize") or 0)
                 doc_type = (request.data.get("doc_type") or request.data.get("docType") or "Design Proof").strip()
                 raw_comments = (request.data.get("comments") or "").strip()
@@ -4247,11 +4254,39 @@ class ProjectViewSet(TenantModelViewSet):
                 file_id = request.data.get("file_id") or request.data.get("fileId")
                 file_obj = File.objects.filter(client_id=client_id, id=file_id).first() if file_id else None
                 if not file_obj:
-                    content_type = "application/pdf" if file_name.lower().endswith(".pdf") else "image/png" if file_name.lower().endswith((".png", ".jpg", ".jpeg", ".webp")) else "application/octet-stream"
+                    ext = Path(file_name).suffix.lower()
+                    if ext in EXTENSION_TO_CONTENT_TYPES:
+                        content_type = EXTENSION_TO_CONTENT_TYPES[ext][0]
+                    else:
+                        raise ValidationFailed(
+                            f"File extension '{ext}' is not allowed.",
+                            field_errors={"fileName": ["Invalid file extension."]},
+                        )
+
+                    clean_code = sanitize_filename(project.code)
+                    clean_stage = sanitize_filename(str(stage.id))
+                    storage_key = f"pms/{clean_code}/{clean_stage}/{secrets.token_hex(6)}_{file_name}"
+
+                    if isinstance(preview_url, str) and preview_url.startswith("data:"):
+                        import base64
+                        try:
+                            _header, encoded = preview_url.split(",", 1)
+                            file_bytes = base64.b64decode(encoded)
+                            validate_file_content(file_bytes, content_type)
+                            write_bytes(storage_key, file_bytes)
+                            file_size = len(file_bytes)
+                        except ValidationFailed:
+                            raise
+                        except Exception as exc:
+                            raise ValidationFailed(
+                                "Invalid file data.",
+                                field_errors={"fileData": [str(exc)]},
+                            )
+
                     file_obj = File.objects.create(
                         client=project.client,
                         scope="pms_document",
-                        storage_key=f"pms/{project.code}/{stage.id}/{secrets.token_hex(6)}_{file_name}",
+                        storage_key=storage_key,
                         file_name=file_name,
                         content_type=content_type,
                         file_size=file_size,
