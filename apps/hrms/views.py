@@ -2619,6 +2619,11 @@ class FlexibilityPolicyView(APIView):
 
         )
 
+        try:
+            services.sync_day_attendance_for_all_punched(request.client_id)
+        except Exception:
+            pass
+
         return Response(policy)
 
 

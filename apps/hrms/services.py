@@ -58,7 +58,8 @@ DEFAULT_FLEXIBILITY = {
 #: DEFAULT_FLEXIBILITY. ``normalize_flexibility`` keeps the two in step.
 SCREEN_FLEXIBILITY_KEYS = (
     "gracePeriod", "lateAfter", "halfDayThreshold", "minimumWorkingHours",
-    "flexibleWorkingHours", "overtimeStartsAfter",
+    "flexibleWorkingHours", "overtimeStartsAfter", "shiftStart", "shiftEnd",
+    "flexiblePunchInStart", "flexiblePunchInEnd", "flexiblePunchOutStart", "flexiblePunchOutEnd",
 )
 
 
@@ -86,17 +87,24 @@ def normalize_flexibility(policy, *, screen_wins=False):
     """
     policy = dict(policy)
     if screen_wins:
+        if policy.get("shiftStart") and _clocks_in(policy.get("shiftStart")):
+            policy["shiftStart"] = _clocks_in(policy.get("shiftStart"))[0].zfill(5)
+        if policy.get("shiftEnd") and _clocks_in(policy.get("shiftEnd")):
+            policy["shiftEnd"] = _clocks_in(policy.get("shiftEnd"))[0].zfill(5)
+
+        clocks = _clocks_in(policy.get("flexibleWorkingHours"))
+        if clocks:
+            policy.setdefault("shiftStart", clocks[0].zfill(5))
+            if len(clocks) > 1:
+                policy.setdefault("shiftEnd", clocks[1].zfill(5))
+
+        late_clocks = _clocks_in(policy.get("lateAfter")) or _clocks_in(policy.get("flexiblePunchInEnd"))
+        explicit_late_after = late_clocks[0].zfill(5) if late_clocks else None
+
         grace = _number_in(policy.get("gracePeriod"))
         if grace is not None:
             policy["graceMinutes"] = int(grace)
-        clocks = _clocks_in(policy.get("flexibleWorkingHours"))
-        if clocks:
-            policy["shiftStart"] = clocks[0].zfill(5)
-            if len(clocks) > 1:
-                policy["shiftEnd"] = clocks[1].zfill(5)
-        elif _clocks_in(policy.get("lateAfter")):
-            late_after = _clocks_in(policy.get("lateAfter"))[0]
-            policy["shiftStart"] = _shift_clock(late_after, -int(policy.get("graceMinutes") or 0))
+
         half = _number_in(policy.get("halfDayThreshold"))
         if half is not None:
             policy["halfDayThresholdHours"] = float(half)
@@ -107,12 +115,42 @@ def normalize_flexibility(policy, *, screen_wins=False):
         if overtime is not None:
             policy["overtimeAfterHours"] = float(overtime)
 
+        if explicit_late_after:
+            policy["lateAfter"] = explicit_late_after
+            start_str = policy.get("shiftStart") or "09:00"
+            st = _parse_time(start_str, time(9, 0))
+            lt = _parse_time(explicit_late_after, time(9, 30))
+            diff_m = (lt.hour * 60 + lt.minute) - (st.hour * 60 + st.minute)
+            if diff_m >= 0 and "gracePeriod" not in policy:
+                policy["graceMinutes"] = diff_m
+                policy["gracePeriod"] = f"{diff_m} minutes"
+
+    shift_start = policy.get("shiftStart") or "09:00"
+    policy["shiftStart"] = shift_start
+    policy.setdefault("shiftEnd", "18:00")
     grace = int(policy.get("graceMinutes") or 0)
+
+    if not policy.get("lateAfter"):
+        policy["lateAfter"] = _shift_clock(shift_start, grace)
+    else:
+        st = _parse_time(shift_start, time(9, 0))
+        lt = _parse_time(policy["lateAfter"], time(9, 30))
+        diff_m = (lt.hour * 60 + lt.minute) - (st.hour * 60 + st.minute)
+        if diff_m >= 0:
+            policy["graceMinutes"] = diff_m
+            policy["gracePeriod"] = f"{diff_m} minutes"
+        else:
+            policy.setdefault("gracePeriod", f"{grace} minutes")
+
+    policy["flexiblePunchInStart"] = policy["shiftStart"]
+    policy["flexiblePunchInEnd"] = policy["lateAfter"]
+    full_day_h = float(policy.get("fullDayHours") or 8)
+    policy["flexiblePunchOutStart"] = _shift_clock(policy["flexiblePunchInStart"], int(full_day_h * 60))
+    policy["flexiblePunchOutEnd"] = _shift_clock(policy["flexiblePunchInEnd"], int(full_day_h * 60))
+
     policy.setdefault("overtimeAfterHours", policy.get("fullDayHours") or 8)
-    policy["lateAfter"] = _shift_clock(policy.get("shiftStart"), grace)
-    policy.setdefault("gracePeriod", f"{grace} minutes")
-    policy.setdefault("halfDayThreshold", f"{policy.get('halfDayThresholdHours')} hours")
-    policy.setdefault("minimumWorkingHours", f"{policy.get('fullDayHours')} hours")
+    policy.setdefault("halfDayThreshold", f"{policy.get('halfDayThresholdHours', 4)} hours")
+    policy.setdefault("minimumWorkingHours", f"{policy.get('fullDayHours', 8)} hours")
     policy.setdefault(
         "flexibleWorkingHours", f"{policy.get('shiftStart')} - {policy.get('shiftEnd')} (Flexible)"
     )
@@ -249,9 +287,16 @@ def derive_attendance(client_id, *, check_in, check_out, submitted_status=None):
             pass
 
     local_check_in = timezone.localtime(check_in) if timezone.is_aware(check_in) else check_in
-    latest_on_time = (
-        datetime.combine(local_check_in.date(), shift_start) + timedelta(minutes=grace)
-    )
+    if policy.get("lateAfter"):
+        late_cutoff = _parse_time(policy.get("lateAfter"), shift_start)
+        latest_on_time = datetime.combine(local_check_in.date(), late_cutoff)
+    elif policy.get("flexiblePunchInEnd"):
+        late_cutoff = _parse_time(policy.get("flexiblePunchInEnd"), shift_start)
+        latest_on_time = datetime.combine(local_check_in.date(), late_cutoff)
+    else:
+        latest_on_time = (
+            datetime.combine(local_check_in.date(), shift_start) + timedelta(minutes=grace)
+        )
     if local_check_in.replace(tzinfo=None) > latest_on_time:
         return "Late", hours
 
@@ -782,7 +827,7 @@ def approve_leave(leave_request, *, user=None, remark=None):
     """
     leave_request = LeaveRequest.objects.select_for_update().get(pk=leave_request.pk)
     if leave_request.status == "Approved":
-        raise Conflict("This leave is already approved.", code=Codes.ALREADY_DONE)
+        return leave_request
     if leave_request.status in ("Rejected", "Cancelled"):
         raise Conflict(
             f"This leave request is {leave_request.status.lower()}.",
@@ -2228,14 +2273,53 @@ def calculate_punch_metrics(client_id, employee, work_date, punches=None, breaks
         if policy.get("lateAfter"):
             late_cutoff = _parse_time(policy.get("lateAfter"), shift_start)
             grace_dt = datetime.combine(local_first_in.date(), late_cutoff)
+        elif policy.get("flexiblePunchInEnd"):
+            late_cutoff = _parse_time(policy.get("flexiblePunchInEnd"), shift_start)
+            grace_dt = datetime.combine(local_first_in.date(), late_cutoff)
         else:
             grace_dt = shift_start_dt + timedelta(minutes=grace)
+        # Between shift start and flexible punch-in cutoff (e.g. 09:00 - 09:30), not considered late!
         if local_first_in.replace(tzinfo=None) > grace_dt:
-            diff = (local_first_in.replace(tzinfo=None) - shift_start_dt).total_seconds()
+            diff = (local_first_in.replace(tzinfo=None) - grace_dt).total_seconds()
             late_minutes = max(0, int(diff // 60))
+        else:
+            late_minutes = 0
 
     early_leaving_minutes = 0
-    if last_out:
+    is_early_out = False
+    required_work_seconds = int(full_day_hours * Decimal(3600))
+    expected_exit_dt = None
+    if first_in:
+        local_first_in = (
+            timezone.localtime(first_in.punch_time)
+            if timezone.is_aware(first_in.punch_time)
+            else first_in.punch_time
+        )
+        expected_exit_dt = local_first_in.replace(tzinfo=None) + timedelta(
+            seconds=required_work_seconds + int(total_completed_break_seconds)
+        )
+
+    if last_out and first_in:
+        local_last_out = (
+            timezone.localtime(last_out.punch_time)
+            if timezone.is_aware(last_out.punch_time)
+            else last_out.punch_time
+        )
+        # If employee completed their full working hours (e.g. 8 hours):
+        # Punch in at 09:30 -> punch out at 17:30 (5:30 PM with 0 break) fulfills 8h working hours,
+        # which is a complete working day and NOT an early departure.
+        if net_working_seconds >= required_work_seconds or working_hours >= full_day_hours:
+            early_leaving_minutes = 0
+            is_early_out = False
+        else:
+            if expected_exit_dt and local_last_out.replace(tzinfo=None) < expected_exit_dt:
+                diff = (expected_exit_dt - local_last_out.replace(tzinfo=None)).total_seconds()
+                early_leaving_minutes = max(0, int(diff // 60))
+                is_early_out = True
+            else:
+                early_leaving_minutes = 0
+                is_early_out = False
+    elif last_out:
         local_last_out = (
             timezone.localtime(last_out.punch_time)
             if timezone.is_aware(last_out.punch_time)
@@ -2245,8 +2329,7 @@ def calculate_punch_metrics(client_id, employee, work_date, punches=None, breaks
         if local_last_out.replace(tzinfo=None) < shift_end_dt:
             diff = (shift_end_dt - local_last_out.replace(tzinfo=None)).total_seconds()
             early_leaving_minutes = max(0, int(diff // 60))
-
-    is_early_out = bool(last_out and (early_leaving_minutes > 0 or working_hours < full_day_hours))
+            is_early_out = bool(early_leaving_minutes > 0 or working_hours < full_day_hours)
 
     overtime_threshold_hours = Decimal(str(policy.get("overtimeStartsAfterHours") or full_day_hours))
     overtime_threshold_seconds = int(overtime_threshold_hours * 3600)
@@ -2300,6 +2383,13 @@ def calculate_punch_metrics(client_id, employee, work_date, punches=None, breaks
         "is_early_out": is_early_out,
         "shift_start": policy.get("shiftStart", "09:30"),
         "shift_end": policy.get("shiftEnd", "18:30"),
+        "late_after": policy.get("lateAfter", "09:30"),
+        "flexible_punch_in_start": policy.get("flexiblePunchInStart", "09:00"),
+        "flexible_punch_in_end": policy.get("flexiblePunchInEnd", "09:30"),
+        "flexible_punch_out_start": policy.get("flexiblePunchOutStart", "17:00"),
+        "flexible_punch_out_end": policy.get("flexiblePunchOutEnd", "17:30"),
+        "expected_exit_time": format_time_ampm(expected_exit_dt) if expected_exit_dt else None,
+        "expected_exit_iso": expected_exit_dt.isoformat() if expected_exit_dt else None,
         "full_day_hours": float(full_day_hours),
         "half_day_threshold_hours": float(half_day_threshold),
         "overtime_seconds": overtime_seconds,
@@ -2427,6 +2517,13 @@ def get_today_punch_status(client, employee, work_date=None):
         "early_minutes": early_mins,
         "shift_start": metrics["shift_start"],
         "shift_end": metrics["shift_end"],
+        "late_after": metrics.get("late_after"),
+        "flexible_punch_in_start": metrics.get("flexible_punch_in_start"),
+        "flexible_punch_in_end": metrics.get("flexible_punch_in_end"),
+        "flexible_punch_out_start": metrics.get("flexible_punch_out_start"),
+        "flexible_punch_out_end": metrics.get("flexible_punch_out_end"),
+        "expected_exit_time": metrics.get("expected_exit_time"),
+        "expected_exit_iso": metrics.get("expected_exit_iso"),
         "full_day_hours": metrics["full_day_hours"],
         "half_day_threshold_hours": metrics["half_day_threshold_hours"],
         "has_pending_regularization": has_pending_regularization,
@@ -2921,8 +3018,9 @@ def sync_attendance_from_punches(*, client, work_date=None):
             att_row.late_minutes = metrics["late_minutes"]
             att_row.early_leaving_minutes = metrics["early_leaving_minutes"]
             att_row.overtime_hours = metrics["overtime_hours"]
-            att_row.status = status_to_use
-            att_row.source = "punch"
+            if att_row.source not in ("bulk", "manual", "regularization"):
+                att_row.status = status_to_use
+                att_row.source = "punch"
             att_row.deleted_at = None
             att_row.deleted_by = None
             att_row.save()
@@ -3289,3 +3387,59 @@ def decide_asset_request(request_row, *, approve, user=None, remark=None, asset=
     request_row.save()
     return request_row
 
+
+
+def sync_day_attendance_for_all_punched(client_id, work_date=None):
+    """Recalculate and update Attendance rows from punches for all employees on work_date."""
+    if work_date is None:
+        work_date = timezone.localdate()
+    emp_ids = AttendancePunch.objects.filter(
+        client_id=client_id, work_date=work_date, deleted_at__isnull=True
+    ).values_list("employee_id", flat=True).distinct()
+    from apps.hrms.models import Employee
+    for emp_id in emp_ids:
+        employee = Employee.objects.filter(id=emp_id, client_id=client_id).first()
+        if not employee:
+            continue
+        all_punches = list(
+            AttendancePunch.objects.filter(
+                client_id=client_id, employee=employee, work_date=work_date, deleted_at__isnull=True
+            ).order_by("punch_time")
+        )
+        all_breaks = list(
+            AttendanceBreak.objects.filter(
+                client_id=client_id, employee=employee, work_date=work_date, deleted_at__isnull=True
+            ).order_by("break_in_time")
+        )
+        if not all_punches:
+            continue
+        metrics = calculate_punch_metrics(
+            client_id, employee, work_date, punches=all_punches, breaks=all_breaks
+        )
+        first_in_dt = metrics["first_in"].punch_time if metrics["first_in"] else None
+        last_out_dt = metrics["last_out"].punch_time if metrics["last_out"] else None
+        first_punch_time = metrics["first_punch"].punch_time if metrics["first_punch"] else None
+        last_punch_time = last_out_dt if metrics["day_completed"] else None
+        check_in_time = first_in_dt or first_punch_time
+        check_out_time = last_out_dt if metrics["day_completed"] else None
+        att_row = Attendance.objects.filter(
+            client_id=client_id, employee=employee, work_date=work_date
+        ).first()
+        if att_row:
+            status_to_use = metrics["status"]
+            if att_row.status in ("On Leave", "Holiday", "Week Off"):
+                status_to_use = att_row.status
+            att_row.first_punch = first_punch_time
+            att_row.last_punch = last_punch_time
+            att_row.check_in = check_in_time
+            att_row.check_out = check_out_time
+            att_row.hours = metrics["working_hours"]
+            att_row.working_hours = metrics["working_hours"]
+            att_row.total_attendance_hours = metrics["total_attendance_hours"]
+            att_row.total_break_minutes = metrics["total_break_minutes"]
+            att_row.late_minutes = metrics["late_minutes"]
+            att_row.early_leaving_minutes = metrics["early_leaving_minutes"]
+            att_row.overtime_hours = metrics["overtime_hours"]
+            att_row.status = status_to_use
+            att_row.source = "punch"
+            att_row.save()
