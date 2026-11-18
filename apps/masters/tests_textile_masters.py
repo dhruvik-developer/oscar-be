@@ -15,7 +15,10 @@ class TextileMasterTests(TestCase):
             slug="textile-test-tenant", defaults={"name": "Textile Test Tenant"}
         )
         self.user = User.objects.create_user(
-            email="textile-masters@example.com", password="pass", client=self.client_obj
+            email="textile-masters@example.com",
+            password="pass",
+            client=self.client_obj,
+            is_superuser=True,
         )
         self.api = APIClient()
         self.api.credentials(

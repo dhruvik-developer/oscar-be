@@ -2592,15 +2592,27 @@ class QCDashboardView(APIView):
         # 6-Month Trend
         trend_months = []
         for i in range(5, -1, -1):
-            m_date = (today.replace(day=1) - timedelta(days=i * 28)).replace(day=1)
-            next_m = (m_date.replace(day=28) + timedelta(days=4)).replace(day=1)
+            m = today.month - i
+            y = today.year
+            while m <= 0:
+                m += 12
+                y -= 1
+            m_date = date(y, m, 1)
+            next_m = date(y + 1, 1, 1) if m == 12 else date(y, m + 1, 1)
             m_label = m_date.strftime("%b")
+            month_end = next_m - timedelta(days=1)
+
+            # Grey GoodsReceiptLines
             m_lines = GoodsReceiptLine.objects.filter(
                 goods_receipt__client_id=client_id,
-                goods_receipt__receipt_date__range=[m_date, next_m - timedelta(days=1)],
+                goods_receipt__deleted_at__isnull=True,
+                goods_receipt__receipt_date__range=[m_date, month_end],
             )
+            if supplier_filter and supplier_filter != "All":
+                m_lines = m_lines.filter(goods_receipt__party__name=supplier_filter)
             if stage == "dyeing":
                 m_lines = m_lines.none()
+
             m_good = m_lines.filter(goods_receipt__qc_status__in=["Approved", "Partially Approved"]).aggregate(
                 q=Coalesce(Sum(Coalesce("weighed_qty", "received_qty") - F("rejected_qty")), Value(Decimal("0.0000")), output_field=QTY)
             )["q"]
@@ -2611,14 +2623,35 @@ class QCDashboardView(APIView):
                 q=Coalesce(Sum("rejected_qty"), Value(Decimal("0.0000")), output_field=QTY)
             )["q"]
             m_rep = JWOReprocess.objects.filter(
-                client_id=client_id, date__range=[m_date, next_m - timedelta(days=1)]
+                client_id=client_id, date__range=[m_date, month_end]
             ).filter(_reprocess_stage_q(client_id, stage)).aggregate(q=Coalesce(Sum("qty"), Value(Decimal("0.0000")), output_field=QTY))["q"]
+
+            # Job Work Inwards (Dyeing / processing)
+            jwo_m = JWOInward.objects.filter(
+                client_id=client_id,
+                date__range=[m_date, month_end],
+            )
+            if supplier_filter and supplier_filter != "All":
+                jwo_m = jwo_m.filter(Q(job_work_order__vendor_name=supplier_filter) | Q(job_work_order__vendor__name=supplier_filter))
+            if stage == "grey":
+                jwo_m = jwo_m.none()
+
+            jwo_m_good = jwo_m.filter(status__in=["Approved", "Completed"]).aggregate(
+                q=Coalesce(Sum("accepted"), Value(Decimal("0.0000")), output_field=QTY)
+            )["q"]
+            jwo_m_hold = jwo_m.filter(status="On Hold").aggregate(
+                q=Coalesce(Sum("qty"), Value(Decimal("0.0000")), output_field=QTY)
+            )["q"]
+            jwo_m_rej = jwo_m.aggregate(
+                q=Coalesce(Sum("rejected"), Value(Decimal("0.0000")), output_field=QTY)
+            )["q"]
+
             trend_months.append({
                 "month": m_label,
-                "good": float(m_good),
-                "hold": float(m_hold),
+                "good": float(m_good) + float(jwo_m_good),
+                "hold": float(m_hold) + float(jwo_m_hold),
                 "reprocess": float(m_rep),
-                "rejected": float(m_rej),
+                "rejected": float(m_rej) + float(jwo_m_rej),
             })
 
         # Supplier Rejection %
@@ -5575,6 +5608,8 @@ class TakaTagPrintView(APIView):
     """Endpoints for Taka Tag Print register, summary metrics, filters, and print event recording."""
     permission_classes = [HasModulePermission]
     module_name = "inventory"
+    required_permissions = ["view_inventory"]
+    permission_map = {"read": ["view_inventory"], "write": ["view_inventory"]}
 
     def get(self, request):
         client_id = request.client_id
@@ -5794,6 +5829,8 @@ class TakaTagScanView(APIView):
     """Fast barcode scanner lookup endpoint for takas (Code 128 / Taka ID)."""
     permission_classes = [HasModulePermission]
     module_name = "inventory"
+    required_permissions = ["view_inventory"]
+    permission_map = {"read": ["view_inventory"], "write": ["view_inventory"]}
 
     def get(self, request):
         client_id = request.client_id
@@ -5857,6 +5894,8 @@ class TakaTagHistoryView(APIView):
     """View print/reprint history audit logs for a specific taka."""
     permission_classes = [HasModulePermission]
     module_name = "inventory"
+    required_permissions = ["view_inventory"]
+    permission_map = {"read": ["view_inventory"], "write": ["view_inventory"]}
 
     def get(self, request, pk=None):
         client_id = request.client_id
@@ -5911,6 +5950,8 @@ class TakaTagPdfView(APIView):
     """Generate printable PDF labels (60mm x 40mm) with Code 128 barcode using ReportLab."""
     permission_classes = [HasModulePermission]
     module_name = "inventory"
+    required_permissions = ["view_inventory"]
+    permission_map = {"read": ["view_inventory"], "write": ["view_inventory"]}
 
     def get(self, request):
         import io

@@ -2,10 +2,13 @@
 Authentication and identity (api.md §2) and Administration (api.md §3).
 """
 import hashlib
+import re
 from datetime import timedelta
 
 from django.conf import settings
 from django.contrib.auth import authenticate
+from django.contrib.auth.hashers import check_password, make_password
+from django.core.cache import cache
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.db.models import Count, Q
@@ -75,6 +78,30 @@ from .serializers import (
 
 MAX_FAILED_LOGINS = 8
 LOCKOUT = timedelta(minutes=15)
+DUMMY_PASSWORD_HASH = make_password("dummy_password_timing_mitigation_oscar_erp")
+
+
+def _notify_account_locked(user):
+    """Notify the real user by email that their account has been temporarily locked."""
+    try:
+        from django.core.mail import send_mail
+
+        minutes = max((int(LOCKOUT.total_seconds()) + 59) // 60, 1)
+        send_mail(
+            subject="Security Alert: Your account has been temporarily locked",
+            message=(
+                f"Hello {user.name or 'there'},\n\n"
+                f"We detected {MAX_FAILED_LOGINS} consecutive failed sign-in attempts on your account. "
+                f"For your protection, sign-in has been temporarily locked for {minutes} minutes.\n\n"
+                f"If you forgot your password, you can reset it at any time using the 'Forgot password?' link.\n"
+                f"If you did not make these attempts, please inform your system administrator immediately.\n"
+            ),
+            from_email=getattr(settings, "DEFAULT_FROM_EMAIL", None) or "security@example.com",
+            recipient_list=[user.email],
+            fail_silently=True,
+        )
+    except Exception:
+        pass
 
 
 def _hash(token):
@@ -151,15 +178,17 @@ class LoginView(APIView):
             candidates = matched
 
         if len(candidates) != 1:
+            check_password(password, DUMMY_PASSWORD_HASH)
             raise invalid
 
         user = candidates[0]
 
         # The password is not checked while locked: the lock is what stops
-        # guessing, so a locked account must not say whether a guess was right.
+        # guessing. Run dummy hash for timing uniformity and return uniform error.
         if user.is_locked():
+            check_password(password, DUMMY_PASSWORD_HASH)
             _audit_login(user, request, "login_blocked", "Sign-in refused: account locked")
-            raise _locked_error(user)
+            raise invalid
 
         if not user.check_password(password):
             if user.locked_until is not None:
@@ -169,10 +198,9 @@ class LoginView(APIView):
             user.failed_login_count += 1
             if user.failed_login_count >= MAX_FAILED_LOGINS:
                 user.locked_until = timezone.now() + LOCKOUT
+                _notify_account_locked(user)
             user.save(update_fields=["failed_login_count", "locked_until"])
             _audit_login(user, request, "login_failed", "Sign-in failed: wrong password")
-            if user.locked_until is not None:
-                raise _locked_error(user)
             raise invalid
 
         # Status is only revealed to someone who knows the password, so these
@@ -357,8 +385,35 @@ class RefreshView(APIView):
                 detail=str(exc),
             ) from exc
 
-        session = UserSession.objects.filter(refresh_token_hash=_hash(raw)).first()
-        if session is None or not session.is_active:
+        raw_hash = _hash(raw)
+        session = UserSession.objects.filter(refresh_token_hash=raw_hash).first()
+        if session is None:
+            # Check for reuse of a previously rotated refresh token
+            cached_session_id = cache.get(f"rotated_refresh:{raw_hash}")
+            if cached_session_id:
+                revoked_session = UserSession.objects.filter(pk=cached_session_id).first()
+                if revoked_session:
+                    now = timezone.now()
+                    revoked_session.revoked_at = now
+                    revoked_session.revoked_reason = "reuse_detected"
+                    revoked_session.save(update_fields=["revoked_at", "revoked_reason"])
+                    UserSession.objects.filter(user=revoked_session.user, revoked_at__isnull=True).update(
+                        revoked_at=now, revoked_reason="reuse_detected"
+                    )
+                    record_audit(
+                        client=revoked_session.client_id,
+                        actor=revoked_session.user,
+                        action="refresh_token_reuse_detected",
+                        entity_type="UserSession",
+                        entity_id=revoked_session.id,
+                        description="Reuse of rotated refresh token detected; session revoked",
+                        ip=request_ip(request),
+                    )
+            raise NotAuthenticated(
+                "Your session has been signed out.", code="TOKEN_REVOKED"
+            )
+
+        if not session.is_active:
             raise NotAuthenticated(
                 "Your session has been signed out.", code="TOKEN_REVOKED"
             )
@@ -369,13 +424,32 @@ class RefreshView(APIView):
         if user is None or user.status != "Active":
             raise NotAuthenticated("This account is not active.", code="ACCOUNT_INACTIVE")
 
+        if user.client is None or user.client.status != "Active":
+            raise NotAuthenticated("This workspace is not active.", code="TENANT_INACTIVE")
+
         set_current_client_id(user.client_id)
+
+        tokens = build_tokens(user, session=session)
+        new_refresh = tokens["refresh"]
+        new_refresh_hash = _hash(new_refresh)
+
+        # Store rotated token hash to detect replay attacks
+        refresh_ttl = int(settings.SIMPLE_JWT["REFRESH_TOKEN_LIFETIME"].total_seconds())
+        cache.set(f"rotated_refresh:{raw_hash}", str(session.id), timeout=refresh_ttl)
+
+        session.refresh_token_hash = new_refresh_hash
         session.last_seen_at = timezone.now()
-        session.save(update_fields=["last_seen_at"])
-        return Response({"access": build_tokens(user, session=session)["access"]})
+        session.save(update_fields=["refresh_token_hash", "last_seen_at"])
+
+        return Response({
+            "access": tokens["access"],
+            "refresh": new_refresh,
+        })
 
 
 class LogoutView(APIView):
+    allow_any_authenticated = True
+
     def post(self, request):
         raw = request.data.get("refresh")
         session_id = getattr(request.user, "session_id", None)
@@ -399,6 +473,8 @@ class LogoutView(APIView):
 
 
 class MeView(APIView):
+    allow_any_authenticated = True
+
     def get(self, request):
         return Response(_me_payload(request.user, request))
 
@@ -410,6 +486,7 @@ class MeView(APIView):
 
 
 class ChangePasswordView(APIView):
+    allow_any_authenticated = True
     throttle_classes = [PasswordChangeThrottle]
 
     def post(self, request):
@@ -575,6 +652,7 @@ class ResetPasswordView(APIView):
 
 class SessionListView(APIView):
     """``GET /auth/sessions/`` -- the topbar security panel."""
+    allow_any_authenticated = True
 
     def get(self, request):
         sessions = UserSession.objects.filter(user=request.user).order_by("-last_seen_at")
@@ -588,6 +666,7 @@ class SessionListView(APIView):
 
 class SessionRevokeOthersView(APIView):
     """``POST /auth/sessions/revoke-others/`` -- sign out every other device."""
+    allow_any_authenticated = True
 
     def post(self, request):
         current = getattr(request.user, "session_id", None) or ""
@@ -618,6 +697,7 @@ LOGIN_HISTORY_ACTIONS = (
 
 class LoginHistoryView(APIView):
     """``GET /auth/login-history/`` -- the caller's own recent sign-in events."""
+    allow_any_authenticated = True
 
     def get(self, request):
         from apps.core.models import AuditLog
@@ -672,10 +752,16 @@ class LoginRoleOptionsView(APIView):
 
     def get(self, request):
         slug = (request.query_params.get("tenant") or "").strip() or None
+        if slug and not re.match(r"^[a-z0-9_-]{1,64}$", slug):
+            raise ValidationFailed(
+                "Invalid tenant format.", field_errors={"tenant": ["Invalid format."]}
+            )
         return Response({"roles": login_role_options(slug)})
 
 
 class SessionDetailView(APIView):
+    allow_any_authenticated = True
+
     def delete(self, request, pk):
         session = UserSession.objects.filter(pk=pk, user=request.user).first()
         if session is None:
@@ -869,6 +955,9 @@ class UserViewSet(TenantModelViewSet):
                     for p in serializer.validated_data.get("deny", [])
                 ]
             )
+            UserSession.objects.filter(user=user, revoked_at__isnull=True).update(
+                revoked_at=timezone.now(), revoked_reason="permissions_changed"
+            )
             self.write_audit(
                 "permissions", user, after=serializer.validated_data,
                 description="Permission overrides updated",
@@ -925,6 +1014,9 @@ class RoleViewSet(TenantModelViewSet):
                 field_errors={"reassignTo": ["Cannot reassign to the role being deleted."]},
             )
         attached.update(role=target)
+        UserSession.objects.filter(user__in=attached, revoked_at__isnull=True).update(
+            revoked_at=timezone.now(), revoked_reason="role_reassigned"
+        )
 
     def perform_destroy(self, instance):
         if instance.is_system:

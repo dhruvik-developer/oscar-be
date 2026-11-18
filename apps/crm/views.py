@@ -1878,6 +1878,8 @@ class SourceViewSet(TenantModelViewSet):
     audit_label_field = "name"
     status_field = None
     ordering = ["name"]
+    required_permissions = ["view_lead"]
+    permission_map = {"read": ["view_lead"], "write": ["manage_pipeline"]}
 
     def list(self, request, *args, **kwargs):
         # A workspace that never had sources gets Broker / Sales Person, so
@@ -1893,6 +1895,8 @@ class IndustryViewSet(TenantModelViewSet):
     audit_label_field = "name"
     status_field = None
     ordering = ["name"]
+    required_permissions = ["view_lead"]
+    permission_map = {"read": ["view_lead"], "write": ["manage_pipeline"]}
 
 
 class LostReasonViewSet(TenantModelViewSet):
@@ -1902,6 +1906,8 @@ class LostReasonViewSet(TenantModelViewSet):
     audit_label_field = "name"
     status_field = None
     ordering = ["name"]
+    required_permissions = ["view_lead"]
+    permission_map = {"read": ["view_lead"], "write": ["manage_pipeline"]}
 
 
 class UserAllocationViewSet(TenantModelViewSet):

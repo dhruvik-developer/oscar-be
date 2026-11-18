@@ -159,18 +159,55 @@ class LockoutAndStatusTests(TestCase):
             "/api/v1/auth/login/", {"email": self.email, "password": password, "role": "STAFF"}, format="json"
         )
 
-    def test_lock_is_announced_with_wait_time(self):
+    def test_lock_notifies_user_via_email_and_returns_uniform_error(self):
         for _ in range(MAX_FAILED_LOGINS - 1):
-            self.assertEqual(self.login("Wrong0000!").data["code"], "INVALID_CREDENTIALS")
+            res = self.login("Wrong0000!")
+            self.assertEqual(res.status_code, 401)
+            self.assertEqual(res.data["code"], "INVALID_CREDENTIALS")
+        self.assertEqual(len(mail.outbox), 0)
+
+        # Trigger lockout
         resp = self.login("Wrong0000!")
-        self.assertEqual(resp.data["code"], "ACCOUNT_LOCKED")
-        self.assertGreater(resp.data["payload"]["retryAfterSeconds"], 0)
-        self.assertIn("15 minutes", resp.data["message"])
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(resp.data["code"], "INVALID_CREDENTIALS")
+        self.assertEqual(resp.data["message"], "Incorrect email or password.")
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.is_locked())
+        # Notification sent to user
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, [self.email])
+        self.assertIn("temporarily locked", mail.outbox[0].subject)
 
     def test_locked_account_rejects_even_the_right_password(self):
         self.user.locked_until = timezone.now() + timedelta(minutes=5)
         self.user.save(update_fields=["locked_until"])
-        self.assertEqual(self.login("Right1234!").data["code"], "ACCOUNT_LOCKED")
+        resp = self.login("Right1234!")
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(resp.data["code"], "INVALID_CREDENTIALS")
+        self.assertEqual(resp.data["message"], "Incorrect email or password.")
+
+    def test_unknown_email_and_locked_account_indistinguishable(self):
+        """Unknown email, wrong password, and locked account return identical 401 responses."""
+        res_unknown = self.api.post(
+            "/api/v1/auth/login/",
+            {"email": "nonexistent@example.com", "password": "WrongPassword!", "role": "STAFF"},
+            format="json",
+        )
+        self.assertEqual(res_unknown.status_code, 401)
+        self.assertEqual(res_unknown.data["code"], "INVALID_CREDENTIALS")
+        self.assertEqual(res_unknown.data["message"], "Incorrect email or password.")
+
+        res_wrong = self.login("WrongPassword!")
+        self.assertEqual(res_wrong.status_code, 401)
+        self.assertEqual(res_wrong.data["code"], "INVALID_CREDENTIALS")
+        self.assertEqual(res_wrong.data["message"], "Incorrect email or password.")
+
+        self.user.locked_until = timezone.now() + timedelta(minutes=15)
+        self.user.save(update_fields=["locked_until"])
+        res_locked = self.login("Right1234!")
+        self.assertEqual(res_locked.status_code, 401)
+        self.assertEqual(res_locked.data["code"], "INVALID_CREDENTIALS")
+        self.assertEqual(res_locked.data["message"], "Incorrect email or password.")
 
     def test_expired_lock_starts_a_fresh_count(self):
         self.user.failed_login_count = MAX_FAILED_LOGINS

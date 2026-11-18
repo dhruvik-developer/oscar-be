@@ -113,6 +113,8 @@ class SalesDocumentViewSet(TenantModelViewSet):
     search_fields = ["party_name", "notes"]
     ordering = ["-doc_date", "-created_at"]
     print_title = "Document"
+    required_permissions = ["view_sales"]
+    permission_map = {"read": ["view_sales"], "write": ["view_sales"]}
 
     def get_queryset(self):
         return (
@@ -1659,7 +1661,7 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
         "write": ["create_invoice"],
         "finalize": ["finalize_invoice"],
         "cancel": ["cancel_invoice"],
-        "payment_terms": [],
+        "payment_terms": ["edit_payment_terms"],
     }
 
     def filter_queryset(self, queryset):

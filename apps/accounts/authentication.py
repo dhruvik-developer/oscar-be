@@ -96,6 +96,10 @@ class TenantJWTAuthentication(JWTAuthentication):
 
         if user.deleted_at is not None or user.status == "Deleted":
             raise NotAuthenticated("This account no longer exists.", code="TOKEN_INVALID")
+        if user.status != "Active":
+            raise NotAuthenticated("This account is not active.", code="ACCOUNT_INACTIVE")
+        if user.client and user.client.status != "Active":
+            raise NotAuthenticated("This workspace is not active.", code="TENANT_INACTIVE")
         return user
 
 
