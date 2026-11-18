@@ -92,7 +92,16 @@ class HasModulePermission(IsAuthenticatedInTenant):
     def _required_for(view, action, method):
         permission_map = getattr(view, "permission_map", None) or {}
         if action and action in permission_map:
-            return permission_map[action]
+            entry = permission_map[action]
+            if isinstance(entry, dict):
+                if method in entry:
+                    return entry[method]
+                if method not in ("GET", "HEAD", "OPTIONS") and "write" in entry:
+                    return entry["write"]
+                if method in ("GET", "HEAD", "OPTIONS") and "read" in entry:
+                    return entry["read"]
+                return []
+            return entry
         if method in permission_map:
             return permission_map[method]
         # `write` is a convenience bucket for "any non-safe method".

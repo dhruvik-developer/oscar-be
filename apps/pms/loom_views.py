@@ -11,6 +11,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.core.permissions import HasModulePermission
+from apps.core.exceptions import NotFound, ValidationFailed
 from apps.core.viewsets import TenantModelViewSet
 from .models_loom import (
     LoomCoordinator,
@@ -39,6 +41,11 @@ from .loom_serializers import (
     YarnDeliverySerializer,
     ProductionProgramSerializer,
     FabricDispatchSerializer,
+    LoomMachineBatchCreateSerializer,
+    DailyLoomProductionBulkSaveSerializer,
+    YarnDeliveryConfirmReceiptSerializer,
+    LoomBeamLoadSerializer,
+    LoomBeamAssignSpareSerializer,
 )
 from .loom_services import (
     get_factory_status,
@@ -49,12 +56,16 @@ from .loom_services import (
 
 
 class LoomCoordinatorViewSet(TenantModelViewSet):
-    queryset = LoomCoordinator.objects.all()
+    permission_classes = [HasModulePermission]
+    permission_map = {"read": ["view_pms"], "write": ["create_pms_project"]}
+    queryset = LoomCoordinator.objects.select_related("user", "employee").all()
     serializer_class = LoomCoordinatorSerializer
 
 
 class LoomFactoryViewSet(TenantModelViewSet):
-    queryset = LoomFactory.objects.all()
+    permission_classes = [HasModulePermission]
+    permission_map = {"read": ["view_pms"], "write": ["create_pms_project"]}
+    queryset = LoomFactory.objects.select_related("coord", "warehouse", "job_worker_party").all()
     serializer_class = LoomFactorySerializer
 
     @action(detail=True, methods=["get"])
@@ -66,23 +77,31 @@ class LoomFactoryViewSet(TenantModelViewSet):
     @action(detail=True, methods=["get"])
     def yarn_stock(self, request, pk=None):
         factory = self.get_object()
-        yarns = YarnMaster.objects.filter(deleted_at__isnull=True)
+        yarns = YarnMaster.objects.filter(client_id=request.client_id, deleted_at__isnull=True)
         results = [get_factory_yarn_stock(factory, y) for y in yarns]
         return Response(results)
 
 
 class LoomMachineViewSet(TenantModelViewSet):
+    permission_classes = [HasModulePermission]
+    permission_map = {"read": ["view_pms"], "write": ["create_pms_project"]}
     queryset = LoomMachine.objects.all()
     serializer_class = LoomMachineSerializer
     filterset_fields = ["factory"]
 
     @action(detail=False, methods=["post"])
     def batch_create(self, request):
-        factory_id = request.data.get("factory")
-        from_no = int(request.data.get("from_no", 1))
-        to_no = int(request.data.get("to_no", 1))
-        reed = int(request.data.get("reed", 84))
+        ser = LoomMachineBatchCreateSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+        factory_id = data["factory_id"]
+        from_no = data["from_no"]
+        to_no = data["to_no"]
+        reed = data.get("reed", 84)
         client_id = getattr(request, "client_id", None)
+
+        if not LoomFactory.objects.filter(id=factory_id, client_id=client_id, deleted_at__isnull=True).exists():
+            raise NotFound("Loom factory not found.")
 
         created = []
         for no in range(from_no, to_no + 1):
@@ -97,16 +116,22 @@ class LoomMachineViewSet(TenantModelViewSet):
 
 
 class YarnMasterViewSet(TenantModelViewSet):
+    permission_classes = [HasModulePermission]
+    permission_map = {"read": ["view_pms"], "write": ["create_pms_project"]}
     queryset = YarnMaster.objects.all()
     serializer_class = YarnMasterSerializer
 
 
 class LoomQualityViewSet(TenantModelViewSet):
-    queryset = LoomQuality.objects.all()
+    permission_classes = [HasModulePermission]
+    permission_map = {"read": ["view_pms"], "write": ["create_pms_project"]}
+    queryset = LoomQuality.objects.select_related("warp_yarn", "weft_yarn", "fabric_quality", "item").all()
     serializer_class = LoomQualitySerializer
 
 
 class LoomBeamViewSet(TenantModelViewSet):
+    permission_classes = [HasModulePermission]
+    permission_map = {"read": ["view_pms"], "write": ["create_pms_project"]}
     queryset = LoomBeam.objects.all()
     serializer_class = LoomBeamSerializer
     filterset_fields = ["factory", "status", "machine"]
@@ -114,9 +139,9 @@ class LoomBeamViewSet(TenantModelViewSet):
     @action(detail=True, methods=["post"])
     def load_to_loom(self, request, pk=None):
         beam = self.get_object()
-        machine_id = request.data.get("machine_id")
-        if not machine_id:
-            return Response({"detail": "machine_id required"}, status=status.HTTP_400_BAD_REQUEST)
+        ser = LoomBeamLoadSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        machine_id = ser.validated_data["machine_id"]
 
         with transaction.atomic():
             # Mark currently on-loom beam for this machine as Finished
@@ -133,7 +158,9 @@ class LoomBeamViewSet(TenantModelViewSet):
     @action(detail=True, methods=["post"])
     def assign_spare(self, request, pk=None):
         beam = self.get_object()
-        machine_id = request.data.get("machine_id")
+        ser = LoomBeamAssignSpareSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        machine_id = ser.validated_data.get("machine_id")
         beam.machine_id = machine_id or None
         beam.status = "Spare"
         beam.save(update_fields=["machine", "status", "updated_at"])
@@ -148,18 +175,32 @@ class LoomBeamViewSet(TenantModelViewSet):
 
 
 class DailyLoomProductionViewSet(TenantModelViewSet):
+    permission_classes = [HasModulePermission]
+    permission_map = {"read": ["view_pms"], "write": ["create_pms_project"]}
     queryset = DailyLoomProduction.objects.all()
     serializer_class = DailyLoomProductionSerializer
-    filterset_fields = ["factory", "machine", "date"]
+    filterset_fields = ["factory", "machine", "date", "beam"]
 
     @action(detail=False, methods=["get"])
     def factory_day(self, request):
         factory_id = request.query_params.get("factory")
         dt_str = request.query_params.get("date", date.today().isoformat())
         if not factory_id:
-            return Response({"detail": "factory query param required"}, status=status.HTTP_400_BAD_REQUEST)
+            raise ValidationFailed("factory query param required", field_errors={"factory": ["Required."]})
 
-        factory = LoomFactory.objects.get(id=factory_id)
+        try:
+            factory = LoomFactory.objects.filter(id=factory_id, client_id=request.client_id, deleted_at__isnull=True).first()
+        except (ValueError, Exception):
+            raise ValidationFailed("Invalid factory ID.")
+        if not factory:
+            raise NotFound("Loom factory not found.")
+
+        try:
+            parsed_date = date.fromisoformat(dt_str)
+            dt_str = parsed_date.isoformat()
+        except (ValueError, TypeError):
+            raise ValidationFailed("Invalid date format. Expected YYYY-MM-DD.", field_errors={"date": ["Expected YYYY-MM-DD."]})
+
         day_log = FactoryDayLog.objects.filter(factory=factory, date=dt_str, deleted_at__isnull=True).first()
         power = float(day_log.power) if day_log else 0.0
 
@@ -168,7 +209,7 @@ class DailyLoomProductionViewSet(TenantModelViewSet):
         for m in machines:
             beam = LoomBeam.objects.filter(machine=m, status="On loom", deleted_at__isnull=True).first()
             prod = DailyLoomProduction.objects.filter(machine=m, date=dt_str, deleted_at__isnull=True).first()
-            rem = float(beam.length) - float(DailyLoomProduction.objects.filter(beam=beam).aggregate(s=Sum("meters"))["s"] or 0) if beam else 0.0
+            rem = float(beam.length) - float(DailyLoomProduction.objects.filter(beam=beam, deleted_at__isnull=True).aggregate(s=Sum("meters"))["s"] or 0) if beam else 0.0
             rows.append({
                 "machine_id": str(m.id),
                 "machine_no": m.no,
@@ -176,10 +217,8 @@ class DailyLoomProductionViewSet(TenantModelViewSet):
                 "beam_id": str(beam.id) if beam else None,
                 "beam_no": beam.beam_no if beam else "",
                 "quality_name": beam.quality.name if beam else "",
-                "remaining_m": max(0.0, rem),
-                "done": bool(prod),
-                "prod_id": str(prod.id) if prod else None,
-                "meters": float(prod.meters) if prod else "",
+                "rem_m": round(rem, 1),
+                "meters": float(prod.meters) if prod else None,
                 "rpm": float(prod.rpm) if prod else 650,
                 "hours": float(prod.hours) if prod else 22,
                 "stop": float(prod.stop) if prod else 0,
@@ -196,11 +235,18 @@ class DailyLoomProductionViewSet(TenantModelViewSet):
 
     @action(detail=False, methods=["post"])
     def bulk_save(self, request):
-        factory_id = request.data.get("factory_id")
-        dt_str = request.data.get("date", date.today().isoformat())
-        power = Decimal(str(request.data.get("power", 0)))
-        rows = request.data.get("rows", [])
+        ser = DailyLoomProductionBulkSaveSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+        factory_id = data["factory_id"]
+        dt = data["date"]
+        dt_str = dt.isoformat()
+        power = data["power"]
+        rows = data["rows"]
         client_id = getattr(request, "client_id", None)
+
+        if not LoomFactory.objects.filter(id=factory_id, client_id=client_id, deleted_at__isnull=True).exists():
+            raise NotFound("Loom factory not found.")
 
         with transaction.atomic():
             # Update/create FactoryDayLog
@@ -216,11 +262,20 @@ class DailyLoomProductionViewSet(TenantModelViewSet):
             saved = 0
             for r in rows:
                 m_val = r.get("meters")
-                if m_val is None or m_val == "" or float(m_val) <= 0:
+                if m_val is None or m_val <= 0:
                     continue
 
-                machine_id = r.get("machine_id")
+                machine_id = r["machine_id"]
                 beam_id = r.get("beam_id")
+                if not beam_id:
+                    active_beam = LoomBeam.objects.filter(machine_id=machine_id, status="On loom", deleted_at__isnull=True).first()
+                    if active_beam:
+                        beam_id = active_beam.id
+                if not beam_id:
+                    raise ValidationFailed(
+                        f"Machine {machine_id} has no active beam assigned.",
+                        field_errors={"rows": ["Active beam is required for production rows."]},
+                    )
                 prod, was_created = DailyLoomProduction.objects.get_or_create(
                     client_id=client_id,
                     factory_id=factory_id,
@@ -249,21 +304,26 @@ class DailyLoomProductionViewSet(TenantModelViewSet):
 
                 # Check if beam is exhausted
                 if beam_id:
-                    beam = LoomBeam.objects.get(id=beam_id)
-                    tot_prod = DailyLoomProduction.objects.filter(beam=beam).aggregate(s=Sum("meters"))["s"] or 0
-                    if float(tot_prod) >= float(beam.length):
-                        beam.status = "Finished"
-                        beam.save(update_fields=["status", "updated_at"])
+                    beam = LoomBeam.objects.filter(id=beam_id, client_id=client_id, deleted_at__isnull=True).first()
+                    if beam:
+                        tot_prod = DailyLoomProduction.objects.filter(beam=beam, deleted_at__isnull=True).aggregate(s=Sum("meters"))["s"] or 0
+                        if float(tot_prod) >= float(beam.length):
+                            beam.status = "Finished"
+                            beam.save(update_fields=["status", "updated_at"])
 
         return Response({"saved_count": saved}, status=status.HTTP_200_OK)
 
 
 class YarnBookingViewSet(TenantModelViewSet):
-    queryset = YarnBooking.objects.all()
+    permission_classes = [HasModulePermission]
+    permission_map = {"read": ["view_pms"], "write": ["create_pms_project"]}
+    queryset = YarnBooking.objects.select_related("yarn", "supplier_party").all()
     serializer_class = YarnBookingSerializer
 
 
 class YarnDeliveryViewSet(TenantModelViewSet):
+    permission_classes = [HasModulePermission]
+    permission_map = {"read": ["view_pms"], "write": ["create_pms_project"]}
     queryset = YarnDelivery.objects.all()
     serializer_class = YarnDeliverySerializer
     filterset_fields = ["factory", "status"]
@@ -271,8 +331,11 @@ class YarnDeliveryViewSet(TenantModelViewSet):
     @action(detail=True, methods=["post"])
     def confirm_receipt(self, request, pk=None):
         delivery = self.get_object()
-        got_kgs = Decimal(str(request.data.get("recd_kgs", delivery.kgs)))
-        recd_date = request.data.get("recd_date", date.today().isoformat())
+        ser = YarnDeliveryConfirmReceiptSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+        got_kgs = data["recd_kgs"]
+        recd_date = data["recd_date"]
         client_id = getattr(request, "client_id", None)
 
         short = delivery.kgs - got_kgs
@@ -302,6 +365,8 @@ class YarnDeliveryViewSet(TenantModelViewSet):
 
 
 class ProductionProgramViewSet(TenantModelViewSet):
+    permission_classes = [HasModulePermission]
+    permission_map = {"read": ["view_pms"], "write": ["create_pms_project"]}
     queryset = ProductionProgram.objects.all()
     serializer_class = ProductionProgramSerializer
 
@@ -312,7 +377,9 @@ class ProductionProgramViewSet(TenantModelViewSet):
 
 
 class FabricDispatchViewSet(TenantModelViewSet):
-    queryset = FabricDispatch.objects.all()
+    permission_classes = [HasModulePermission]
+    permission_map = {"read": ["view_pms"], "write": ["create_pms_project"]}
+    queryset = FabricDispatch.objects.select_related("factory", "quality", "job_work_order", "dyeing_mill_party", "delivery_challan").all()
     serializer_class = FabricDispatchSerializer
     filterset_fields = ["factory", "quality"]
 
@@ -320,17 +387,24 @@ class FabricDispatchViewSet(TenantModelViewSet):
     def inventory_summary(self, request):
         factory_id = request.query_params.get("factory")
         if not factory_id:
-            return Response({"detail": "factory query param required"}, status=status.HTTP_400_BAD_REQUEST)
+            raise ValidationFailed("factory query param required", field_errors={"factory": ["Required."]})
 
-        qualities = LoomQuality.objects.filter(deleted_at__isnull=True)
+        try:
+            factory = LoomFactory.objects.filter(id=factory_id, client_id=request.client_id, deleted_at__isnull=True).first()
+        except (ValueError, Exception):
+            raise ValidationFailed("Invalid factory ID.")
+        if not factory:
+            raise NotFound("Loom factory not found.")
+
+        qualities = LoomQuality.objects.filter(client_id=request.client_id, deleted_at__isnull=True)
         results = []
         for q in qualities:
             prod_m = DailyLoomProduction.objects.filter(
-                factory_id=factory_id, beam__quality=q, deleted_at__isnull=True
+                factory=factory, beam__quality=q, deleted_at__isnull=True
             ).aggregate(s=Sum("meters"))["s"] or 0
             
             dispatches = FabricDispatch.objects.filter(
-                factory_id=factory_id, quality=q, deleted_at__isnull=True
+                factory=factory, quality=q, deleted_at__isnull=True
             )
             godown = dispatches.filter(dest="Godown").aggregate(s=Sum("meters"))["s"] or 0
             mill = dispatches.filter(dest="Dyeing mill").aggregate(s=Sum("meters"))["s"] or 0
@@ -351,7 +425,7 @@ class FabricDispatchViewSet(TenantModelViewSet):
 
         # Grey at dyeing mills
         mills = {}
-        all_mill_outs = FabricDispatch.objects.filter(dest="Dyeing mill", deleted_at__isnull=True).select_related("quality")
+        all_mill_outs = FabricDispatch.objects.filter(client_id=request.client_id, dest="Dyeing mill", deleted_at__isnull=True).select_related("quality")
         for o in all_mill_outs:
             k = f"{o.dest_name or '(unnamed)'}|{o.quality.name}"
             if k not in mills:
@@ -366,13 +440,14 @@ class FabricDispatchViewSet(TenantModelViewSet):
 
 
 class LoomDashboardOverviewView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_pms"]
 
     def get(self, request):
-        factories = LoomFactory.objects.filter(is_active=True, deleted_at__isnull=True)
+        factories = LoomFactory.objects.filter(client_id=request.client_id, is_active=True, deleted_at__isnull=True)
         factory_statuses = [get_factory_status(f) for f in factories]
         
-        programs = ProductionProgram.objects.filter(deleted_at__isnull=True).exclude(status="Closed")
+        programs = ProductionProgram.objects.filter(client_id=request.client_id, deleted_at__isnull=True).exclude(status="Closed")
         programs_data = [ProductionProgramSerializer(p).data for p in programs]
 
         return Response({
@@ -382,9 +457,10 @@ class LoomDashboardOverviewView(APIView):
 
 
 class LoomDemoDataView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [HasModulePermission]
+    required_permissions = ["create_pms_project"]
 
-    def post(self, request, action_name=None):
+    def post(self, request):
         client_id = getattr(request, "client_id", None)
         action = request.data.get("action", "reset")
         if action == "reset":

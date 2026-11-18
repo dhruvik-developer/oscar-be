@@ -17,9 +17,43 @@ from .models_loom import (
 
 
 class LoomCoordinatorSerializer(serializers.ModelSerializer):
+    name = serializers.CharField(required=False, allow_blank=True, default="")
+    employee_details = serializers.SerializerMethodField()
+    user_name = serializers.CharField(source="user.name", read_only=True, default="")
+
     class Meta:
         model = LoomCoordinator
-        fields = ["id", "name", "phone", "email", "user"]
+        fields = [
+            "id", "name", "phone", "email", "user", "user_name",
+            "employee", "employee_details",
+        ]
+
+    def get_employee_details(self, obj):
+        if not obj.employee:
+            return None
+        code = getattr(obj.employee, "code", None) or getattr(obj.employee, "employee_code", None)
+        desig = getattr(getattr(obj.employee, "designation", None), "name", None)
+        return {
+            "id": str(obj.employee.id),
+            "name": obj.employee.name,
+            "code": code or "",
+            "designation": desig or "",
+            "phone": obj.employee.phone or "",
+            "email": obj.employee.email or "",
+        }
+
+    def validate(self, attrs):
+        emp = attrs.get("employee")
+        if emp:
+            if not attrs.get("name"):
+                attrs["name"] = emp.name
+            if not attrs.get("phone") and emp.phone:
+                attrs["phone"] = emp.phone
+            if not attrs.get("email") and emp.email:
+                attrs["email"] = emp.email
+            if not attrs.get("user") and getattr(emp, "user", None):
+                attrs["user"] = emp.user
+        return attrs
 
 
 class LoomMachineSerializer(serializers.ModelSerializer):
@@ -32,12 +66,41 @@ class LoomMachineSerializer(serializers.ModelSerializer):
 
 class LoomFactorySerializer(serializers.ModelSerializer):
     coord_name = serializers.CharField(source="coord.name", read_only=True, default="")
+    warehouse_name = serializers.CharField(source="warehouse.name", read_only=True, default="")
+    job_worker_party_name = serializers.CharField(source="job_worker_party.name", read_only=True, default="")
+    warehouse_details = serializers.SerializerMethodField()
+    job_worker_party_details = serializers.SerializerMethodField()
     machines = LoomMachineSerializer(many=True, read_only=True)
     machines_count = serializers.SerializerMethodField()
 
     class Meta:
         model = LoomFactory
-        fields = ["id", "name", "code", "coord", "coord_name", "address", "is_active", "machines", "machines_count"]
+        fields = [
+            "id", "name", "code", "coord", "coord_name", "address",
+            "factory_type", "warehouse", "warehouse_name", "warehouse_details",
+            "job_worker_party", "job_worker_party_name", "job_worker_party_details",
+            "is_active", "machines", "machines_count",
+        ]
+
+    def get_warehouse_details(self, obj):
+        if not obj.warehouse:
+            return None
+        return {
+            "id": str(obj.warehouse.id),
+            "name": obj.warehouse.name,
+            "code": getattr(obj.warehouse, "code", ""),
+            "type": getattr(obj.warehouse, "type", ""),
+        }
+
+    def get_job_worker_party_details(self, obj):
+        if not obj.job_worker_party:
+            return None
+        return {
+            "id": str(obj.job_worker_party.id),
+            "name": obj.job_worker_party.name,
+            "code": getattr(obj.job_worker_party, "code", ""),
+            "phone": getattr(obj.job_worker_party, "phone", ""),
+        }
 
     def get_machines_count(self, obj):
         return obj.machines.filter(deleted_at__isnull=True).count()
@@ -50,8 +113,13 @@ class YarnMasterSerializer(serializers.ModelSerializer):
 
 
 class LoomQualitySerializer(serializers.ModelSerializer):
+    name = serializers.CharField(required=False, allow_blank=True, default="")
     warp_yarn_name = serializers.CharField(source="warp_yarn.name", read_only=True)
     weft_yarn_name = serializers.CharField(source="weft_yarn.name", read_only=True)
+    fabric_quality_name = serializers.CharField(source="fabric_quality.name", read_only=True, default="")
+    item_name = serializers.CharField(source="item.name", read_only=True, default="")
+    fabric_quality_details = serializers.SerializerMethodField()
+    item_details = serializers.SerializerMethodField()
     ppm = serializers.FloatField(read_only=True)
     warp_kg_m = serializers.FloatField(read_only=True)
     weft_kg_m = serializers.FloatField(read_only=True)
@@ -65,11 +133,41 @@ class LoomQualitySerializer(serializers.ModelSerializer):
     class Meta:
         model = LoomQuality
         fields = [
-            "id", "name", "warp_yarn", "warp_yarn_name", "ends", "crimp",
+            "id", "name", "fabric_quality", "fabric_quality_name", "fabric_quality_details",
+            "item", "item_name", "item_details", "warp_yarn", "warp_yarn_name", "ends", "crimp",
             "weft_yarn", "weft_yarn_name", "reed", "reed_w", "ppi", "wastage",
             "pick_charge", "ppm", "warp_kg_m", "weft_kg_m", "glm", "gsm",
             "warp_cost", "weft_cost", "job_cost", "total_cost",
         ]
+
+    def get_fabric_quality_details(self, obj):
+        if not obj.fabric_quality:
+            return None
+        fq = obj.fabric_quality
+        return {
+            "id": str(fq.id),
+            "name": fq.name,
+            "code": getattr(fq, "code", ""),
+            "reed": getattr(fq, "reed", None),
+            "pick": getattr(fq, "pick", None),
+            "width": float(fq.width) if getattr(fq, "width", None) else None,
+            "gsm": float(fq.gsm) if getattr(fq, "gsm", None) else None,
+        }
+
+    def get_item_details(self, obj):
+        if not obj.item:
+            return None
+        return {
+            "id": str(obj.item.id),
+            "name": obj.item.name,
+            "code": getattr(obj.item, "code", ""),
+        }
+
+    def validate(self, attrs):
+        fq = attrs.get("fabric_quality")
+        if fq and not attrs.get("name"):
+            attrs["name"] = fq.name
+        return attrs
 
 
 class LoomBeamSerializer(serializers.ModelSerializer):
@@ -138,7 +236,10 @@ class YarnDeliverySerializer(serializers.ModelSerializer):
 
 
 class YarnBookingSerializer(serializers.ModelSerializer):
+    supplier = serializers.CharField(required=False, allow_blank=True, default="")
     yarn_name = serializers.CharField(source="yarn.name", read_only=True)
+    supplier_party_name = serializers.CharField(source="supplier_party.name", read_only=True, default="")
+    supplier_party_details = serializers.SerializerMethodField()
     deliveries = YarnDeliverySerializer(many=True, read_only=True)
     scheduled_kgs = serializers.SerializerMethodField()
     delivered_kgs = serializers.SerializerMethodField()
@@ -148,10 +249,34 @@ class YarnBookingSerializer(serializers.ModelSerializer):
     class Meta:
         model = YarnBooking
         fields = [
-            "id", "supplier", "yarn", "yarn_name", "kgs", "rate", "date",
+            "id", "supplier", "supplier_party", "supplier_party_name",
+            "supplier_party_details", "yarn", "yarn_name", "kgs", "rate", "date",
             "note", "deliveries", "scheduled_kgs", "delivered_kgs",
             "unscheduled_kgs", "pending_kgs",
         ]
+
+    def get_supplier_party_details(self, obj):
+        if not obj.supplier_party:
+            return None
+        party = obj.supplier_party
+        city = ""
+        if isinstance(getattr(party, "billing_address", None), dict):
+            city = party.billing_address.get("city", "")
+        return {
+            "id": str(party.id),
+            "name": party.name,
+            "code": getattr(party, "code", "") or "",
+            "gstin": getattr(party, "gstin", "") or "",
+            "phone": getattr(party, "phone", "") or "",
+            "city": city,
+            "type": getattr(party, "type", "") or "",
+        }
+
+    def validate(self, attrs):
+        sp = attrs.get("supplier_party")
+        if sp and not attrs.get("supplier"):
+            attrs["supplier"] = sp.name
+        return attrs
 
     def get_scheduled_kgs(self, obj):
         from django.db.models import Sum
@@ -189,10 +314,120 @@ class ProductionProgramSerializer(serializers.ModelSerializer):
 class FabricDispatchSerializer(serializers.ModelSerializer):
     factory_name = serializers.CharField(source="factory.name", read_only=True)
     quality_name = serializers.CharField(source="quality.name", read_only=True)
+    job_work_order_number = serializers.CharField(source="job_work_order.order_number", read_only=True, default="")
+    dyeing_mill_party_name = serializers.CharField(source="dyeing_mill_party.name", read_only=True, default="")
+    delivery_challan_number = serializers.CharField(source="delivery_challan.challan_number", read_only=True, default="")
+    job_work_order_details = serializers.SerializerMethodField()
+    dyeing_mill_party_details = serializers.SerializerMethodField()
+    delivery_challan_details = serializers.SerializerMethodField()
 
     class Meta:
         model = FabricDispatch
         fields = [
             "id", "factory", "factory_name", "quality", "quality_name",
-            "date", "taka", "meters", "dest", "dest_name", "challan", "vehicle",
+            "date", "taka", "meters", "dest", "dest_name",
+            "job_work_order", "job_work_order_number", "job_work_order_details",
+            "dyeing_mill_party", "dyeing_mill_party_name", "dyeing_mill_party_details",
+            "delivery_challan", "delivery_challan_number", "delivery_challan_details",
+            "challan", "vehicle",
         ]
+
+    def get_job_work_order_details(self, obj):
+        if not obj.job_work_order:
+            return None
+        jwo = obj.job_work_order
+        return {
+            "id": str(jwo.id),
+            "order_number": getattr(jwo, "order_number", ""),
+            "vendor_name": getattr(getattr(jwo, "vendor", None), "name", ""),
+            "status": getattr(jwo, "status", ""),
+        }
+
+    def get_dyeing_mill_party_details(self, obj):
+        if not obj.dyeing_mill_party:
+            return None
+        p = obj.dyeing_mill_party
+        return {
+            "id": str(p.id),
+            "name": p.name,
+            "code": getattr(p, "code", "") or "",
+            "gstin": getattr(p, "gstin", "") or "",
+        }
+
+    def get_delivery_challan_details(self, obj):
+        if not obj.delivery_challan:
+            return None
+        dc = obj.delivery_challan
+        return {
+            "id": str(dc.id),
+            "challan_number": getattr(dc, "challan_number", "") or "",
+            "status": getattr(dc, "status", "") or "",
+        }
+
+    def validate(self, attrs):
+        if attrs.get("dest") == "Dyeing mill":
+            dp = attrs.get("dyeing_mill_party")
+            if dp and not attrs.get("dest_name"):
+                attrs["dest_name"] = dp.name
+            jwo = attrs.get("job_work_order")
+            if jwo and not attrs.get("dyeing_mill_party") and getattr(jwo, "vendor", None):
+                attrs["dyeing_mill_party"] = jwo.vendor
+                if not attrs.get("dest_name"):
+                    attrs["dest_name"] = jwo.vendor.name
+        return attrs
+
+
+class LoomMachineBatchCreateSerializer(serializers.Serializer):
+    factory = serializers.UUIDField(required=False)
+    factory_id = serializers.UUIDField(required=False)
+    from_no = serializers.IntegerField(min_value=1)
+    to_no = serializers.IntegerField(min_value=1)
+    reed = serializers.IntegerField(min_value=1, required=False, default=84)
+
+    def validate(self, attrs):
+        fid = attrs.get("factory") or attrs.get("factory_id")
+        if not fid:
+            raise serializers.ValidationError({"factory": ["This field is required."]})
+        attrs["factory_id"] = fid
+        if attrs["from_no"] > attrs["to_no"]:
+            raise serializers.ValidationError({"to_no": ["to_no must be greater than or equal to from_no."]})
+        return attrs
+
+
+class DailyLoomProductionBulkSaveRowSerializer(serializers.Serializer):
+    machine_id = serializers.UUIDField()
+    beam_id = serializers.UUIDField(required=False, allow_null=True)
+    meters = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
+    rpm = serializers.DecimalField(max_digits=8, decimal_places=2, required=False, default=650)
+    hours = serializers.DecimalField(max_digits=5, decimal_places=2, required=False, default=22)
+    stop = serializers.DecimalField(max_digits=5, decimal_places=2, required=False, default=0)
+    reason = serializers.CharField(required=False, allow_blank=True, default="")
+    damage = serializers.DecimalField(max_digits=8, decimal_places=2, required=False, default=0)
+
+
+class DailyLoomProductionBulkSaveSerializer(serializers.Serializer):
+    factory_id = serializers.UUIDField(required=False)
+    factory = serializers.UUIDField(required=False)
+    date = serializers.DateField()
+    power = serializers.DecimalField(max_digits=8, decimal_places=2)
+    rows = DailyLoomProductionBulkSaveRowSerializer(many=True)
+
+    def validate(self, attrs):
+        fid = attrs.get("factory_id") or attrs.get("factory")
+        if not fid:
+            raise serializers.ValidationError({"factory_id": ["This field is required."]})
+        attrs["factory_id"] = fid
+        return attrs
+
+
+class YarnDeliveryConfirmReceiptSerializer(serializers.Serializer):
+    recd_kgs = serializers.DecimalField(max_digits=12, decimal_places=2)
+    recd_date = serializers.DateField()
+
+
+class LoomBeamLoadSerializer(serializers.Serializer):
+    machine_id = serializers.UUIDField()
+
+
+class LoomBeamAssignSpareSerializer(serializers.Serializer):
+    machine_id = serializers.UUIDField(required=False, allow_null=True)

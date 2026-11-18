@@ -470,13 +470,13 @@ def design_colour_analysis(client_id, date_from=None, date_to=None):
         })
 
         group["totalTakas"] += 1
-        m = D(t.meter or 0)
+        m = D(getattr(t, "received_quantity", None) or getattr(t, "available_quantity", None) or 0)
         group["totalMeters"] += m
         avail = D(t.available_quantity or 0)
         group["availableMeters"] += avail
         group["soldMeters"] += max(ZERO, m - avail)
 
-        age = (today - (t.inward_date or t.created_at.date())).days
+        age = (today - (getattr(t, "received_date", None) or t.created_at.date())).days
         group["daysList"].append(age)
 
     rows = []
@@ -518,7 +518,7 @@ def stock_ageing_mis(client_id, as_of=None):
     ).select_related("item")
 
     for t in takas:
-        inward = t.inward_date or t.created_at.date()
+        inward = getattr(t, "received_date", None) or t.created_at.date()
         age = (as_of - inward).days
         if age <= 30: b_key = "0-30"
         elif age <= 60: b_key = "31-60"

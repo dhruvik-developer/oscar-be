@@ -63,7 +63,7 @@ def parse_filters(params):
             return None
         try:
             return date.fromisoformat(raw)
-        except ValueError:
+        except (ValueError, TypeError):
             raise ValidationFailed(
                 "Invalid date.", field_errors={key: ["Expected YYYY-MM-DD."]}
             )

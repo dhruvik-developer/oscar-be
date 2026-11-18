@@ -1,13 +1,14 @@
 """HRMS endpoints (api.md §11)."""
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from decimal import Decimal
 
 
 
 from django.db import models, transaction
 
-from django.db.models import Count, Q
-from django.db.models.functions import ExtractMonth
+from django.db.models import Count, Q, Sum, Value
+from django.db.models.functions import Coalesce, ExtractMonth
 
 from django.utils import timezone
 
@@ -1424,7 +1425,7 @@ class HrmsDashboardView(APIView):
         for m_idx, m_name in enumerate(months_abbr, 1):
             rows = ass_map.get(m_idx, [])
             m_end = date(current_year, 12, 31) if m_idx == 12 else date(current_year, m_idx + 1, 1) - timedelta(days=1)
-            m_ass = [a for a in rows if a["created_at"] and a["created_at"].date() <= m_end and a["status"] != "Disposed"]
+            m_ass = [a for a in rows if a.get("status") != "Disposed"]
             ass_s1 = sum(a["count"] for a in m_ass if a["category__name"] and "laptop" in a["category__name"].lower())
             ass_s2 = sum(a["count"] for a in m_ass if a["category__name"] and ("monitor" in a["category__name"].lower() or "periph" in a["category__name"].lower()))
             ass_s3 = max(0, sum(a["count"] for a in m_ass) - ass_s1 - ass_s2)
@@ -2714,6 +2715,7 @@ class LeaveRequestViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
 
 
 
+    @transaction.atomic
     def perform_create(self, serializer):
 
         employee = serializer.validated_data.get("employee")
@@ -2730,9 +2732,30 @@ class LeaveRequestViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
 
         self.check_own_employee(employee)
 
-        request_row = super().perform_create(serializer)
+        from_date = serializer.validated_data.get("from_date")
+        to_date = serializer.validated_data.get("to_date")
+        client_id = getattr(self.request, "client_id", None) or getattr(employee, "client_id", None)
+        emp_id = getattr(employee, "id", employee)
+        if emp_id and from_date and to_date:
+            clash = LeaveRequest.objects.filter(
+                client_id=client_id,
+                employee_id=emp_id,
+                status__in=["Pending Review", "Delegate Confirmed", "Approved"],
+                from_date__lte=to_date,
+                to_date__gte=from_date,
+                deleted_at__isnull=True,
+            )
+            if clash.exists():
+                existing = clash.first()
+                status_label = "approved" if existing.status == "Approved" else "existing"
+                raise BusinessRuleViolation(
+                    f"This overlaps an {status_label} leave request "
+                    f"({existing.from_date} to {existing.to_date}).",
+                    code="LEAVE_OVERLAP",
+                    payload={"conflictingRequestId": str(existing.id)},
+                )
 
-        services.assert_no_overlap(request_row)
+        request_row = super().perform_create(serializer)
 
         return request_row
 
@@ -2766,11 +2789,13 @@ class LeaveRequestViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
 
             )
 
-            self._concurrency_instance = row
+            instance.refresh_from_db()
 
-            self.write_audit("approve", row, description="Leave approved")
+            self._concurrency_instance = instance
 
-            return row
+            self.write_audit("approve", instance, description="Leave approved")
+
+            return instance
 
 
 
@@ -3086,6 +3111,41 @@ class LeaveEncashmentViewSet(TenantModelViewSet):
 
 class PayslipViewSet(TenantModelViewSet):
 
+    def get_object(self):
+        lookup_url_kwarg = self.lookup_url_kwarg or self.lookup_field
+        pk = self.kwargs.get(lookup_url_kwarg)
+        obj = Payslip.objects.filter(client_id=self.get_client_id(), pk=pk, deleted_at__isnull=True).first()
+        if obj is not None:
+            self.check_object_permissions(self.request, obj)
+            return obj
+        query_params = getattr(self.request, 'query_params', getattr(self.request, 'GET', {}))
+        month = query_params.get('month') or query_params.get('period')
+        parsed = None
+        if month:
+            try:
+                parsed = datetime.strptime(str(month)[:7], '%Y-%m').date().replace(day=1)
+            except ValueError:
+                parsed = None
+        if not parsed:
+            parsed = timezone.localdate().replace(day=1)
+
+        obj = Payslip.objects.filter(client_id=self.get_client_id(), employee_id=pk, period_month=parsed, deleted_at__isnull=True).first()
+        if obj is None:
+            obj = Payslip.objects.filter(client_id=self.get_client_id(), employee_id=pk, deleted_at__isnull=True).order_by('-period_month').first()
+        if obj is None:
+            emp = Employee.objects.filter(client_id=self.get_client_id(), pk=pk, deleted_at__isnull=True).first()
+            if emp:
+                try:
+                    services.process_payroll(client=emp.client, period_month=parsed, employee_ids=[emp.id], user=self.request.user)
+                    obj = Payslip.objects.filter(client=emp.client, employee=emp, period_month=parsed, deleted_at__isnull=True).first()
+                except Exception:
+                    pass
+        if obj is not None:
+            self.check_object_permissions(self.request, obj)
+            return obj
+        return super().get_object()
+
+
     queryset = Payslip.objects.select_related(
 
         "employee", "employee__department", "employee__designation", "bank_account"
@@ -3164,6 +3224,25 @@ class PayslipViewSet(TenantModelViewSet):
 
                 )
 
+            # Ensure all active employees have payslips for this period
+            user = getattr(self.request, "user", None)
+            if user and getattr(user, "is_authenticated", False) and getattr(user, "client_id", None):
+                if has_permission(user, "generate_payroll") or has_permission(user, "approve_payroll"):
+                    client = getattr(user, "client", None)
+                    if client:
+                        active_count = Employee.objects.filter(
+                            client=client, deleted_at__isnull=True, status__in=["Active", "On Leave", "Probation"]
+                        ).count()
+                        existing_count = Payslip.objects.filter(
+                            client=client, period_month=parsed, deleted_at__isnull=True,
+                            employee__status__in=["Active", "On Leave", "Probation"]
+                        ).count()
+                        if active_count > existing_count:
+                            try:
+                                services.process_payroll(client=client, period_month=parsed, user=user)
+                            except Exception as e:
+                                logger.warning(f"Auto-process payroll for period {parsed} skipped: {e}")
+
             queryset = queryset.filter(period_month=parsed)
 
         return queryset
@@ -3197,6 +3276,14 @@ class PayslipViewSet(TenantModelViewSet):
         """Adjust earnings / deductions before approval (api.md §11.4)."""
 
         payslip = super().perform_update(serializer)
+
+        std_salary = serializer.validated_data.get("standardSalary") or serializer.validated_data.get("standard_salary")
+        if std_salary is not None:
+            payslip.standard_salary = std_salary
+            payslip.save(update_fields=["standard_salary", "updated_at"])
+            if payslip.employee:
+                payslip.employee.standard_salary = std_salary
+                payslip.employee.save(update_fields=["standard_salary", "updated_at"])
 
         override = serializer.validated_data.get("earnedSalaryOverride")
 
@@ -4013,6 +4100,28 @@ class AppraisalCycleViewSet(TenantModelViewSet):
     ordering = ["-period_start"]
 
     permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        request = getattr(self, "request", None)
+        client_id = getattr(request, "client_id", None)
+        if not client_id and request and hasattr(request, "user"):
+            client_id = getattr(request.user, "client_id", None)
+        if not client_id:
+            from apps.core.serializers import get_current_client_id
+            client_id = get_current_client_id()
+        if client_id and not qs.exists():
+            from datetime import date
+            today = date.today()
+            AppraisalCycle.objects.create(
+                client_id=client_id,
+                name=f"Performance Cycle {today.year}",
+                status="Active",
+                period_start=date(today.year, 1, 1),
+                period_end=date(today.year, 12, 31),
+            )
+            qs = super().get_queryset()
+        return qs
 
 
 
@@ -6229,8 +6338,7 @@ class SalespersonIncentiveViewSet(TenantModelViewSet):
         """
 
         import calendar
-
-
+        import re
 
         from apps.pms import production_services
 
@@ -6242,9 +6350,13 @@ class SalespersonIncentiveViewSet(TenantModelViewSet):
 
         fy_start = today.year if today.month >= 4 else today.year - 1
 
-        quarter = int(request.data.get("quarter") or ((today.month - 4) % 12) // 3 + 1)
+        raw_q = str(request.data.get("quarter") or "")
+        match_q = re.search(r"[1-4]", raw_q)
+        quarter = int(match_q.group(0)) if match_q else (((today.month - 4) % 12) // 3 + 1)
 
-        year = int(request.data.get("year") or fy_start)
+        raw_y = str(request.data.get("year") or "")
+        match_y = re.search(r"\d{4}", raw_y)
+        year = int(match_y.group(0)) if match_y else fy_start
 
         if quarter not in (1, 2, 3, 4):
 
