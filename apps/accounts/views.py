@@ -32,7 +32,16 @@ from apps.core.exceptions import (
 from apps.core.pagination import envelope
 from apps.core.printing import EmailDeliveryFailed
 from apps.core.permissions import AllowPublic, HasModulePermission
-from apps.core.throttling import LoginThrottle, PasswordChangeThrottle, PublicEndpointThrottle
+from apps.core.throttling import (
+    FailedLoginThrottle,
+    LoginThrottle,
+    OTPVerifyThrottle,
+    PasswordChangeThrottle,
+    PasswordResetThrottle,
+    PublicEndpointThrottle,
+    SensitiveActionThrottle,
+    TokenRefreshThrottle,
+)
 from apps.core.viewsets import TenantModelViewSet
 from apps.core.tenancy import set_current_client_id
 
@@ -134,98 +143,106 @@ def _me_payload(user, request=None):
 class LoginView(APIView):
     authentication_classes = []
     permission_classes = [AllowPublic]
-    throttle_classes = [LoginThrottle]
+    throttle_classes = [LoginThrottle, FailedLoginThrottle]
 
     def post(self, request):
-        serializer = LoginSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        email = serializer.validated_data["email"].lower()
-        password = serializer.validated_data["password"]
+        try:
+            serializer = LoginSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            email = serializer.validated_data["email"].lower()
+            password = serializer.validated_data["password"]
 
-        candidates = list(
-            User.objects.filter(email=email, deleted_at__isnull=True).select_related(
-                "client", "role"
-            )
-        )
-        # A tenant slug disambiguates when the same address exists in more than
-        # one tenant. Without it, an ambiguous address is treated as a failure
-        # rather than guessing which tenant the caller meant.
-        slug = (request.data.get("tenant") or request.data.get("clientSlug") or "").strip()
-        if slug:
-            candidates = [u for u in candidates if u.client.slug == slug]
-
-        invalid = NotAuthenticated(
-            "Incorrect email or password.", code="INVALID_CREDENTIALS"
-        )
-
-        if len(candidates) > 1:
-            # The address exists in several tenants. Once the password proves
-            # who is asking, naming their workspaces leaks nothing, so the
-            # form can offer a picker instead of a dead end.
-            matched = [u for u in candidates if u.check_password(password)]
-            if not matched:
-                raise invalid
-            if len(matched) > 1:
-                raise NotAuthenticated(
-                    "This email belongs to more than one workspace. Choose one to continue.",
-                    code="TENANT_REQUIRED",
-                    payload={
-                        "workspaces": [
-                            {"slug": u.client.slug, "name": u.client.name} for u in matched
-                        ]
-                    },
+            candidates = list(
+                User.objects.filter(email=email, deleted_at__isnull=True).select_related(
+                    "client", "role"
                 )
-            candidates = matched
-
-        if len(candidates) != 1:
-            check_password(password, DUMMY_PASSWORD_HASH)
-            raise invalid
-
-        user = candidates[0]
-
-        # The password is not checked while locked: the lock is what stops
-        # guessing. Run dummy hash for timing uniformity and return uniform error.
-        if user.is_locked():
-            check_password(password, DUMMY_PASSWORD_HASH)
-            _audit_login(user, request, "login_blocked", "Sign-in refused: account locked")
-            raise invalid
-
-        if not user.check_password(password):
-            if user.locked_until is not None:
-                # The previous lock ran out; start a fresh count.
-                user.failed_login_count = 0
-                user.locked_until = None
-            user.failed_login_count += 1
-            if user.failed_login_count >= MAX_FAILED_LOGINS:
-                user.locked_until = timezone.now() + LOCKOUT
-                _notify_account_locked(user)
-            user.save(update_fields=["failed_login_count", "locked_until"])
-            _audit_login(user, request, "login_failed", "Sign-in failed: wrong password")
-            raise invalid
-
-        # Status is only revealed to someone who knows the password, so these
-        # messages cannot be used to find out which addresses have accounts.
-        if user.status != "Active":
-            raise NotAuthenticated(
-                "This account is not active. Contact your administrator.",
-                code="ACCOUNT_INACTIVE",
             )
-        if user.client.status != "Active":
-            raise NotAuthenticated(
-                "This workspace is not active.", code="TENANT_INACTIVE"
-            )
-        # Checked only after the password, like the status messages above.
-        # The role is not a failed password guess, so it does not count
-        # towards the lockout.
-        if not role_matches(user, serializer.validated_data["role"]):
-            _audit_login(user, request, "login_failed", "Sign-in refused: selected role is not assigned")
-            raise NotAuthenticated(
-                "The selected role is not assigned to this account.", code="ROLE_MISMATCH"
+            # A tenant slug disambiguates when the same address exists in more than
+            # one tenant. Without it, an ambiguous address is treated as a failure
+            # rather than guessing which tenant the caller meant.
+            slug = (request.data.get("tenant") or request.data.get("clientSlug") or "").strip()
+            if slug:
+                candidates = [u for u in candidates if u.client.slug == slug]
+
+            invalid = NotAuthenticated(
+                "Incorrect email or password.", code="INVALID_CREDENTIALS"
             )
 
-        if user.requires_two_factor:
-            return _two_factor_response(user, request)
-        return Response(_start_session(user, request))
+            if len(candidates) > 1:
+                # The address exists in several tenants. Once the password proves
+                # who is asking, naming their workspaces leaks nothing, so the
+                # form can offer a picker instead of a dead end.
+                matched = [u for u in candidates if u.check_password(password)]
+                if not matched:
+                    raise invalid
+                if len(matched) > 1:
+                    raise NotAuthenticated(
+                        "This email belongs to more than one workspace. Choose one to continue.",
+                        code="TENANT_REQUIRED",
+                        payload={
+                            "workspaces": [
+                                {"slug": u.client.slug, "name": u.client.name} for u in matched
+                            ]
+                        },
+                    )
+                candidates = matched
+
+            if len(candidates) != 1:
+                check_password(password, DUMMY_PASSWORD_HASH)
+                raise invalid
+
+            user = candidates[0]
+
+            # The password is not checked while locked: the lock is what stops
+            # guessing. Run dummy hash for timing uniformity and return uniform error.
+            if user.is_locked():
+                check_password(password, DUMMY_PASSWORD_HASH)
+                _audit_login(user, request, "login_blocked", "Sign-in refused: account locked")
+                raise invalid
+
+            if not user.check_password(password):
+                if user.locked_until is not None:
+                    # The previous lock ran out; start a fresh count.
+                    user.failed_login_count = 0
+                    user.locked_until = None
+                user.failed_login_count += 1
+                if user.failed_login_count >= MAX_FAILED_LOGINS:
+                    user.locked_until = timezone.now() + LOCKOUT
+                    _notify_account_locked(user)
+                user.save(update_fields=["failed_login_count", "locked_until"])
+                _audit_login(user, request, "login_failed", "Sign-in failed: wrong password")
+                raise invalid
+
+            # Status is only revealed to someone who knows the password, so these
+            # messages cannot be used to find out which addresses have accounts.
+            if user.status != "Active":
+                raise NotAuthenticated(
+                    "This account is not active. Contact your administrator.",
+                    code="ACCOUNT_INACTIVE",
+                )
+            if user.client.status != "Active":
+                raise NotAuthenticated(
+                    "This workspace is not active.", code="TENANT_INACTIVE"
+                )
+            # Checked only after the password, like the status messages above.
+            # The role is not a failed password guess, so it does not count
+            # towards the lockout.
+            if not role_matches(user, serializer.validated_data["role"]):
+                _audit_login(user, request, "login_failed", "Sign-in refused: selected role is not assigned")
+                raise NotAuthenticated(
+                    "The selected role is not assigned to this account.", code="ROLE_MISMATCH"
+                )
+
+            if user.requires_two_factor:
+                resp = _two_factor_response(user, request)
+                FailedLoginThrottle.clear_failures(request)
+                return resp
+            resp = Response(_start_session(user, request))
+            FailedLoginThrottle.clear_failures(request)
+            return resp
+        except Exception:
+            FailedLoginThrottle.record_failure(request)
+            raise
 
 
 def _audit_login(user, request, action, description):
@@ -293,7 +310,7 @@ class LoginVerifyOtpView(APIView):
 
     authentication_classes = []
     permission_classes = [AllowPublic]
-    throttle_classes = [LoginThrottle]
+    throttle_classes = [OTPVerifyThrottle]
 
     def post(self, request):
         serializer = LoginOtpSerializer(data=request.data)
@@ -321,7 +338,7 @@ class LoginResendOtpView(APIView):
 
     authentication_classes = []
     permission_classes = [AllowPublic]
-    throttle_classes = [LoginThrottle]
+    throttle_classes = [OTPVerifyThrottle]
 
     def post(self, request):
         challenge_id = str(request.data.get("challengeId") or "")
@@ -369,7 +386,7 @@ class RefreshView(APIView):
 
     authentication_classes = []
     permission_classes = [AllowPublic]
-    throttle_classes = [LoginThrottle]
+    throttle_classes = [TokenRefreshThrottle]
 
     def post(self, request):
         serializer = RefreshSerializer(data=request.data)
@@ -522,7 +539,7 @@ class ForgotPasswordView(APIView):
 
     authentication_classes = []
     permission_classes = [AllowPublic]
-    throttle_classes = [LoginThrottle]
+    throttle_classes = [PasswordResetThrottle]
 
     def post(self, request):
         serializer = ForgotPasswordSerializer(data=request.data)
@@ -558,7 +575,7 @@ class VerifyResetOtpView(APIView):
 
     authentication_classes = []
     permission_classes = [AllowPublic]
-    throttle_classes = [LoginThrottle]
+    throttle_classes = [OTPVerifyThrottle]
 
     def post(self, request):
         serializer = VerifyResetOtpSerializer(data=request.data)
@@ -580,7 +597,7 @@ class VerifyResetOtpView(APIView):
 class ResetPasswordView(APIView):
     authentication_classes = []
     permission_classes = [AllowPublic]
-    throttle_classes = [LoginThrottle]
+    throttle_classes = [PasswordResetThrottle]
 
     def post(self, request):
         serializer = ResetPasswordSerializer(data=request.data)
@@ -729,7 +746,6 @@ class SupportInfoView(APIView):
 
     authentication_classes = []
     permission_classes = [AllowPublic]
-    throttle_classes = [LoginThrottle]
 
     def get(self, request):
         return Response({
