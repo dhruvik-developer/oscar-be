@@ -3792,6 +3792,28 @@ class OfferViewSet(TenantModelViewSet):
 
 
 
+    @action(detail=True, methods=["post"], url_path="send_offer")
+    def send_offer(self, request, pk=None):
+        offer = self.get_object()
+        offer.status = "Sent"
+        if offer.sent_at is None:
+            offer.sent_at = timezone.now()
+        offer.save(update_fields=["status", "sent_at", "updated_at"])
+        return Response(self.get_serializer(offer).data)
+
+    @action(detail=True, methods=["post"], url_path="accept_offer")
+    def accept_offer(self, request, pk=None):
+        offer = self.get_object()
+        offer.status = "Accepted"
+        if offer.responded_at is None:
+            offer.responded_at = timezone.now()
+        offer.save(update_fields=["status", "responded_at", "updated_at"])
+        candidate = offer.application.candidate
+        candidate.stage = "Offer"
+        candidate.save(update_fields=["stage", "updated_at"])
+        return Response(self.get_serializer(offer).data)
+
+
 class OnboardingViewSet(TenantModelViewSet):
 
     queryset = OnboardingTask.objects.select_related("candidate", "owner")
@@ -5906,6 +5928,23 @@ class TeamViewSet(TenantModelViewSet):
 
 
 
+
+
+    @action(detail=True, methods=["post"], url_path="add-member")
+    def add_member(self, request, pk=None):
+        team = self.get_object()
+        emp_id = request.data.get("employeeId") or request.data.get("employee_id")
+        if emp_id:
+            team.members.add(emp_id)
+        return Response(self.get_serializer(team).data)
+
+    @action(detail=True, methods=["post"], url_path="remove-member")
+    def remove_member(self, request, pk=None):
+        team = self.get_object()
+        emp_id = request.data.get("employeeId") or request.data.get("employee_id")
+        if emp_id:
+            team.members.remove(emp_id)
+        return Response(self.get_serializer(team).data)
 
 
 class ApprovalChainViewSet(TenantModelViewSet):

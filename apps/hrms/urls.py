@@ -75,8 +75,8 @@ router.register(
 )
 router.register("performance/goals", views.GoalViewSet, basename="hrms-goals")
 
-# router.register("trainings", views.TrainingViewSet, basename="hrms-trainings")
-# router.register("trainers", views.TrainerViewSet, basename="hrms-trainers")
+router.register("trainings", views.TrainingViewSet, basename="hrms-trainings")
+router.register("trainers", views.TrainerViewSet, basename="hrms-trainers")
 
 router.register("assets", views.AssetViewSet, basename="hrms-assets")
 router.register(
@@ -107,10 +107,10 @@ router.register("complaints", views.ComplaintViewSet, basename="hrms-complaints"
 # Re-enable together with CAREER_MILESTONES_ENABLED in
 # Evenmore-oscar/app/src/features/portal/EmployeePortal.jsx.
 # =============================================================================
-# router.register("transfers", views.EmployeeTransferViewSet, basename="hrms-transfers")
-# router.register("promotions", views.EmployeePromotionViewSet, basename="hrms-promotions")
-# router.register("warnings", views.EmployeeWarningViewSet, basename="hrms-warnings")
-# router.register("awards", views.EmployeeAwardViewSet, basename="hrms-awards")
+router.register("transfers", views.EmployeeTransferViewSet, basename="hrms-transfers")
+router.register("promotions", views.EmployeePromotionViewSet, basename="hrms-promotions")
+router.register("warnings", views.EmployeeWarningViewSet, basename="hrms-warnings")
+router.register("awards", views.EmployeeAwardViewSet, basename="hrms-awards")
 
 
 urlpatterns = [
@@ -139,7 +139,9 @@ urlpatterns = [
         name="hrms-performance-dashboard",
     ),
     path("working-days/", views.WorkingDayView.as_view(), name="hrms-working-days"),
+    path("work-schedules/", views.WorkingDayView.as_view(), name="hrms-work-schedules"),
     path("settings/", views.HrmsSettingsView.as_view(), name="hrms-settings"),
+    path("leave/balance-summary/", views.LeaveBalanceViewSet.as_view({"get": "summary"}), name="hrms-leave-balance-summary"),
     path("agency-monitoring/", views.AgencyProductionMonitoringView.as_view(), name="hrms-agency-monitoring"),
     path("", include(router.urls)),
 ]
