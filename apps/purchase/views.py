@@ -173,7 +173,7 @@ class PurchaseOrderViewSet(SalesDocumentViewSet):
 
     permission_map = {"read": ["view_purchase"], "write": ["create_purchase_order"]}
 
-    draft_values = ("Draft", "Issued")
+    draft_values = ("Draft", "Issued", "Pending Approval")
 
 
 
@@ -431,6 +431,9 @@ class PurchaseOrderViewSet(SalesDocumentViewSet):
 
         res = self._transition(request, from_statuses=("Pending Approval",), to_status="Approved")
         dyeing_dispatch.dispatch_planned(order, user=request.user)
+
+        from apps.pms.models import ProductionInstruction
+        ProductionInstruction.objects.filter(client_id=order.client_id, final_po=order).update(status="PO Created")
 
         appr_req = ApprovalRequest.objects.filter(
 
