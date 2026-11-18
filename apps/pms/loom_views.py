@@ -4,12 +4,13 @@ Loom & Weaving API ViewSets for Oscar PMS.
 from datetime import datetime, date
 from decimal import Decimal
 from django.db import transaction
-from django.db.models import Sum
+from django.db.models import Q, Sum
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework.exceptions import PermissionDenied
 
 from apps.core.permissions import HasModulePermission
 from apps.core.exceptions import NotFound, ValidationFailed
@@ -55,6 +56,65 @@ from .loom_services import (
 )
 
 
+def is_loom_admin_or_manager(user):
+    """
+    Returns True if the user is an Administrator, Admin, or General Manager / Owner / Management.
+    Employees / Field Staff / Coordinators return False.
+    """
+    if not user or not user.is_authenticated:
+        return False
+
+    role_code = (getattr(getattr(user, "role", None), "code", "") or "").upper()
+    role_name = (getattr(getattr(user, "role", None), "name", "") or "").lower()
+
+    # Explicit employee / coordinator / staff roles are always restricted to assigned factories
+    if role_code in ["PROD_STAFF", "PC", "PROD_COORD", "EMPLOYEE", "STAFF"]:
+        return False
+    if "employee" in role_name or "field staff" in role_name:
+        return False
+
+    # Superuser check (when not an explicit employee role)
+    if user.is_superuser:
+        return True
+
+    # Administrator, Admin, General Manager, Owner, Management
+    admin_codes = ["SYS_ADMIN", "ADMIN", "AD", "OWNER", "GM", "GENERAL_MANAGER", "MGMT"]
+    if role_code in admin_codes:
+        return True
+
+    admin_keywords = ["administrator", "admin", "general manager", "owner", "management", "gm"]
+    if any(kw in role_name for kw in admin_keywords):
+        return True
+
+    return False
+
+
+def get_user_assigned_factories(user, client_id):
+    """
+    Returns QuerySet of LoomFactory that this user is permitted to see.
+    Admins and General Managers can see all active factories.
+    Employees / Field Staff can only see the factories assigned to them.
+    """
+    qs = LoomFactory.objects.filter(client_id=client_id, deleted_at__isnull=True)
+    if is_loom_admin_or_manager(user):
+        return qs
+    if not user or not getattr(user, "is_authenticated", False):
+        return qs.none()
+
+    emp = getattr(user, "employee", None)
+    q = Q(coord__user=user) | Q(assigned_users=user)
+    if emp:
+        q |= Q(coord__employee=emp) | Q(assigned_employees=emp)
+    user_email = getattr(user, "email", None)
+    if user_email:
+        q |= Q(coord__email__iexact=user_email)
+    user_name = getattr(user, "name", None)
+    if user_name:
+        q |= Q(coord__name__iexact=user_name)
+
+    return qs.filter(q).distinct()
+
+
 class LoomCoordinatorViewSet(TenantModelViewSet):
     permission_classes = [HasModulePermission]
     permission_map = {"read": ["view_pms"], "write": ["create_pms_project"]}
@@ -65,8 +125,16 @@ class LoomCoordinatorViewSet(TenantModelViewSet):
 class LoomFactoryViewSet(TenantModelViewSet):
     permission_classes = [HasModulePermission]
     permission_map = {"read": ["view_pms"], "write": ["create_pms_project"]}
-    queryset = LoomFactory.objects.select_related("coord", "warehouse", "job_worker_party").all()
     serializer_class = LoomFactorySerializer
+
+    def get_queryset(self):
+        user = getattr(self.request, "user", None)
+        client_id = getattr(self.request, "client_id", None)
+        return (
+            get_user_assigned_factories(user, client_id)
+            .select_related("coord", "warehouse", "job_worker_party")
+            .prefetch_related("assigned_employees", "assigned_users")
+        )
 
     @transaction.atomic
     def perform_create(self, serializer):
@@ -234,6 +302,11 @@ class DailyLoomProductionViewSet(TenantModelViewSet):
         if not factory:
             raise NotFound("Loom factory not found.")
 
+        # Permission check: ensure user has permission for this factory
+        allowed_factories = get_user_assigned_factories(request.user, request.client_id)
+        if not allowed_factories.filter(id=factory.id).exists():
+            raise PermissionDenied("You do not have access to this factory. Only assigned factories can be accessed.")
+
         try:
             parsed_date = date.fromisoformat(dt_str)
             dt_str = parsed_date.isoformat()
@@ -270,6 +343,8 @@ class DailyLoomProductionViewSet(TenantModelViewSet):
             "date": dt_str,
             "power": power,
             "rows": rows,
+            "last_updated_at": day_log.updated_at.isoformat() if (day_log and day_log.updated_at) else None,
+            "is_admin_or_manager": is_loom_admin_or_manager(request.user),
         })
 
     @action(detail=False, methods=["post"])
@@ -286,6 +361,11 @@ class DailyLoomProductionViewSet(TenantModelViewSet):
 
         if not LoomFactory.objects.filter(id=factory_id, client_id=client_id, deleted_at__isnull=True).exists():
             raise NotFound("Loom factory not found.")
+
+        # Permission check: ensure user is allowed to submit for this factory
+        allowed_factories = get_user_assigned_factories(request.user, client_id)
+        if not allowed_factories.filter(id=factory_id).exists():
+            raise PermissionDenied("You do not have permission to submit entries for this factory.")
 
         with transaction.atomic():
             # Update/create FactoryDayLog
@@ -350,7 +430,10 @@ class DailyLoomProductionViewSet(TenantModelViewSet):
                             beam.status = "Finished"
                             beam.save(update_fields=["status", "updated_at"])
 
-        return Response({"saved_count": saved}, status=status.HTTP_200_OK)
+        return Response({
+            "saved_count": saved,
+            "last_updated_at": f_log.updated_at.isoformat() if (f_log and f_log.updated_at) else None,
+        }, status=status.HTTP_200_OK)
 
 
 class YarnBookingViewSet(TenantModelViewSet):

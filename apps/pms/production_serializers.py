@@ -39,6 +39,7 @@ class ProductionInstructionSerializer(BaseModelSerializer):
     greyLotNo = serializers.ReadOnlyField(source="grey_lot.lot_number")
     finalPoId = serializers.PrimaryKeyRelatedField(source="final_po", read_only=True)
     finalPoNumber = serializers.ReadOnlyField(source="final_po.po_number")
+    finalPoStatus = serializers.ReadOnlyField(source="final_po.status")
     sourcePoId = TenantPrimaryKeyRelatedField(
         source="source_po", model="purchase.PurchaseOrder", required=False, allow_null=True
     )
@@ -68,7 +69,7 @@ class ProductionInstructionSerializer(BaseModelSerializer):
             "taka_count", "total_weight", "width", "gsm", "tentative_rate", "agreed_rate", "rate_uom",
             "special_terms", "expected_start_date", "expectedStartDate", "expected_completion_date", "expectedCompletionDate",
             "pi_date", "fabric", "process_type", "agreed_job_rate", "rejected_qty",
-            "verification_remarks", "completed_at", "greyLotId", "greyLotNo", "finalPoId", "finalPoNumber",
+            "verification_remarks", "completed_at", "greyLotId", "greyLotNo", "finalPoId", "finalPoNumber", "finalPoStatus",
             "sourcePoId", "sourcePoNumber",
             "employeeId", "employeeCode", "employeeName", "supervisorId", "supervisorName",
             "status", "verified_by", "verified_at", "notes",
@@ -80,7 +81,7 @@ class ProductionInstructionSerializer(BaseModelSerializer):
             "completed_at", "rejected_qty", "verification_remarks",
             "employeeCode", "employeeName", "cumulative", "balance",
             "totalProduced", "acceptedQty", "rejectedQty", "reprocessQty", "shortageQty", "finalAmount",
-            "agencyCode", "greyLotNo", "finalPoNumber", "sourcePoNumber",
+            "agencyCode", "greyLotNo", "finalPoNumber", "finalPoStatus", "sourcePoNumber",
             # Status only moves through approve/start/complete/verify/generate-po.
             "status",
             "created_at", "updated_at",

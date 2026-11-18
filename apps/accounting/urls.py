@@ -30,5 +30,6 @@ urlpatterns = [
     ),
     path("export/tally/", views.TallyExportView.as_view(), name="accounts-tally-export"),
     path("export/excel/", views.ExcelExportView.as_view(), name="accounts-excel-export"),
+    path("customer-write-off/", views.CustomerWriteOffView.as_view(), name="accounts-customer-write-off"),
     path("", include(router.urls)),
 ]

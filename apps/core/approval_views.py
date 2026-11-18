@@ -36,7 +36,7 @@ class ApprovalRequestViewSet(viewsets.ModelViewSet):
     permission_map = {
         "read": ["view_approvals"],
         "badge": ["view_approvals"],
-        "create": ["view_approvals"],
+        "create": [],
         "approve": ["manage_approvals"],
         "reject": ["manage_approvals"],
         "return_correction": ["return_approval"],
@@ -171,7 +171,7 @@ class DiscountPolicyView(APIView):
     """
 
     permission_classes = [HasModulePermission]
-    permission_map = {"PATCH": ["manage_approval_rules"], "PUT": ["manage_approval_rules"]}
+    permission_map = {"GET": [], "PATCH": ["manage_approval_rules"], "PUT": ["manage_approval_rules"]}
 
     PCT_FIELDS = {
         "autoAllowPct": "auto_allow_pct",

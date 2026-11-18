@@ -220,6 +220,7 @@ def instruction_completion(instruction):
         "rateUom": instruction.rate_uom or "Meter",
         "finalPoNumber": getattr(final_po_obj, "po_number", None) if final_po_obj else None,
         "finalPoId": str(final_po_obj.id) if final_po_obj else None,
+        "finalPoStatus": getattr(final_po_obj, "status", None) if final_po_obj else None,
         "dailySummary": rows,
         "rows": rows,
         "verificationRemarks": getattr(instruction, "verification_remarks", None) or "",
@@ -668,9 +669,9 @@ def generate_final_job_work_po(instruction, *, user=None, custom_data=None):
             f"Final Job Work PO can only be generated after completion verification (currently {instruction.status}).",
             field_errors={"status": ["Must be Verified or PO Pending."]},
         )
-    if instruction.final_po_id and not custom_data.get("allowRecreate") and action not in ["save_draft", "submit_for_approval", "approve_complete", "approve_generate"]:
+    if instruction.final_po_id and not custom_data.get("allowRecreate"):
         if getattr(instruction.final_po, "status", None) not in ["Draft", "Pending Approval"]:
-            raise Conflict("Final PO has already been created for this instruction.", code=Codes.ALREADY_DONE)
+            raise Conflict("Final Job Work PO has already been approved and cannot be edited.", code=Codes.ALREADY_DONE)
 
     completion = instruction_completion(instruction)
     raw_billable = custom_data.get("billableQty") or custom_data.get("acceptedQty")

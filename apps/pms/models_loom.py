@@ -47,6 +47,12 @@ class LoomFactory(TenantModel):
         "masters.Party", null=True, blank=True, on_delete=models.SET_NULL, related_name="job_worker_factories"
     )
     is_active = models.BooleanField(default=True)
+    assigned_employees = models.ManyToManyField(
+        "hrms.Employee", blank=True, related_name="assigned_loom_factories"
+    )
+    assigned_users = models.ManyToManyField(
+        "accounts.User", blank=True, related_name="assigned_loom_factories"
+    )
 
     class Meta:
         db_table = "loom_factories"
