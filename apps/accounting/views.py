@@ -570,3 +570,32 @@ class ExcelExportView(APIView):
         response = HttpResponse(csv_data, content_type="text/csv")
         response["Content-Disposition"] = f'attachment; filename="{register_type}_register_{timezone.localdate()}.csv"'
         return response
+
+
+class CustomerWriteOffView(APIView):
+    """``POST /accounts/customer-write-off/`` -- Write off uncollectible customer balance (PDF §14, §16)."""
+
+    permission_classes = [HasModulePermission]
+    required_permissions = ["manage_ledgers"]
+
+    def post(self, request):
+        from apps.core.exceptions import ValidationFailed
+        party_id = request.data.get("partyId") or request.data.get("party_id")
+        amount = request.data.get("amount")
+        reason = request.data.get("reason") or "Bad debt write-off"
+        invoice_id = request.data.get("invoiceId") or request.data.get("invoice_id")
+
+        if not party_id:
+            raise ValidationFailed("partyId is required.", field_errors={"partyId": ["Required."]})
+        if not amount:
+            raise ValidationFailed("amount is required.", field_errors={"amount": ["Required."]})
+
+        result = services.write_off_customer_receivable(
+            request.client_id,
+            party_id=party_id,
+            amount=amount,
+            reason=reason,
+            user=request.user,
+            invoice_id=invoice_id,
+        )
+        return Response(result)

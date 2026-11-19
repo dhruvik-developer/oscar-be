@@ -761,6 +761,24 @@ class BrokerCommissionSerializer(BaseModelSerializer):
     leadName = serializers.SerializerMethodField()
     lead_number = serializers.SerializerMethodField()
     lead_name = serializers.SerializerMethodField()
+    invoice_due_date = serializers.DateField(source="invoice.due_date", read_only=True)
+    invoice_status = serializers.CharField(source="invoice.status", read_only=True)
+    invoiceDueDate = serializers.DateField(source="invoice.due_date", read_only=True)
+    invoiceStatus = serializers.CharField(source="invoice.status", read_only=True)
+    is_invoice_overdue = serializers.SerializerMethodField()
+    isInvoiceOverdue = serializers.SerializerMethodField()
+
+    def get_is_invoice_overdue(self, commission):
+        inv = commission.invoice
+        if not inv or not inv.due_date:
+            return False
+        from apps.core.money import D, ZERO
+        from django.utils import timezone
+        is_unpaid = inv.status not in ("Paid",) and (D(inv.total or 0) - D(inv.amount_paid or 0)) > ZERO
+        return bool(is_unpaid and timezone.localdate() > inv.due_date)
+
+    def get_isInvoiceOverdue(self, commission):
+        return self.get_is_invoice_overdue(commission)
 
     def _lead(self, commission):
         from .models import order_lead
@@ -790,6 +808,8 @@ class BrokerCommissionSerializer(BaseModelSerializer):
             "broker_name", "broker_code", "party_name", "invoice_number",
             "invoice", "invoiceNumber", "leadNumber", "leadName", "lead_number", "lead_name",
             "party", "partyName", "salesperson",
+            "invoiceDueDate", "invoiceStatus", "isInvoiceOverdue",
+            "invoice_due_date", "invoice_status", "is_invoice_overdue",
             "invoice_date", "invoice_amount", "commission_basis", "commission_type",
             "rate", "commission_amount", "paid_amount", "status",
             "approved_by", "approved_at", "paid_at", "payment_reference",

@@ -66,6 +66,7 @@ SYSTEM_ACCOUNTS = [
     # already charged: what production absorbed into WIP is taken back out
     # of P&L here, so it is not counted twice.
     ("production_absorbed", "5610", "Manufacturing Overhead Absorbed", "Expense", None),
+    ("bad_debts", "5800", "Bad Debts Written Off", "Expense", None),
 ]
 
 
@@ -1269,3 +1270,64 @@ def account_ledger(client_id, account_id, *, date_from=None, date_to=None):
         "entries": entries,
         "closingBalance": running,
     }
+
+
+@transaction.atomic
+def write_off_customer_receivable(client_id, party_id=None, amount=None, reason="Bad debt write-off", user=None, invoice_id=None, party=None):
+    """Write off uncollectible customer balance / invoice (PDF §14, §16).
+    
+    Posts:
+      Dr Bad Debts Written Off (5800)
+      Cr Sundry Debtors (1200) [party linked]
+    """
+    from apps.masters.models import Party
+    from apps.sales.models import SalesInvoice
+    from apps.core.audit import record_audit
+    from apps.core.exceptions import ValidationFailed
+    
+    if party_id is None and party is not None:
+        party_id = getattr(party, "id", party)
+
+    party = Party.objects.select_for_update().filter(pk=party_id, client_id=client_id, deleted_at__isnull=True).first()
+    if not party:
+        raise ValidationFailed("Customer party not found.")
+    
+    writeoff_amount = round2(D(amount))
+    if writeoff_amount <= ZERO:
+        raise ValidationFailed("Write-off amount must be greater than zero.")
+    
+    bad_debts_acc = system_account(client_id, "bad_debts")
+    debtors_acc = system_account(client_id, "debtors")
+    
+    postings = [
+        debit(bad_debts_acc, writeoff_amount, description=f"Bad debt write-off: {party.name} - {reason}"),
+        credit(debtors_acc, writeoff_amount, party=party, description=f"Bad debt write-off against {party.name}"),
+    ]
+    
+    entry = post_entry(
+        client=client_id,
+        postings=postings,
+        narration=f"Customer bad debt written off for {party.name}: {reason}",
+        source_document_type="CustomerWriteOff",
+        source_document_id=party.id,
+        user=user,
+    )
+    
+    if invoice_id:
+        invoice = SalesInvoice.objects.select_for_update().filter(pk=invoice_id, client_id=client_id).first()
+        if invoice:
+            invoice.notes = (invoice.notes or "") + f" [Bad debt written off: ₹{writeoff_amount} ({reason})]"
+            invoice.save(update_fields=["notes", "updated_at"])
+    
+    record_audit(
+        client=client_id,
+        actor=user,
+        action="write_off",
+        entity_type="Party",
+        entity_id=party.id,
+        description=f"Wrote off bad debt ₹{writeoff_amount:,.2f} for customer {party.name}: {reason}",
+    )
+    return entry
+
+
+

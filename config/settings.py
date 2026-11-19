@@ -211,8 +211,28 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 # --------------------------------------------------------------------------
 # DRF (api.md §1.3 - §1.5)
 # --------------------------------------------------------------------------
-NUM_PROXIES = int(env("NUM_PROXIES", "0"))
+# --------------------------------------------------------------------------
+# Rate Limiting & Proxy Configuration (api.md §1.5)
+# --------------------------------------------------------------------------
+LOGIN_RATE_LIMIT = "100/minute" if ("test" in sys.argv) else env("LOGIN_RATE_LIMIT", "5/minute")
+LOGIN_FAILED_RATE_LIMIT = env("LOGIN_FAILED_RATE_LIMIT", env("LOGIN_FAILED_LIMIT", "10/10minute"))
+LOGIN_FAILED_LIMIT = LOGIN_FAILED_RATE_LIMIT
+AUTHENTICATED_RATE_LIMIT = env("AUTHENTICATED_RATE_LIMIT", env("AUTHENTICATED_API_RATE_LIMIT", "120/minute"))
+AUTHENTICATED_API_RATE_LIMIT = AUTHENTICATED_RATE_LIMIT
+ANONYMOUS_RATE_LIMIT = env("ANONYMOUS_RATE_LIMIT", env("ANONYMOUS_API_RATE_LIMIT", "30/minute"))
+ANONYMOUS_API_RATE_LIMIT = ANONYMOUS_RATE_LIMIT
+PASSWORD_RESET_RATE_LIMIT = env("PASSWORD_RESET_RATE_LIMIT", "3/15minute")
+OTP_VERIFY_RATE_LIMIT = env("OTP_VERIFY_RATE_LIMIT", env("OTP_RATE_LIMIT", "5/10minute"))
+OTP_RATE_LIMIT = OTP_VERIFY_RATE_LIMIT
+TOKEN_REFRESH_RATE_LIMIT = env("TOKEN_REFRESH_RATE_LIMIT", env("TOKEN_RATE_LIMIT", "10/10minute"))
+TOKEN_RATE_LIMIT = TOKEN_REFRESH_RATE_LIMIT
+SENSITIVE_ACTION_RATE_LIMIT = env("SENSITIVE_ACTION_RATE_LIMIT", "10/10minute")
+NUM_PROXIES = int(env("NUM_PROXIES", "0")) if env("NUM_PROXIES") else None
+TRUSTED_PROXIES = env_list("TRUSTED_PROXIES", "")
 
+# --------------------------------------------------------------------------
+# DRF (api.md §1.3 - §1.5)
+# --------------------------------------------------------------------------
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": (
         "apps.accounts.authentication.TenantJWTAuthentication",
@@ -230,15 +250,24 @@ REST_FRAMEWORK = {
     "DEFAULT_RENDERER_CLASSES": ("rest_framework.renderers.JSONRenderer",),
     # api.md §1.6 -- money is a number with 2 decimals, never a formatted string.
     "COERCE_DECIMAL_TO_STRING": False,
-    "NUM_PROXIES": NUM_PROXIES,
+    "DEFAULT_THROTTLE_CLASSES": (
+        "apps.core.throttling.SafeAnonRateThrottle",
+        "apps.core.throttling.SafeUserRateThrottle",
+    ),
     "DEFAULT_THROTTLE_RATES": {
-        # Public/unauthenticated surfaces: quotation links, proof links, careers,
-        # public lead forms (api.md §5.3, §9.7, §10.6, §11.5).
+        "anon": ANONYMOUS_RATE_LIMIT,
+        "user": AUTHENTICATED_RATE_LIMIT,
+        "login": LOGIN_RATE_LIMIT,
+        "login_failed": LOGIN_FAILED_RATE_LIMIT,
+        "password_reset": PASSWORD_RESET_RATE_LIMIT,
+        "otp_verify": OTP_VERIFY_RATE_LIMIT,
+        "token_refresh": TOKEN_REFRESH_RATE_LIMIT,
+        "sensitive_action": SENSITIVE_ACTION_RATE_LIMIT,
+        "password_change": "5/min",
         "public": "60/min",
         "public_write": "10/min",
-        "login": "20/min",
-        "password_change": "5/min",
     },
+    "NUM_PROXIES": NUM_PROXIES,
 }
 
 SIMPLE_JWT = {
@@ -290,7 +319,7 @@ CORS_ALLOW_HEADERS = (
     "idempotency-key",
     "if-unmodified-since",
 )
-CORS_EXPOSE_HEADERS = ("last-modified", "idempotency-replayed")
+CORS_EXPOSE_HEADERS = ("last-modified", "idempotency-replayed", "retry-after")
 
 # --------------------------------------------------------------------------
 # Application settings
