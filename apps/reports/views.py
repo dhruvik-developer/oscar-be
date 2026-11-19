@@ -214,9 +214,15 @@ class ReportView(APIView):
         from .dashboard import business_dashboard
 
         day = request.query_params.get("date") or as_of
+        period = request.query_params.get("period", "mtd")
+        chart_range = request.query_params.get("chart_range", "7d")
         try:
             return Response(business_dashboard(
-                client_id, day=day, include_batch_profit=_can_see_batch_cost(request.user),
+                client_id,
+                day=day,
+                period=period,
+                chart_range=chart_range,
+                include_batch_profit=_can_see_batch_cost(request.user),
             ))
         except ValueError:
             raise ValidationFailed(
