@@ -99,6 +99,16 @@ class DepartmentSerializer(BaseModelSerializer):
             "description", "employees", "teams", "created_at", "updated_at",
         ]
 
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        remark = ret.get("remark")
+        if remark and isinstance(remark, str):
+            import re
+            remark = re.sub(r"Overlapped with approved leave\s+[0-9a-fA-F-]{32,36}", "Overlapped with an existing approved leave", remark)
+            remark = re.sub(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b", "", remark)
+            ret["remark"] = re.sub(r"\s+", " ", remark).strip()
+        return ret
+
     def validate(self, attrs):
         """A department without a code gets one from its name (Dyeing -> DYEING)."""
         from apps.masters.serializers import slug_code, unique_code

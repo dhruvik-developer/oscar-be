@@ -867,7 +867,7 @@ def approve_leave(leave_request, *, user=None, remark=None):
     ).exclude(pk=leave_request.pk)
     overlapping_pending.update(
         status="Rejected",
-        remark=f"Overlapped with approved leave {leave_request.id}",
+        remark=f"Overlapped with approved leave ({leave_request.from_date} to {leave_request.to_date})",
         decided_at=timezone.now(),
         approver=user if getattr(user, "is_authenticated", False) else None,
     )

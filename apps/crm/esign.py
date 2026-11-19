@@ -58,12 +58,13 @@ class ESignFailed(EvenmoreAPIError):
 
 
 def is_configured():
+    has_key = bool(getattr(settings, "DOCUSIGN_PRIVATE_KEY", "").strip()) or bool(getattr(settings, "DOCUSIGN_PRIVATE_KEY_PATH", "").strip())
     return all(
         (
             settings.DOCUSIGN_INTEGRATION_KEY,
             settings.DOCUSIGN_USER_ID,
             settings.DOCUSIGN_ACCOUNT_ID,
-            settings.DOCUSIGN_PRIVATE_KEY_PATH,
+            has_key,
         )
     )
 
@@ -81,6 +82,9 @@ def consent_url():
 
 
 def _private_key():
+    direct_key = getattr(settings, "DOCUSIGN_PRIVATE_KEY", "").strip()
+    if direct_key:
+        return direct_key
     path = Path(settings.DOCUSIGN_PRIVATE_KEY_PATH)
     if not path.is_absolute():
         path = Path(settings.BASE_DIR) / path
