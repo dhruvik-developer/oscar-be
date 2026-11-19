@@ -34,7 +34,13 @@ def env_list(key, default=""):
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
-SECRET_KEY = env("DJANGO_SECRET_KEY", "dev-insecure-key-do-not-use-in-production")
+SECRET_KEY = env("DJANGO_SECRET_KEY")
+if not SECRET_KEY:
+    from django.core.exceptions import ImproperlyConfigured
+
+    raise ImproperlyConfigured(
+        "DJANGO_SECRET_KEY environment variable is required and must be defined in .env or the environment."
+    )
 DEBUG = env_bool("DJANGO_DEBUG", False)
 # JWTs and password-reset codes are signed with this key; a short or default
 # one makes them forgeable. Development may run with it, production may not.
@@ -45,8 +51,10 @@ if not DEBUG and (len(SECRET_KEY) < 32 or "insecure" in SECRET_KEY or "change-me
         "DJANGO_SECRET_KEY must be a random string of at least 32 characters "
         "when DJANGO_DEBUG=False."
     )
-ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1,0.0.0.0,testserver")
-DJANGO_ADMIN_URL = env("DJANGO_ADMIN_URL", "django-admin/").strip("/") + "/"
+ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS")
+if "test" in sys.argv and "testserver" not in ALLOWED_HOSTS:
+    ALLOWED_HOSTS.append("testserver")
+DJANGO_ADMIN_URL = env("DJANGO_ADMIN_URL", "").strip("/") + "/"
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -122,10 +130,10 @@ else:
     ENABLED_MODULES = list(FULL_MODULES)
 
 
-
 def module_enabled(name):
     """Route-level toggle. Apps stay in INSTALLED_APPS for FK integrity."""
     return name.lower() in ENABLED_MODULES
+
 
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
@@ -162,12 +170,12 @@ ASGI_APPLICATION = "config.asgi.application"
 
 DATABASES = {
     "default": {
-        "ENGINE": "django.db.backends.postgresql",
-        "NAME": env("DB_NAME", "evenmore_erp"),
-        "USER": env("DB_USER", "postgres"),
-        "PASSWORD": env("DB_PASSWORD", "postgres"),
-        "HOST": env("DB_HOST", "localhost"),
-        "PORT": env("DB_PORT", "5432"),
+        "ENGINE": env("DB_ENGINE", "django.db.backends.postgresql"),
+        "NAME": env("DB_NAME", ""),
+        "USER": env("DB_USER", ""),
+        "PASSWORD": env("DB_PASSWORD", ""),
+        "HOST": env("DB_HOST", ""),
+        "PORT": env("DB_PORT", ""),
         # The development server creates short-lived request threads; keeping
         # their connections open can exhaust PostgreSQL's connection limit.
         "CONN_MAX_AGE": int(env("DB_CONN_MAX_AGE", "0" if DEBUG else "60")),
@@ -175,6 +183,37 @@ DATABASES = {
         "TEST": {"NAME": env("DB_TEST_NAME", None)},
     }
 }
+
+_database_url = env("DATABASE_URL")
+if _database_url:
+    from urllib.parse import unquote, urlparse
+
+    _url = urlparse(_database_url)
+    DATABASES["default"]["ENGINE"] = "django.db.backends.postgresql"
+    if _url.path:
+        DATABASES["default"]["NAME"] = unquote(_url.path.lstrip("/"))
+    if _url.username:
+        DATABASES["default"]["USER"] = unquote(_url.username)
+    if _url.password:
+        DATABASES["default"]["PASSWORD"] = unquote(_url.password)
+    if _url.hostname:
+        DATABASES["default"]["HOST"] = _url.hostname
+    if _url.port:
+        DATABASES["default"]["PORT"] = str(_url.port)
+
+if not ("test" in sys.argv):
+    if not DATABASES["default"].get("NAME"):
+        from django.core.exceptions import ImproperlyConfigured
+
+        raise ImproperlyConfigured(
+            "DB_NAME environment variable is required and must be defined in .env or the environment."
+        )
+    if not DATABASES["default"].get("USER"):
+        from django.core.exceptions import ImproperlyConfigured
+
+        raise ImproperlyConfigured(
+            "DB_USER environment variable is required and must be defined in .env or the environment."
+        )
 
 AUTH_USER_MODEL = "accounts.User"
 
@@ -214,21 +253,24 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 # --------------------------------------------------------------------------
 # Rate Limiting & Proxy Configuration (api.md §1.5)
 # --------------------------------------------------------------------------
-LOGIN_RATE_LIMIT = "100/minute" if ("test" in sys.argv) else env("LOGIN_RATE_LIMIT", "5/minute")
-LOGIN_FAILED_RATE_LIMIT = env("LOGIN_FAILED_RATE_LIMIT", env("LOGIN_FAILED_LIMIT", "10/10minute"))
+LOGIN_RATE_LIMIT = env("LOGIN_RATE_LIMIT")
+LOGIN_FAILED_RATE_LIMIT = env("LOGIN_FAILED_RATE_LIMIT")
 LOGIN_FAILED_LIMIT = LOGIN_FAILED_RATE_LIMIT
-AUTHENTICATED_RATE_LIMIT = env("AUTHENTICATED_RATE_LIMIT", env("AUTHENTICATED_API_RATE_LIMIT", "300/minute"))
+AUTHENTICATED_RATE_LIMIT = env("AUTHENTICATED_RATE_LIMIT")
 AUTHENTICATED_API_RATE_LIMIT = AUTHENTICATED_RATE_LIMIT
-ANONYMOUS_RATE_LIMIT = env("ANONYMOUS_RATE_LIMIT", env("ANONYMOUS_API_RATE_LIMIT", "100/minute"))
+ANONYMOUS_RATE_LIMIT = env("ANONYMOUS_RATE_LIMIT")
 ANONYMOUS_API_RATE_LIMIT = ANONYMOUS_RATE_LIMIT
-PASSWORD_RESET_RATE_LIMIT = env("PASSWORD_RESET_RATE_LIMIT", "3/15minute")
-OTP_VERIFY_RATE_LIMIT = env("OTP_VERIFY_RATE_LIMIT", env("OTP_RATE_LIMIT", "5/10minute"))
+PASSWORD_RESET_RATE_LIMIT = env("PASSWORD_RESET_RATE_LIMIT")
+OTP_VERIFY_RATE_LIMIT = env("OTP_VERIFY_RATE_LIMIT")
 OTP_RATE_LIMIT = OTP_VERIFY_RATE_LIMIT
-TOKEN_REFRESH_RATE_LIMIT = env("TOKEN_REFRESH_RATE_LIMIT", env("TOKEN_RATE_LIMIT", "10/10minute"))
+TOKEN_REFRESH_RATE_LIMIT = env("TOKEN_REFRESH_RATE_LIMIT")
 TOKEN_RATE_LIMIT = TOKEN_REFRESH_RATE_LIMIT
-SENSITIVE_ACTION_RATE_LIMIT = env("SENSITIVE_ACTION_RATE_LIMIT", "10/10minute")
-NUM_PROXIES = int(env("NUM_PROXIES", "0")) if env("NUM_PROXIES") else None
-TRUSTED_PROXIES = env_list("TRUSTED_PROXIES", "")
+SENSITIVE_ACTION_RATE_LIMIT = env("SENSITIVE_ACTION_RATE_LIMIT")
+PASSWORD_CHANGE_RATE_LIMIT = env("PASSWORD_CHANGE_RATE_LIMIT")
+PUBLIC_RATE_LIMIT = env("PUBLIC_RATE_LIMIT")
+PUBLIC_WRITE_RATE_LIMIT = env("PUBLIC_WRITE_RATE_LIMIT")
+NUM_PROXIES = int(env("NUM_PROXIES")) if env("NUM_PROXIES") else None
+TRUSTED_PROXIES = env_list("TRUSTED_PROXIES")
 
 # --------------------------------------------------------------------------
 # DRF (api.md §1.3 - §1.5)
@@ -263,13 +305,14 @@ REST_FRAMEWORK = {
         "otp_verify": OTP_VERIFY_RATE_LIMIT,
         "token_refresh": TOKEN_REFRESH_RATE_LIMIT,
         "sensitive_action": SENSITIVE_ACTION_RATE_LIMIT,
-        "password_change": "5/min",
-        "public": "60/min",
-        "public_write": "10/min",
+        "password_change": PASSWORD_CHANGE_RATE_LIMIT,
+        "public": PUBLIC_RATE_LIMIT,
+        "public_write": PUBLIC_WRITE_RATE_LIMIT,
     },
     "NUM_PROXIES": NUM_PROXIES,
 }
 
+JWT_SECRET_KEY = env("JWT_SECRET_KEY", "")
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(minutes=int(env("ACCESS_TOKEN_MINUTES", "60"))),
     "REFRESH_TOKEN_LIFETIME": timedelta(days=int(env("REFRESH_TOKEN_DAYS", "14"))),
@@ -279,6 +322,8 @@ SIMPLE_JWT = {
     "USER_ID_CLAIM": "user_id",
     "TOKEN_TYPE_CLAIM": "token_type",
 }
+if JWT_SECRET_KEY:
+    SIMPLE_JWT["SIGNING_KEY"] = JWT_SECRET_KEY
 
 SPECTACULAR_SETTINGS = {
     "TITLE": "Evenmore ERP API",
@@ -293,10 +338,7 @@ SPECTACULAR_SETTINGS = {
 # --------------------------------------------------------------------------
 # CORS (api-integration.md blocker 6)
 # --------------------------------------------------------------------------
-CORS_ALLOWED_ORIGINS = env_list(
-    "CORS_ALLOWED_ORIGINS",
-    "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000",
-)
+CORS_ALLOWED_ORIGINS = env_list("CORS_ALLOWED_ORIGINS")
 CORS_ALLOW_CREDENTIALS = False
 
 #: Where the React app is served; password-reset emails link to
@@ -349,8 +391,8 @@ EMAIL_HOST = env("EMAIL_HOST", "")
 EMAIL_PORT = int(env("EMAIL_PORT", "587"))
 EMAIL_HOST_USER = env("EMAIL_HOST_USER", "")
 EMAIL_HOST_PASSWORD = env("EMAIL_HOST_PASSWORD", "")
-EMAIL_USE_TLS = env("EMAIL_USE_TLS", "True").strip().lower() in ("1", "true", "yes", "on")
-EMAIL_USE_SSL = env("EMAIL_USE_SSL", "False").strip().lower() in ("1", "true", "yes", "on")
+EMAIL_USE_TLS = env_bool("EMAIL_USE_TLS", True)
+EMAIL_USE_SSL = env_bool("EMAIL_USE_SSL", False)
 DEFAULT_FROM_EMAIL = env("DEFAULT_FROM_EMAIL", "")
 EMAIL_TIMEOUT = int(env("EMAIL_TIMEOUT", "20"))
 
@@ -453,9 +495,9 @@ if not DEBUG and not IS_TESTING:
         )
 
     db_pass = DATABASES["default"].get("PASSWORD", "")
-    if db_pass == "postgres" or len(db_pass) < 12:
+    if not db_pass or db_pass == "postgres" or len(db_pass) < 12:
         raise ImproperlyConfigured(
-            "DB_PASSWORD must not be the default 'postgres' and must be at least 12 characters when DJANGO_DEBUG=False."
+            "DB_PASSWORD must be configured in environment (.env), must not be the default 'postgres' and must be at least 12 characters when DJANGO_DEBUG=False."
         )
 
     for origin in CORS_ALLOWED_ORIGINS:
@@ -473,7 +515,7 @@ STOCK_ADJUSTMENT_APPROVAL_LIMIT = env("STOCK_ADJUSTMENT_APPROVAL_LIMIT", None) o
 # --------------------------------------------------------------------------
 # E-Invoicing & E-Way Bill Integration (PDF §20)
 # --------------------------------------------------------------------------
-EINVOICE_ENABLED = env_bool("EINVOICE_ENABLED", True)
+EINVOICE_ENABLED = env_bool("EINVOICE_ENABLED", False)
 EINVOICE_PROVIDER = env("EINVOICE_PROVIDER", "sandbox-sim")
 EINVOICE_SANDBOX_MODE = env_bool("EINVOICE_SANDBOX_MODE", True)
 EINVOICE_BASE_URL = env("EINVOICE_BASE_URL", "https://einv-apisandbox.nic.in")
@@ -494,5 +536,6 @@ DOCUSIGN_INTEGRATION_KEY = env("DOCUSIGN_INTEGRATION_KEY", "")
 DOCUSIGN_USER_ID = env("DOCUSIGN_USER_ID", "")
 DOCUSIGN_ACCOUNT_ID = env("DOCUSIGN_ACCOUNT_ID", "")
 DOCUSIGN_PRIVATE_KEY_PATH = env("DOCUSIGN_PRIVATE_KEY_PATH", "")
+DOCUSIGN_PRIVATE_KEY = env("DOCUSIGN_PRIVATE_KEY", "")
 DOCUSIGN_AUTH_SERVER = env("DOCUSIGN_AUTH_SERVER", "account-d.docusign.com")
 DOCUSIGN_BASE_URL = env("DOCUSIGN_BASE_URL", "https://demo.docusign.net/restapi")

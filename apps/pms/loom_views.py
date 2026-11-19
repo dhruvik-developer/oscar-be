@@ -13,7 +13,7 @@ from rest_framework.views import APIView
 from rest_framework.exceptions import PermissionDenied
 
 from apps.core.permissions import HasModulePermission
-from apps.core.exceptions import NotFound, ValidationFailed
+from apps.core.exceptions import NotFound, ValidationFailed, Conflict
 from apps.core.viewsets import TenantModelViewSet
 from .models_loom import (
     LoomCoordinator,
@@ -442,6 +442,17 @@ class YarnBookingViewSet(TenantModelViewSet):
     queryset = YarnBooking.objects.select_related("yarn", "supplier_party").all()
     serializer_class = YarnBookingSerializer
 
+    def check_delete_allowed(self, instance):
+        if instance.deliveries.filter(deleted_at__isnull=True, status="Received").exists():
+            raise Conflict("Cannot delete booking with received yarn deliveries. You can edit or adjust the booking quantity instead.")
+
+    def perform_destroy(self, instance):
+        super().perform_destroy(instance)
+        user = getattr(self.request, "user", None)
+        user_obj = user if getattr(user, "is_authenticated", False) else None
+        for d in instance.deliveries.filter(deleted_at__isnull=True, status="Scheduled"):
+            d.soft_delete(user_obj)
+
 
 class YarnDeliveryViewSet(TenantModelViewSet):
     permission_classes = [HasModulePermission]
@@ -482,6 +493,19 @@ class YarnDeliveryViewSet(TenantModelViewSet):
                     recd_kgs=Decimal("0"),
                     status="Scheduled",
                 )
+            elif short < 0:
+                # Received MORE than scheduled (excess arrival): update scheduled kgs to actual received
+                delivery.kgs = got_kgs
+                delivery.save(update_fields=["kgs", "updated_at"])
+                # Auto-expand booking total kg if total deliveries now exceed booked quantity
+                booking = delivery.booking
+                if booking:
+                    total_sched = (
+                        booking.deliveries.filter(deleted_at__isnull=True).aggregate(s=Sum("kgs"))["s"] or Decimal("0")
+                    )
+                    if total_sched > booking.kgs:
+                        booking.kgs = total_sched
+                        booking.save(update_fields=["kgs", "updated_at"])
 
         return Response(YarnDeliverySerializer(delivery).data)
 
