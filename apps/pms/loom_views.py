@@ -1,6 +1,7 @@
 """
 Loom & Weaving API ViewSets for Oscar PMS.
 """
+import logging
 from datetime import datetime, date
 from decimal import Decimal
 from django.db import transaction
@@ -15,6 +16,17 @@ from rest_framework.exceptions import PermissionDenied
 from apps.core.permissions import HasModulePermission
 from apps.core.exceptions import NotFound, ValidationFailed, Conflict
 from apps.core.viewsets import TenantModelViewSet
+from .inventory_bridge import (
+    sync_yarn_delivery_receipt_to_inventory,
+    sync_beam_warp_consumption_to_inventory,
+    sync_daily_weft_consumption_to_inventory,
+    sync_fabric_dispatch_to_inventory,
+    sync_yarn_master_to_inventory,
+    sync_loom_quality_to_inventory,
+    sync_daily_loom_production_to_pi,
+)
+
+logger = logging.getLogger(__name__)
 from .models_loom import (
     LoomCoordinator,
     LoomFactory,
@@ -125,6 +137,7 @@ class LoomCoordinatorViewSet(TenantModelViewSet):
 class LoomFactoryViewSet(TenantModelViewSet):
     permission_classes = [HasModulePermission]
     permission_map = {"read": ["view_pms"], "write": ["create_pms_project"]}
+    queryset = LoomFactory.objects.all()
     serializer_class = LoomFactorySerializer
 
     def get_queryset(self):
@@ -140,6 +153,11 @@ class LoomFactoryViewSet(TenantModelViewSet):
     def perform_create(self, serializer):
         factory = super().perform_create(serializer)
         client_id = getattr(self.request, "client_id", None)
+        user = getattr(self.request, "user", None)
+        if user and getattr(user, "is_authenticated", False):
+            factory.assigned_users.add(user)
+            if getattr(user, "employee", None):
+                factory.assigned_employees.add(user.employee)
         # Ensure factory is synced as a Vendor in Parties master
         if not factory.job_worker_party:
             from apps.masters.models import Party
@@ -149,7 +167,6 @@ class LoomFactoryViewSet(TenantModelViewSet):
                 deleted_at__isnull=True,
             ).first()
             if not party:
-                user = getattr(self.request, "user", None)
                 party = Party.objects.create(
                     client_id=client_id,
                     name=factory.name.strip(),
@@ -225,15 +242,63 @@ class LoomMachineViewSet(TenantModelViewSet):
 class YarnMasterViewSet(TenantModelViewSet):
     permission_classes = [HasModulePermission]
     permission_map = {"read": ["view_pms"], "write": ["create_pms_project"]}
-    queryset = YarnMaster.objects.all()
+    queryset = YarnMaster.objects.select_related("item", "category").all()
     serializer_class = YarnMasterSerializer
+
+    def perform_create(self, serializer):
+        # [OLD CODE - COMMENTED OUT]: yarn = serializer.save() (did not set client_id via TenantModelViewSet)
+        # yarn = serializer.save()
+        yarn = super().perform_create(serializer)
+        try:
+            sync_yarn_master_to_inventory(yarn, category_id=self.request.data.get("category"))
+        except Exception as exc:
+            logger.warning("Failed to sync yarn to inventory item: %s", exc)
+        return yarn
+
+    def perform_update(self, serializer):
+        # [OLD CODE - COMMENTED OUT]: yarn = serializer.save()
+        # yarn = serializer.save()
+        yarn = super().perform_update(serializer)
+        try:
+            sync_yarn_master_to_inventory(yarn, category_id=self.request.data.get("category"))
+        except Exception as exc:
+            logger.warning("Failed to sync yarn to inventory item: %s", exc)
+        return yarn
 
 
 class LoomQualityViewSet(TenantModelViewSet):
     permission_classes = [HasModulePermission]
     permission_map = {"read": ["view_pms"], "write": ["create_pms_project"]}
-    queryset = LoomQuality.objects.select_related("warp_yarn", "weft_yarn", "fabric_quality", "item").all()
+    queryset = LoomQuality.objects.select_related("warp_yarn", "weft_yarn", "fabric_quality", "item", "category").all()
     serializer_class = LoomQualitySerializer
+
+    def perform_create(self, serializer):
+        # [OLD CODE - COMMENTED OUT]: quality = serializer.save()
+        # quality = serializer.save()
+        quality = super().perform_create(serializer)
+        try:
+            sync_loom_quality_to_inventory(
+                quality,
+                category_id=self.request.data.get("category"),
+                fabric_quality_id=self.request.data.get("fabric_quality"),
+            )
+        except Exception as exc:
+            logger.warning("Failed to sync quality to inventory: %s", exc)
+        return quality
+
+    def perform_update(self, serializer):
+        # [OLD CODE - COMMENTED OUT]: quality = serializer.save()
+        # quality = serializer.save()
+        quality = super().perform_update(serializer)
+        try:
+            sync_loom_quality_to_inventory(
+                quality,
+                category_id=self.request.data.get("category"),
+                fabric_quality_id=self.request.data.get("fabric_quality"),
+            )
+        except Exception as exc:
+            logger.warning("Failed to sync quality to inventory: %s", exc)
+        return quality
 
 
 class LoomBeamViewSet(TenantModelViewSet):
@@ -242,6 +307,17 @@ class LoomBeamViewSet(TenantModelViewSet):
     queryset = LoomBeam.objects.all()
     serializer_class = LoomBeamSerializer
     filterset_fields = ["factory", "status", "machine"]
+
+    def perform_create(self, serializer):
+        # [OLD CODE - COMMENTED OUT]: beam = serializer.save()
+        # beam = serializer.save()
+        beam = super().perform_create(serializer)
+        if beam.status == "On loom":
+            try:
+                sync_beam_warp_consumption_to_inventory(beam, user=getattr(self.request, "user", None))
+            except Exception as exc:
+                logger.warning("Failed to sync beam warp consumption: %s", exc)
+        return beam
 
     @action(detail=True, methods=["post"])
     def load_to_loom(self, request, pk=None):
@@ -259,6 +335,11 @@ class LoomBeamViewSet(TenantModelViewSet):
             beam.status = "On loom"
             beam.machine_id = machine_id
             beam.save(update_fields=["status", "machine", "updated_at"])
+
+            try:
+                sync_beam_warp_consumption_to_inventory(beam, user=request.user)
+            except Exception as exc:
+                logger.warning("Failed to sync beam warp consumption: %s", exc)
 
         return Response(LoomBeamSerializer(beam).data)
 
@@ -421,6 +502,16 @@ class DailyLoomProductionViewSet(TenantModelViewSet):
                     prod.save()
                 saved += 1
 
+                try:
+                    sync_daily_weft_consumption_to_inventory(prod, user=request.user)
+                except Exception as exc:
+                    logger.warning("Failed to sync weft consumption for prod %s: %s", prod.id, exc)
+
+                try:
+                    sync_daily_loom_production_to_pi(prod, user=request.user)
+                except Exception as exc:
+                    logger.warning("Failed to auto-sync PI progress for prod %s: %s", prod.id, exc)
+
                 # Check if beam is exhausted
                 if beam_id:
                     beam = LoomBeam.objects.filter(id=beam_id, client_id=client_id, deleted_at__isnull=True).first()
@@ -507,6 +598,11 @@ class YarnDeliveryViewSet(TenantModelViewSet):
                         booking.kgs = total_sched
                         booking.save(update_fields=["kgs", "updated_at"])
 
+            try:
+                sync_yarn_delivery_receipt_to_inventory(delivery, user=request.user)
+            except Exception as exc:
+                logger.warning("Failed to sync yarn delivery receipt to inventory: %s", exc)
+
         return Response(YarnDeliverySerializer(delivery).data)
 
 
@@ -528,6 +624,15 @@ class FabricDispatchViewSet(TenantModelViewSet):
     queryset = FabricDispatch.objects.select_related("factory", "quality", "job_work_order", "dyeing_mill_party", "delivery_challan").all()
     serializer_class = FabricDispatchSerializer
     filterset_fields = ["factory", "quality"]
+
+    def perform_create(self, serializer):
+        # [OLD CODE - COMMENTED OUT]: instance = serializer.save()
+        # instance = serializer.save()
+        instance = super().perform_create(serializer)
+        try:
+            sync_fabric_dispatch_to_inventory(instance, user=getattr(self.request, "user", None))
+        except Exception as exc:
+            logger.warning("Failed to sync fabric dispatch to inventory: %s", exc)
 
     @action(detail=False, methods=["get"])
     def inventory_summary(self, request):

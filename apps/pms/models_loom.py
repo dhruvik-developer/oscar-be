@@ -89,6 +89,12 @@ class YarnMaster(TenantModel):
     kg_per_bag = models.DecimalField(max_digits=10, decimal_places=2, default=25)
     rate = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     note = models.TextField(null=True, blank=True)
+    item = models.ForeignKey(
+        "masters.Item", null=True, blank=True, on_delete=models.SET_NULL, related_name="loom_yarns"
+    )
+    category = models.ForeignKey(
+        "masters.ItemCategory", null=True, blank=True, on_delete=models.SET_NULL, related_name="loom_yarns"
+    )
 
     class Meta:
         db_table = "loom_yarns"
@@ -105,6 +111,9 @@ class LoomQuality(TenantModel):
     )
     item = models.ForeignKey(
         "masters.Item", null=True, blank=True, on_delete=models.SET_NULL, related_name="loom_qualities"
+    )
+    category = models.ForeignKey(
+        "masters.ItemCategory", null=True, blank=True, on_delete=models.SET_NULL, related_name="loom_qualities"
     )
     warp_yarn = models.ForeignKey(YarnMaster, on_delete=models.PROTECT, related_name="warp_qualities")
     ends = models.IntegerField()
@@ -335,6 +344,12 @@ class FabricDispatch(TenantModel):
     )
     challan = models.TextField(null=True, blank=True)
     vehicle = models.TextField(null=True, blank=True)
+    batch = models.ForeignKey(
+        "inventory.Batch", null=True, blank=True, on_delete=models.SET_NULL, related_name="fabric_dispatches"
+    )
+    target_location = models.ForeignKey(
+        "masters.Location", null=True, blank=True, on_delete=models.SET_NULL, related_name="incoming_fabric_dispatches"
+    )
 
     class Meta:
         db_table = "loom_fabric_dispatches"
