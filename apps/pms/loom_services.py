@@ -40,7 +40,15 @@ def get_machine_info(m):
         prod_m = DailyLoomProduction.objects.filter(
             beam=beam, deleted_at__isnull=True
         ).aggregate(s=Sum("meters"))["s"] or 0
-        rem = max(0.0, float(beam.length) - float(prod_m))
+
+        # [OLD CODE - COMMENTED OUT]: Assumed 1 meter warp = 1 meter woven fabric (ignoring crimp)
+        # rem = max(0.0, float(beam.length) - float(prod_m))
+
+        # [REAL-LIFE TEXTILE STANDARD]:
+        # Due to warp crimp (waviness over/under weft), 1m of woven fabric consumes (1 + crimp/100) meters of warp.
+        crimp_pct = float(q.crimp) if (q and q.crimp) else 5.0
+        warp_consumed_m = float(prod_m) * (1.0 + crimp_pct / 100.0)
+        rem = max(0.0, float(beam.length) - warp_consumed_m)
     else:
         rem = 0.0
 
@@ -211,14 +219,30 @@ def get_program_stats(p):
     days_count = len({p_row.date for p_row in prod_list})
     avg_rpm = (sum(float(p_row.rpm) for p_row in prod_list) / len(prod_list)) if prod_list else 0.0
 
-    # Theoretical meters = (rpm * 60 * hours) / ppm
-    ppm = q.ppm
-    theo = sum((float(p_row.rpm) * 60 * float(p_row.hours)) / ppm for p_row in prod_list) if ppm > 0 else 0.0
-    eff = (meters / theo * 100.0) if theo > 0 else 0.0
+    # [OLD CODE - COMMENTED OUT]: Gross theoretical meters & efficiency without deducting power cut hours
+    # ppm = q.ppm
+    # theo = sum((float(p_row.rpm) * 60 * float(p_row.hours)) / ppm for p_row in prod_list) if ppm > 0 else 0.0
+    # eff = (meters / theo * 100.0) if theo > 0 else 0.0
+    # day_logs = FactoryDayLog.objects.filter(factory=p.factory, date__gte=p.start, date__lte=p.deadline, deleted_at__isnull=True)
+    # power_avg = float(day_logs.aggregate(a=Avg("power"))["a"] or 0)
 
-    # Power cut avg
+    # [REAL-LIFE TEXTILE STANDARD]:
+    ppm = q.ppm
     day_logs = FactoryDayLog.objects.filter(factory=p.factory, date__gte=p.start, date__lte=p.deadline, deleted_at__isnull=True)
     power_avg = float(day_logs.aggregate(a=Avg("power"))["a"] or 0)
+    power_cut_map = {l.date: float(l.power or 0) for l in day_logs}
+
+    # 1. Gross Theoretical Meters (nominal shift hours basis)
+    theo = sum((float(p_row.rpm) * 60 * float(p_row.hours)) / ppm for p_row in prod_list) if ppm > 0 else 0.0
+    gross_eff = (meters / theo * 100.0) if theo > 0 else 0.0
+
+    # 2. Net Theoretical Meters (operating hours available, deducting power cuts)
+    net_theo = sum(
+        (float(p_row.rpm) * 60 * max(0.0, float(p_row.hours) - power_cut_map.get(p_row.date, 0.0))) / ppm
+        for p_row in prod_list
+    ) if ppm > 0 else 0.0
+    net_eff = (meters / net_theo * 100.0) if net_theo > 0 else gross_eff
+    eff = net_eff  # Primary report follows Net Operating Efficiency standard
 
     # Working days & expected
     total_days = max(1, (p.deadline - p.start).days + 1)
@@ -257,6 +281,7 @@ def get_program_stats(p):
         "avg_rpm": avg_rpm,
         "theo_meters": theo,
         "eff_pct": eff,
+        "gross_eff_pct": gross_eff,
         "power_avg": power_avg,
         "total_days": total_days,
         "days_used": days_used,

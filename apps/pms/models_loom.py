@@ -135,14 +135,28 @@ class LoomQuality(TenantModel):
     def weft_kg_m(self):
         return float(self.weft_yarn.denier) * float(self.reed_w) * float(self.ppi) * (1.0 + float(self.wastage) / 100.0) / 9000000.0
 
+    # [OLD CODE - COMMENTED OUT]: Nominal weight without crimp & wastage, dividing by reed width
+    # @property
+    # def glm(self):
+    #     return (float(self.ends) * float(self.warp_yarn.denier) + float(self.weft_yarn.denier) * float(self.reed_w) * float(self.ppi)) / 9000000.0 * 1000.0
+    #
+    # @property
+    # def gsm(self):
+    #     rw = float(self.reed_w) * 0.0254
+    #     return (self.glm / rw) if rw > 0 else 0.0
+
+    # [REAL-LIFE TEXTILE STANDARD]:
     @property
     def glm(self):
-        return (float(self.ends) * float(self.warp_yarn.denier) + float(self.weft_yarn.denier) * float(self.reed_w) * float(self.ppi)) / 9000000.0 * 1000.0
+        # Physical scale weight of 1 linear meter (GLM) = Total warp weight + Total weft weight (including crimp & take-up)
+        return (self.warp_kg_m + self.weft_kg_m) * 1000.0
 
     @property
     def gsm(self):
-        rw = float(self.reed_w) * 0.0254
-        return (self.glm / rw) if rw > 0 else 0.0
+        # Off-loom greige fabric contracts by ~4-6% from reed space (standard contraction factor 0.95).
+        # Dividing GLM by the contracted greige cloth width accurately matches circular GSM scale cutters.
+        greige_w_m = float(self.reed_w) * 0.95 * 0.0254
+        return (self.glm / greige_w_m) if greige_w_m > 0 else 0.0
 
     @property
     def warp_cost(self):

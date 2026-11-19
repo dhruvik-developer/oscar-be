@@ -99,6 +99,16 @@ class DepartmentSerializer(BaseModelSerializer):
             "description", "employees", "teams", "created_at", "updated_at",
         ]
 
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        remark = ret.get("remark")
+        if remark and isinstance(remark, str):
+            import re
+            remark = re.sub(r"Overlapped with approved leave\s+[0-9a-fA-F-]{32,36}", "Overlapped with an existing approved leave", remark)
+            remark = re.sub(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b", "", remark)
+            ret["remark"] = re.sub(r"\s+", " ", remark).strip()
+        return ret
+
     def validate(self, attrs):
         """A department without a code gets one from its name (Dyeing -> DYEING)."""
         from apps.masters.serializers import slug_code, unique_code
@@ -2061,6 +2071,7 @@ class TerminationSerializer(BaseModelSerializer):
         source="employee", model="hrms.Employee", required=False, allow_null=True
     )
     employeeName = serializers.CharField(source="employee.name", read_only=True)
+    employeeCode = serializers.CharField(source="employee.employee_code", read_only=True)
     lastWorkingDay = serializers.DateField(
         source="last_working_day", required=False, allow_null=True
     )
@@ -2072,7 +2083,7 @@ class TerminationSerializer(BaseModelSerializer):
     class Meta:
         model = Termination
         fields = [
-            "id", "employeeId", "employeeName", "reason", "lastWorkingDay",
+            "id", "employeeId", "employeeName", "employeeCode", "reason", "lastWorkingDay",
             "terminationDate", "letter_file", "settlement_amount", "settlementAmount",
             "status", "created_at",
         ]
@@ -2089,6 +2100,7 @@ class ResignationSerializer(BaseModelSerializer):
         source="employee", model="hrms.Employee", required=False, allow_null=True
     )
     employeeName = serializers.CharField(source="employee.name", read_only=True)
+    employeeCode = serializers.CharField(source="employee.employee_code", read_only=True)
     submittedOn = serializers.DateField(source="submitted_on")
     noticePeriodDays = serializers.IntegerField(source="notice_period_days", required=False)
     lastWorkingDay = serializers.DateField(
@@ -2101,7 +2113,7 @@ class ResignationSerializer(BaseModelSerializer):
     class Meta:
         model = Resignation
         fields = [
-            "id", "employeeId", "employeeName", "submittedOn", "noticePeriodDays",
+            "id", "employeeId", "employeeName", "employeeCode", "submittedOn", "noticePeriodDays",
             "lastWorkingDay", "exit_interview_at", "exitInterviewAt", "reason",
             "handover_to", "handoverTo", "status", "checklist", "created_at",
         ]
@@ -2117,10 +2129,12 @@ class ComplaintSerializer(BaseModelSerializer):
         source="raised_by_employee", model="hrms.Employee",
         required=False, allow_null=True, write_only=True,
     )
+    raisedByEmployeeCode = serializers.CharField(source="raised_by_employee.employee_code", read_only=True)
     againstEmployeeId = TenantPrimaryKeyRelatedField(
         source="against_employee", model="hrms.Employee",
         required=False, allow_null=True,
     )
+    againstEmployeeCode = serializers.CharField(source="against_employee.employee_code", read_only=True)
     againstName = serializers.SerializerMethodField()
     against = serializers.SerializerMethodField()
     description = serializers.CharField(required=False, allow_blank=True)
@@ -2134,7 +2148,7 @@ class ComplaintSerializer(BaseModelSerializer):
     class Meta:
         model = Complaint
         fields = [
-            "id", "raisedBy", "complainant", "raisedByEmployeeId", "againstEmployeeId",
+            "id", "raisedBy", "complainant", "raisedByEmployeeId", "raisedByEmployeeCode", "againstEmployeeId", "againstEmployeeCode",
             "againstName", "against", "category", "description", "summary", "isAnonymous",
             "status", "assigned_to", "resolution", "resolved_at", "created_at",
             "raisedDate", "filedOn", "priority", "assignedInvestigator",
@@ -2237,6 +2251,9 @@ class ComplaintSerializer(BaseModelSerializer):
                 pass
         ret["priority"] = meta.get("priority", "High")
         ret["assignedInvestigator"] = meta.get("assignedInvestigator", "Ayesha Khan (HR Director)")
+        ret["complainantEmployeeCode"] = complaint.raised_by_employee.employee_code if complaint.raised_by_employee_id else meta.get("complainantEmployeeCode", "")
+        ret["raisedByEmployeeCode"] = ret["complainantEmployeeCode"]
+        ret["againstEmployeeCode"] = complaint.against_employee.employee_code if complaint.against_employee_id else meta.get("againstEmployeeCode", "")
         if not ret.get("complainant"):
             ret["complainant"] = meta.get("complainant", "")
             ret["raisedBy"] = ret["complainant"]

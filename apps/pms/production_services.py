@@ -146,8 +146,16 @@ def instruction_completion(instruction):
     rejected = total_rejected if total_rejected > ZERO else D(getattr(instruction, "rejected_qty", 0))
     reprocess = total_reprocess
     accepted = total_accepted if total_accepted > ZERO else max(ZERO, total - rejected - reprocess)
-    shortage = max(ZERO, order_meter - total)
-    balance_qty = compute_balance(order_meter, total)
+
+    # [OLD CODE - COMMENTED OUT]: Shortage compared to gross total produced regardless of defects/rejections
+    # shortage = max(ZERO, order_meter - total)
+
+    # [REAL-LIFE TEXTILE STANDARD]:
+    # Commercial Shortage is the deficit of usable/accepted fabric against the contracted order meters.
+    # Total produced fabric that was rejected or sent for reprocess cannot satisfy the buyer's order quantity.
+    shortage = max(ZERO, order_meter - accepted)
+    production_shortage = max(ZERO, order_meter - total)
+    balance_qty = compute_balance(order_meter, accepted)
     completion_pct = round((float(total) / float(order_meter) * 100), 1) if order_meter > ZERO else 0
 
     employee = getattr(instruction, "employee", None)
@@ -211,6 +219,7 @@ def instruction_completion(instruction):
         "acceptedQty": accepted,
         "balanceQty": balance_qty,
         "shortageQty": shortage,
+        "productionShortageQty": production_shortage,
         "completionPercentage": completion_pct,
         "jobRate": rate,
         "finalAmount": round2(accepted * rate),

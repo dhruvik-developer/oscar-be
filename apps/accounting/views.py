@@ -99,6 +99,12 @@ class AccountViewSet(TenantModelViewSet):
             (parent["children"] if parent else roots).append(node)
         return Response({"accounts": roots})
 
+    @action(detail=False, methods=["post"], url_path="seed-defaults")
+    def seed_defaults(self, request):
+        """Seed all standard system accounts for this client."""
+        created = services.seed_chart_of_accounts(request.client_id)
+        return Response({"createdCount": len(created), "message": f"Successfully initialized {len(created)} system accounts."})
+
 
 class BankAccountViewSet(TenantModelViewSet):
     queryset = BankAccount.objects.select_related("account")
