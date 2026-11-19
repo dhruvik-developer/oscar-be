@@ -36,14 +36,11 @@ def env_list(key, default=""):
 
 SECRET_KEY = env("DJANGO_SECRET_KEY")
 if not SECRET_KEY:
-    if "test" in sys.argv:
-        SECRET_KEY = "django-insecure-test-key-only-for-automated-tests"
-    else:
-        from django.core.exceptions import ImproperlyConfigured
+    from django.core.exceptions import ImproperlyConfigured
 
-        raise ImproperlyConfigured(
-            "DJANGO_SECRET_KEY environment variable is required and must be defined in .env or the environment."
-        )
+    raise ImproperlyConfigured(
+        "DJANGO_SECRET_KEY environment variable is required and must be defined in .env or the environment."
+    )
 DEBUG = env_bool("DJANGO_DEBUG", False)
 # JWTs and password-reset codes are signed with this key; a short or default
 # one makes them forgeable. Development may run with it, production may not.
@@ -133,10 +130,10 @@ else:
     ENABLED_MODULES = list(FULL_MODULES)
 
 
-
 def module_enabled(name):
     """Route-level toggle. Apps stay in INSTALLED_APPS for FK integrity."""
     return name.lower() in ENABLED_MODULES
+
 
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
@@ -256,17 +253,17 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 # --------------------------------------------------------------------------
 # Rate Limiting & Proxy Configuration (api.md §1.5)
 # --------------------------------------------------------------------------
-LOGIN_RATE_LIMIT = "100/minute" if ("test" in sys.argv) else env("LOGIN_RATE_LIMIT")
-LOGIN_FAILED_RATE_LIMIT = env("LOGIN_FAILED_RATE_LIMIT") or env("LOGIN_FAILED_LIMIT")
+LOGIN_RATE_LIMIT = env("LOGIN_RATE_LIMIT")
+LOGIN_FAILED_RATE_LIMIT = env("LOGIN_FAILED_RATE_LIMIT")
 LOGIN_FAILED_LIMIT = LOGIN_FAILED_RATE_LIMIT
-AUTHENTICATED_RATE_LIMIT = env("AUTHENTICATED_RATE_LIMIT") or env("AUTHENTICATED_API_RATE_LIMIT")
+AUTHENTICATED_RATE_LIMIT = env("AUTHENTICATED_RATE_LIMIT")
 AUTHENTICATED_API_RATE_LIMIT = AUTHENTICATED_RATE_LIMIT
-ANONYMOUS_RATE_LIMIT = env("ANONYMOUS_RATE_LIMIT") or env("ANONYMOUS_API_RATE_LIMIT")
+ANONYMOUS_RATE_LIMIT = env("ANONYMOUS_RATE_LIMIT")
 ANONYMOUS_API_RATE_LIMIT = ANONYMOUS_RATE_LIMIT
 PASSWORD_RESET_RATE_LIMIT = env("PASSWORD_RESET_RATE_LIMIT")
-OTP_VERIFY_RATE_LIMIT = env("OTP_VERIFY_RATE_LIMIT") or env("OTP_RATE_LIMIT")
+OTP_VERIFY_RATE_LIMIT = env("OTP_VERIFY_RATE_LIMIT")
 OTP_RATE_LIMIT = OTP_VERIFY_RATE_LIMIT
-TOKEN_REFRESH_RATE_LIMIT = env("TOKEN_REFRESH_RATE_LIMIT") or env("TOKEN_RATE_LIMIT")
+TOKEN_REFRESH_RATE_LIMIT = env("TOKEN_REFRESH_RATE_LIMIT")
 TOKEN_RATE_LIMIT = TOKEN_REFRESH_RATE_LIMIT
 SENSITIVE_ACTION_RATE_LIMIT = env("SENSITIVE_ACTION_RATE_LIMIT")
 PASSWORD_CHANGE_RATE_LIMIT = env("PASSWORD_CHANGE_RATE_LIMIT")

@@ -58,7 +58,10 @@ class ESignFailed(EvenmoreAPIError):
 
 
 def is_configured():
-    has_key = bool(getattr(settings, "DOCUSIGN_PRIVATE_KEY", "").strip()) or bool(getattr(settings, "DOCUSIGN_PRIVATE_KEY_PATH", "").strip())
+    has_key = bool(
+        getattr(settings, "DOCUSIGN_PRIVATE_KEY", "").strip()
+        or getattr(settings, "DOCUSIGN_PRIVATE_KEY_PATH", "").strip()
+    )
     return all(
         (
             settings.DOCUSIGN_INTEGRATION_KEY,
