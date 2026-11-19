@@ -1135,6 +1135,14 @@ class Trip(TenantModel, LegacyIdMixin):
     trip_date = models.DateField(default=timezone.localdate)
     from_location = models.TextField()
     to_location = models.TextField()
+    from_warehouse = models.ForeignKey(
+        "masters.Location", null=True, blank=True, on_delete=models.SET_NULL, related_name="trips_from"
+    )
+    to_warehouse = models.ForeignKey(
+        "masters.Location", null=True, blank=True, on_delete=models.SET_NULL, related_name="trips_to"
+    )
+    is_stock_deducted = models.BooleanField(default=False)
+    is_stock_received = models.BooleanField(default=False)
     transporter = models.ForeignKey(
         "masters.Transporter", null=True, blank=True, on_delete=models.SET_NULL, related_name="trips"
     )

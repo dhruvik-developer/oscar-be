@@ -42,6 +42,7 @@ BUCKET_BY_LOCATION_CODE = {
     "SYS-REPROCESS": "rework",
     "SYS-SECOND-QUALITY": "secondQuality",
     "SYS-REJECT": "rejected",
+    "SYS-SAMPLE": "sample",
 }
 
 
@@ -275,16 +276,23 @@ def _bucket(taka):
     code = (getattr(taka.location, "code", "") or "").upper()
     if code in BUCKET_BY_LOCATION_CODE:
         return BUCKET_BY_LOCATION_CODE[code]
+    if getattr(taka, "status", None) == "Sample":
+        return "sample"
     if code.startswith("SYS-WIP"):
         return "withJobWorker"
     return "available"
 
 
-def batch_quantities(batch, takas=None):
+def batch_quantities(batch, takas=None, movements=None):
     """Metres by bucket, from where each roll is now plus the movement ledger."""
     from .models import StockMovement
 
     takas = takas if takas is not None else _takas(batch)
+    if movements is not None:
+        taka_ids = {t.id for t in takas}
+        moves = [m for m in movements if m.lot_taka_id in taka_ids]
+    else:
+        moves = list(StockMovement.objects.filter(lot_taka__in=takas, deleted_at__isnull=True))
     buckets = defaultdict(lambda: ZERO)
     for taka in takas:
         qty = D(taka.available_quantity or 0)
@@ -297,10 +305,11 @@ def batch_quantities(batch, takas=None):
     roots = [t for t in takas if t.parent_taka_id is None or t.parent_taka_id not in {x.id for x in takas}]
     received = sum((D(t.received_quantity or 0) for t in roots), ZERO)
 
-    moves = StockMovement.objects.filter(lot_taka__in=takas, deleted_at__isnull=True)
-    sold = -(moves.filter(type__in=SALE_TYPES).aggregate(v=Sum("quantity"))["v"] or ZERO)
-    returned = moves.filter(type__in=RETURN_TYPES).aggregate(v=Sum("quantity"))["v"] or ZERO
-    jw_out = -(moves.filter(type="JOBWORK_OUTWARD", quantity__lt=0).aggregate(v=Sum("quantity"))["v"] or ZERO)
+    sold = -(sum((m.quantity for m in moves if m.type in SALE_TYPES), ZERO))
+    returned = sum((m.quantity for m in moves if m.type in RETURN_TYPES), ZERO)
+    jw_out = -(sum(
+        (m.quantity for m in moves if m.type == "JOBWORK_OUTWARD" and m.quantity < 0), ZERO
+    ))
     jw_in = sum(
         (D(t.received_quantity or 0) for t in takas if t.source_document_type == "JobWorkInward"),
         ZERO,
@@ -368,18 +377,25 @@ def _sale_rates(movements):
 REJECT_IN_TYPES = ("QC_REJECT", "SALES_RETURN_REJECT", "SAMPLE_RETURN_REJECT")
 
 
-def rejected_total(batch, takas=None):
+def rejected_total(batch, takas=None, movements=None):
     """Metres of the batch ever routed to Reject (QC or returns)."""
     from .models import StockMovement
 
     takas = takas if takas is not None else _takas(batch)
-    value = StockMovement.objects.filter(
-        lot_taka__in=takas, type__in=REJECT_IN_TYPES, quantity__gt=0, deleted_at__isnull=True,
-    ).aggregate(v=Sum("quantity"))["v"]
+    if movements is not None:
+        taka_ids = {t.id for t in takas}
+        value = sum(
+            (m.quantity for m in movements if m.type in REJECT_IN_TYPES and m.quantity > 0 and m.lot_taka_id in taka_ids),
+            ZERO,
+        )
+    else:
+        value = StockMovement.objects.filter(
+            lot_taka__in=takas, type__in=REJECT_IN_TYPES, quantity__gt=0, deleted_at__isnull=True,
+        ).aggregate(v=Sum("quantity"))["v"]
     return round4(D(value or 0))
 
 
-def batch_costing(batch, takas=None, qty=None):
+def batch_costing(batch, takas=None, qty=None, movements=None, cost_entries=None, losses=None):
     """Batch-specific cost and profit, with rejections split by cause.
 
     * Normal production / process loss is absorbed: its metres simply are not
@@ -394,11 +410,15 @@ def batch_costing(batch, takas=None, qty=None):
     from .models import LotCostEntry, StockMovement
 
     takas = takas if takas is not None else _takas(batch)
-    qty = qty or batch_quantities(batch, takas)
+    qty = qty or batch_quantities(batch, takas, movements=movements)
     lots = sorted({t.lot_number for t in takas})
-    entries = LotCostEntry.objects.filter(
-        client_id=batch.client_id, lot_number__in=lots, deleted_at__isnull=True
-    ).order_by("date", "created_at")
+    if cost_entries is None:
+        entries = LotCostEntry.objects.filter(
+            client_id=batch.client_id, lot_number__in=lots, deleted_at__isnull=True
+        ).order_by("date", "created_at")
+    else:
+        lot_set = set(lots)
+        entries = [e for e in cost_entries if e.lot_number in lot_set]
     by_type = defaultdict(lambda: ZERO)
     pending = ZERO
     for e in entries:
@@ -408,9 +428,13 @@ def batch_costing(batch, takas=None, qty=None):
             pending += D(e.amount)
     total_cost = sum(by_type.values(), ZERO)
 
-    sale_moves = list(
-        StockMovement.objects.filter(lot_taka__in=takas, type="SALE", deleted_at__isnull=True)
-    )
+    if movements is None:
+        sale_moves = list(
+            StockMovement.objects.filter(lot_taka__in=takas, type="SALE", deleted_at__isnull=True)
+        )
+    else:
+        taka_ids = {t.id for t in takas}
+        sale_moves = [m for m in movements if m.type == "SALE" and m.lot_taka_id in taka_ids]
     rates = _sale_rates(sale_moves)
     gross_sold = sum((-D(m.quantity) for m in sale_moves), ZERO)
     priced = [(-D(m.quantity), rates.get(m.id)) for m in sale_moves if rates.get(m.id) is not None]
@@ -419,9 +443,12 @@ def batch_costing(batch, takas=None, qty=None):
     net_sold = D(qty["sold"])
     revenue = round2(avg_rate * net_sold)
 
-    losses = list(batch.losses.filter(deleted_at__isnull=True).select_related("responsible_party"))
+    if losses is None:
+        losses = list(batch.losses.filter(deleted_at__isnull=True).select_related("responsible_party"))
+    else:
+        losses = [l for l in losses if l.batch_id == batch.id]
     claimable_qty = sum((D(l.quantity) for l in losses if l.claimable), ZERO)
-    rejected = rejected_total(batch, takas)
+    rejected = rejected_total(batch, takas, movements=movements)
     absorbed_qty = max(ZERO, rejected - claimable_qty)
 
     good_output = net_sold + D(qty["onHand"]) - D(qty["rejected"])
@@ -607,29 +634,98 @@ def batch_timeline(batch, takas=None, include_cost=False):
         "referenceType": batch.source_document_type,
     }]
 
-    for m in (
+    raw_movements = list(
         StockMovement.objects.filter(lot_taka__in=takas, deleted_at__isnull=True)
         .select_related("location", "lot_taka", "created_by")
-        .order_by("movement_date", "created_at")
-    ):
-        event = {
-            "date": _date(m.movement_date),
-            "at": _date(m.created_at),
-            "kind": "MOVEMENT",
-            "type": m.type,
-            "title": m.type.replace("_", " ").title(),
-            "quantity": str(m.quantity),
-            "uom": m.uom,
-            "location": m.location.name if m.location_id else None,
-            "taka": m.lot_taka.taka_id if m.lot_taka_id else None,
-            "reference": m.reference_number,
-            "referenceType": m.reference_type,
-            "by": getattr(m.created_by, "name", None),
-            "notes": m.notes,
-        }
-        if include_cost and m.unit_cost is not None:
-            event["unitCost"] = str(m.unit_cost)
-        events.append(event)
+        .order_by("movement_date", "created_at", "id")
+    )
+
+    TRANSFER_PAIRS = {
+        "TRANSFER_OUT": "TRANSFER_IN",
+        "LOT_MERGE_OUT": "LOT_MERGE_IN",
+        "TAKA_REGISTER_OUT": "TAKA_REGISTER_IN",
+    }
+
+    used = set()
+    for i, m1 in enumerate(raw_movements):
+        if i in used:
+            continue
+        partner_idx = None
+        for j in range(i + 1, len(raw_movements)):
+            if j in used:
+                continue
+            m2 = raw_movements[j]
+            same_ref = (m1.reference_number == m2.reference_number and m1.reference_type == m2.reference_type)
+            same_qty = (m1.quantity == -m2.quantity)
+            matching_type = (
+                m1.type == m2.type
+                or TRANSFER_PAIRS.get(m1.type) == m2.type
+                or TRANSFER_PAIRS.get(m2.type) == m1.type
+            )
+            is_opposite_sign = (m1.quantity > 0 and m2.quantity < 0) or (m1.quantity < 0 and m2.quantity > 0)
+            if same_ref and same_qty and is_opposite_sign and matching_type:
+                partner_idx = j
+                break
+
+        if partner_idx is not None:
+            used.add(i)
+            used.add(partner_idx)
+            m2 = raw_movements[partner_idx]
+            out_m = m1 if m1.quantity < 0 else m2
+            in_m = m2 if m1.quantity < 0 else m1
+            qty = abs(out_m.quantity)
+            from_loc = out_m.location.name if out_m.location else None
+            to_loc = in_m.location.name if in_m.location else None
+            title = out_m.type.replace("_OUT", "").replace("_", " ").title()
+
+            event = {
+                "date": _date(out_m.movement_date),
+                "at": _date(out_m.created_at),
+                "kind": "TRANSFER",
+                "type": out_m.type,
+                "title": title,
+                "quantity": str(qty),
+                "uom": out_m.uom or in_m.uom,
+                "fromLocation": from_loc,
+                "toLocation": to_loc,
+                "location": f"{from_loc} → {to_loc}" if (from_loc and to_loc) else (to_loc or from_loc),
+                "reference": out_m.reference_number or in_m.reference_number,
+                "referenceType": out_m.reference_type or in_m.reference_type,
+                "taka": out_m.lot_taka.taka_id if out_m.lot_taka_id else (in_m.lot_taka.taka_id if in_m.lot_taka_id else None),
+                "by": getattr(out_m.created_by, "name", None) or getattr(in_m.created_by, "name", None),
+                "notes": out_m.notes or in_m.notes,
+            }
+            if include_cost:
+                cost = out_m.unit_cost if out_m.unit_cost is not None else in_m.unit_cost
+                if cost is not None:
+                    event["unitCost"] = str(cost)
+            events.append(event)
+        else:
+            used.add(i)
+            is_out = m1.quantity < 0
+            loc_name = m1.location.name if m1.location_id else None
+            event = {
+                "date": _date(m1.movement_date),
+                "at": _date(m1.created_at),
+                "kind": "MOVEMENT",
+                "type": m1.type,
+                "direction": "OUT" if is_out else "IN",
+                "title": m1.type.replace("_", " ").title(),
+                "quantity": str(abs(m1.quantity) if is_out else m1.quantity),
+                "rawQuantity": str(m1.quantity),
+                "uom": m1.uom,
+                "location": loc_name,
+                "fromLocation": loc_name if is_out else None,
+                "toLocation": loc_name if not is_out else None,
+                "taka": m1.lot_taka.taka_id if m1.lot_taka_id else None,
+                "reference": m1.reference_number,
+                "referenceType": m1.reference_type,
+                "by": getattr(m1.created_by, "name", None),
+                "notes": m1.notes,
+            }
+            if include_cost and m1.unit_cost is not None:
+                event["unitCost"] = str(m1.unit_cost)
+            events.append(event)
 
     qc_lines = (
         QCInspectionLine.objects.filter(lot_taka__in=takas, deleted_at__isnull=True)

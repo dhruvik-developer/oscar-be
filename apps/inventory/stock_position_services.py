@@ -36,6 +36,18 @@ BUCKET_LABEL = {
 }
 
 
+def _normalize_params(params):
+    if hasattr(params, "dict"):
+        params = params.dict()
+    clean = {}
+    for k, v in (params or {}).items():
+        if isinstance(v, (list, tuple)):
+            clean[k] = v[0] if v else ""
+        else:
+            clean[k] = v
+    return clean
+
+
 def _date(value):
     if not value:
         return None
@@ -48,6 +60,7 @@ def _date(value):
 
 
 def _page(rows, params):
+    params = _normalize_params(params)
     try:
         page = max(1, int(params.get("page") or 1))
         size = min(200, max(1, int(params.get("page_size") or 25)))
@@ -69,6 +82,7 @@ def _rolls(client_id, params):
     """Rolls in stock, filtered by the common Stock Position filters."""
     from .models import LotTaka
 
+    params = _normalize_params(params)
     qs = LotTaka.objects.filter(
         client_id=client_id, deleted_at__isnull=True, available_quantity__gt=0,
     ).select_related("item", "design", "shade", "fabric_quality", "location", "batch", "batch__owner_party")
@@ -77,11 +91,18 @@ def _rolls(client_id, params):
         qs = qs.filter(
             Q(batch__batch_code__icontains=q) | Q(taka_id__icontains=q) | Q(lot_number__icontains=q)
             | Q(item__name__icontains=q) | Q(item__sku__icontains=q)
+            | Q(batch__owner_party__name__icontains=q) | Q(batch__supplier__name__icontains=q)
+            | Q(location__name__icontains=q) | Q(design__name__icontains=q) | Q(shade__name__icontains=q)
+            | Q(batch__purchase_order__po_number__icontains=q)
         )
     for key, field in (("itemId", "item_id"), ("designId", "design_id"), ("shadeId", "shade_id"),
                        ("locationId", "location_id")):
-        if params.get(key):
-            qs = qs.filter(**{field: params[key]})
+        val = params.get(key)
+        if val:
+            if isinstance(val, (list, tuple)):
+                val = val[0] if val else None
+            if val:
+                qs = qs.filter(**{field: val})
     if params.get("batch"):
         qs = qs.filter(batch__batch_code__icontains=params["batch"])
     ownership = params.get("ownership")
@@ -129,6 +150,7 @@ def _roll_row(t, include_cost):
 # 1. Fabric Stock Overview
 # ---------------------------------------------------------------------------
 def fabric_overview(client_id, params, include_cost=False):
+    params = _normalize_params(params)
     rolls = _rolls(client_id, params)
     kpi = defaultdict(lambda: ZERO)
     for t in rolls:
@@ -162,6 +184,7 @@ def usable_stock(client_id, params, include_cost=False):
     bulk (not yet in takas) is usable for production but not for sale."""
     from apps.masters.models import Item
 
+    params = _normalize_params(params)
     rolls = [
         t for t in _rolls(client_id, {**params, "ownership": "OSCAR"})
         if _taka_bucket(t) in ("available", "reserved") and t.qc_status in RELEASED_QC_STATUSES
@@ -206,6 +229,7 @@ def scrap_waste(client_id, params, include_cost=False):
 
     from .models import BatchLoss, ProductionRun
 
+    params = _normalize_params(params)
     rolls = [t for t in _rolls(client_id, params) if _taka_bucket(t) in ("rejected", "secondQuality")]
     losses_by_batch = defaultdict(list)
     for loss in BatchLoss.objects.filter(
@@ -263,6 +287,16 @@ def scrap_waste(client_id, params, include_cost=False):
             "stockStatus": f"{order.jwo_no} ({order.vendor_name})" if order else None,
             "receivedDate": entry.approved_at.date().isoformat() if entry.approved_at else None,
         })
+    if params.get("q"):
+        q_term = params["q"].lower()
+        rows = [
+            r for r in rows
+            if q_term in (r.get("batchCode") or "").lower()
+            or q_term in (r.get("fabric") or "").lower()
+            or q_term in (r.get("reason") or "").lower()
+            or q_term in (r.get("disposition") or "").lower()
+            or q_term in (r.get("kind") or "").lower()
+        ]
     if params.get("kind"):
         rows = [r for r in rows if r.get("kind") == params["kind"]]
     kpis = {k: str(round2(v) if k == "value" else round4(v)) for k, v in kpi.items()}
@@ -343,6 +377,8 @@ def dispose_scrap(client_id, *, lot_taka_id, quantity, reason, user=None):
 def reprocessing(client_id, params, include_cost=False):
     from apps.jobwork.models import JobWorkOrder, JWOCharge, JWOInwardTaka, JWOLossEntry, JWOOutwardTaka
 
+    params = _normalize_params(params)
+
     from . import services as stock
     from .models import LotTaka
 
@@ -351,7 +387,10 @@ def reprocessing(client_id, params, include_cost=False):
     orders = JobWorkOrder.objects.filter(client_id=client_id).exclude(status__in=["Cancelled"]).order_by("-order_date")
     if params.get("q"):
         q = params["q"]
-        orders = orders.filter(Q(jwo_no__icontains=q) | Q(vendor_name__icontains=q) | Q(process__icontains=q))
+        orders = orders.filter(
+            Q(jwo_no__icontains=q) | Q(vendor_name__icontains=q) | Q(process__icontains=q)
+            | Q(outwards__takas__lot_taka__batch__batch_code__icontains=q)
+        ).distinct()
     rows = []
     kpi = defaultdict(lambda: ZERO)
     for order in orders:
@@ -447,6 +486,8 @@ CONDITION_STATE = {
 def customer_returns(client_id, params, include_cost=False):
     from apps.sales.models import SalesReturnLine
 
+    params = _normalize_params(params)
+
     lines = SalesReturnLine.objects.filter(
         client_id=client_id, deleted_at__isnull=True, sales_return__deleted_at__isnull=True,
     ).exclude(sales_return__status="Cancelled").select_related(
@@ -497,6 +538,8 @@ def customer_returns(client_id, params, include_cost=False):
 def samples(client_id, params, include_cost=False):
     from .models import Sample, StockMovement
 
+    params = _normalize_params(params)
+
     qs = Sample.objects.filter(client_id=client_id, deleted_at__isnull=True).select_related(
         "party", "source_lot_taka", "source_lot_taka__batch", "fabric_quality", "design", "shade",
     ).order_by("-sample_date", "-created_at")
@@ -524,20 +567,41 @@ def samples(client_id, params, include_cost=False):
             status = "Overdue"
         if params.get("status") and params["status"] != status:
             continue
+        unit_cost = D(s.source_lot_taka.rate) if s.source_lot_taka and s.source_lot_taka.rate else (
+            round2(D(s.estimated_cost) / D(s.quantity)) if s.quantity and s.estimated_cost else ZERO
+        )
+        total_val = D(s.estimated_cost or 0)
         row = {
-            "sampleId": str(s.id), "sampleNumber": s.sample_number, "date": s.sample_date.isoformat(),
-            "batchCode": s.source_lot_taka.batch.batch_code if s.source_lot_taka_id and s.source_lot_taka.batch_id else None,
+            "sampleId": str(s.id),
+            "sampleNumber": s.sample_number,
+            "date": s.sample_date.isoformat(),
+            "issueDate": s.sample_date.isoformat(),
+            "batchCode": s.source_lot_taka.batch.batch_code if s.source_lot_taka_id and s.source_lot_taka.batch_id else (s.source_lot_taka.lot_number if s.source_lot_taka else "-"),
             "takaId": s.source_lot_taka.taka_id if s.source_lot_taka_id else None,
-            "party": s.party.name if s.party_id else None,
-            "fabricQuality": s.fabric_quality.name if s.fabric_quality_id else None,
-            "design": s.design.name if s.design_id else None, "shade": s.shade.name if s.shade_id else None,
-            "type": s.get_sample_type_display(), "quantity": str(round4(D(s.quantity))),
-            "returned": str(round4(D(s.returned_quantity))), "consumed": str(round4(D(s.consumed_quantity))),
-            "outstanding": str(round4(max(ZERO, out))), "uom": s.uom, "returnable": s.is_returnable,
-            "dueDate": s.due_date.isoformat() if s.due_date else None, "status": status,
+            "party": s.party.name if s.party_id else "-",
+            "customer": s.party.name if s.party_id else "-",
+            "fabricQuality": s.fabric_quality.name if s.fabric_quality_id else (s.source_lot_taka.item.name if s.source_lot_taka and s.source_lot_taka.item else "-"),
+            "design": s.design.name if s.design_id else "",
+            "shade": s.shade.name if s.shade_id else "-",
+            "fabricShade": f"{s.fabric_quality.name if s.fabric_quality_id else (s.source_lot_taka.item.name if s.source_lot_taka and s.source_lot_taka.item else 'Fabric')} / {s.shade.name if s.shade_id else 'Standard'}",
+            "type": s.get_sample_type_display(),
+            "quantity": str(round4(D(s.quantity))),
+            "issuedQuantity": str(round4(D(s.quantity))),
+            "returned": str(round4(D(s.returned_quantity))),
+            "returnedQuantity": str(round4(D(s.returned_quantity))),
+            "consumed": str(round4(D(s.consumed_quantity))),
+            "consumedQuantity": str(round4(D(s.consumed_quantity))),
+            "outstanding": str(round4(max(ZERO, out))),
+            "availableQuantity": str(round4(max(ZERO, out))),
+            "uom": s.uom,
+            "unitCost": str(round2(unit_cost)),
+            "totalValue": str(round2(total_val)),
+            "estimatedCost": str(round2(total_val)),
+            "returnable": s.is_returnable,
+            "dueDate": s.due_date.isoformat() if s.due_date else None,
+            "status": status,
+            "remarks": s.remarks or "",
         }
-        if include_cost:
-            row["estimatedCost"] = str(round2(D(s.estimated_cost or 0)))
         rows.append(row)
     under_qc = StockMovement.objects.filter(
         client_id=client_id, type="SAMPLE_RETURN_HOLD", quantity__gt=0, deleted_at__isnull=True,

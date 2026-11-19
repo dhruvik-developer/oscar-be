@@ -16,7 +16,7 @@ is NEVER counted as revenue or realized profit.
 from collections import defaultdict
 from decimal import Decimal
 from django.db.models import Q
-from apps.inventory.models import Batch, LotTaka, LotCostEntry, StockMovement
+from apps.inventory.models import Batch, BatchLoss, LotTaka, LotCostEntry, StockMovement
 from apps.inventory.batch_services import batch_costing, batch_quantities, _date, _sale_rates
 from apps.sales.models import DeliveryChallan, SalesInvoice, SalesOrder, DeliveryChallanLine, SalesInvoiceLine
 
@@ -41,11 +41,47 @@ def get_batch_profitability_summary(client_id, day=None):
     Computes summary metrics, top 5 profitable batches, and top 5 loss-making batches.
     Used directly by the Dashboard's compact 'Batch-wise Profitability' section.
     """
-    batches = (
+    batches = list(
         Batch.objects.filter(client_id=client_id, deleted_at__isnull=True)
         .select_related("item", "purchase_order", "goods_receipt")
         .order_by("-created_at")
     )
+
+    # Bulk preloads: a handful of queries for every batch instead of one
+    # round trip per batch per relation.
+    batch_ids = [b.id for b in batches]
+    takas_by_batch = defaultdict(list)
+    if batch_ids:
+        for t in LotTaka.objects.filter(
+            batch_id__in=batch_ids, deleted_at__isnull=True
+        ).select_related(
+            "item", "item__category", "location", "fabric_quality", "design", "shade", "supplier"
+        ).order_by("created_at"):
+            takas_by_batch[t.batch_id].append(t)
+
+    all_takas = [t for ts in takas_by_batch.values() for t in ts]
+    taka_ids = [t.id for t in all_takas]
+    movements_by_taka = defaultdict(list)
+    if taka_ids:
+        for m in StockMovement.objects.filter(
+            lot_taka_id__in=taka_ids, deleted_at__isnull=True
+        ):
+            movements_by_taka[m.lot_taka_id].append(m)
+
+    lot_numbers = {t.lot_number for t in all_takas if t.lot_number}
+    entries_by_lot = defaultdict(list)
+    if lot_numbers:
+        for e in LotCostEntry.objects.filter(
+            client_id=client_id, lot_number__in=lot_numbers, deleted_at__isnull=True
+        ).order_by("date", "created_at"):
+            entries_by_lot[e.lot_number].append(e)
+
+    losses_by_batch = defaultdict(list)
+    if batch_ids:
+        for l in BatchLoss.objects.filter(
+            batch_id__in=batch_ids, deleted_at__isnull=True
+        ).select_related("responsible_party"):
+            losses_by_batch[l.batch_id].append(l)
 
     profitable_rows = []
     loss_rows = []
@@ -55,7 +91,15 @@ def get_batch_profitability_summary(client_id, day=None):
     total_realized_loss = ZERO
 
     for b in batches:
-        c = batch_costing(b)
+        takas = takas_by_batch.get(b.id, [])
+        movements = [m for t in takas for m in movements_by_taka.get(t.id, ())]
+        lots = {t.lot_number for t in takas}
+        cost_entries = [e for lot in lots for e in entries_by_lot.get(lot, ())]
+        losses = losses_by_batch.get(b.id, [])
+        c = batch_costing(
+            b, takas=takas, movements=movements,
+            cost_entries=cost_entries, losses=losses,
+        )
         sold_qty = D(c.get("soldQty", "0"))
         rev = D(c.get("revenue", "0"))
         cogs = D(c.get("costOfSold", "0"))
@@ -63,7 +107,7 @@ def get_batch_profitability_summary(client_id, day=None):
         unsold_val = D(c.get("unsoldInventoryValue", "0"))
         total_cost = D(c.get("totalCost", "0"))
         cost_per_unit = D(c.get("costPerUnit", "0"))
-        qty = batch_quantities(b)
+        qty = batch_quantities(b, takas, movements=movements)
         rem_qty = D(qty.get("onHand", "0"))
 
         is_sold = sold_qty > ZERO
@@ -112,7 +156,7 @@ def get_batch_profitability_summary(client_id, day=None):
         "profitableCount": len(profitable_rows),
         "lossMakingCount": len(loss_rows),
         "unsoldBatchesCount": unsold_count,
-        "totalBatches": batches.count(),
+        "totalBatches": len(batches),
         "totalUnsoldValue": str(round2(total_unsold_val)),
         "profitable": profitable_rows[:5],
         "lossMaking": loss_rows[:5],

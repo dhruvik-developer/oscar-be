@@ -303,15 +303,13 @@ class StockAuditLineSerializer(BaseModelSerializer):
     itemId = TenantPrimaryKeyRelatedField(source="item", queryset=Item.objects.all())
     sku = serializers.CharField(source="item.sku", read_only=True)
     name = serializers.CharField(source="item.name", read_only=True)
-    # GeneratedField (counted_qty - system_qty) -- DRF falls back to ModelField
-    # for it, which drf-spectacular cannot map (DecimalField() with no args).
-    # Declared explicitly so schema generation sees a real DecimalField.
+    costPrice = serializers.DecimalField(source="item.cost_price", max_digits=18, decimal_places=4, read_only=True)
     variance = QuantityField(read_only=True)
 
     class Meta:
         model = StockAuditLine
         fields = [
-            "id", "itemId", "sku", "name", "system_qty", "counted_qty",
+            "id", "itemId", "sku", "name", "costPrice", "system_qty", "counted_qty",
             "variance", "reason", "adjustment_movement",
         ]
         read_only_fields = ["variance", "adjustment_movement"]
@@ -319,14 +317,63 @@ class StockAuditLineSerializer(BaseModelSerializer):
 
 class StockAuditSerializer(BaseModelSerializer):
     lines = StockAuditLineSerializer(many=True, required=False)
+    locationName = serializers.CharField(source="location.name", read_only=True, allow_null=True)
+    location_name = serializers.CharField(source="location.name", read_only=True, allow_null=True)
+    conductedByName = serializers.SerializerMethodField(read_only=True)
+    conducted_by_name = serializers.SerializerMethodField(read_only=True)
+    createdByName = serializers.SerializerMethodField(read_only=True)
+    created_by_name = serializers.SerializerMethodField(read_only=True)
+    linesCount = serializers.SerializerMethodField(read_only=True)
+    lines_count = serializers.SerializerMethodField(read_only=True)
+    auditNumber = serializers.CharField(source="audit_number", read_only=True)
+    periodMonth = serializers.DateField(source="period_month", read_only=True)
+    postedAt = serializers.DateTimeField(source="posted_at", read_only=True)
+    createdAt = serializers.DateTimeField(source="created_at", read_only=True)
+
+    def get_conductedByName(self, obj):
+        if not obj.conducted_by:
+            return None
+        return obj.conducted_by.name or obj.conducted_by.email
+
+    def get_conducted_by_name(self, obj):
+        return self.get_conductedByName(obj)
+
+    def get_createdByName(self, obj):
+        user = obj.conducted_by or getattr(obj, "created_by", None)
+        if not user:
+            return None
+        return user.name or user.email
+
+    def get_created_by_name(self, obj):
+        return self.get_createdByName(obj)
+
+    def get_linesCount(self, obj):
+        if hasattr(obj, "_prefetched_objects_cache") and "lines" in obj._prefetched_objects_cache:
+            return len(obj.lines.all())
+        return obj.lines.count()
+
+    def get_lines_count(self, obj):
+        return self.get_linesCount(obj)
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret['audit_number'] = instance.audit_number
+        ret['period_month'] = str(instance.period_month) if instance.period_month else None
+        ret['location_name'] = instance.location.name if instance.location else None
+        ret['status'] = instance.status
+        return ret
 
     class Meta:
         model = StockAudit
         fields = [
-            "id", "audit_number", "location", "period_month", "status",
-            "conducted_by", "posted_at", "notes", "lines", "created_at", "updated_at",
+            "id", "audit_number", "auditNumber", "location", "locationName", "location_name",
+            "period_month", "periodMonth", "status",
+            "conducted_by", "conductedByName", "conducted_by_name",
+            "created_by", "createdByName", "created_by_name",
+            "posted_at", "postedAt", "notes", "lines", "linesCount", "lines_count",
+            "created_at", "createdAt", "updated_at",
         ]
-        read_only_fields = ["audit_number", "posted_at", "created_at", "updated_at"]
+        read_only_fields = ["audit_number", "auditNumber", "posted_at", "postedAt", "created_at", "createdAt", "updated_at"]
 
 
 class QualityStandardSerializer(BaseModelSerializer):
@@ -518,19 +565,47 @@ class SampleSerializer(BaseModelSerializer):
     returnedQuantity = serializers.DecimalField(source="returned_quantity", max_digits=18, decimal_places=4, read_only=True)
     consumedQuantity = serializers.DecimalField(source="consumed_quantity", max_digits=18, decimal_places=4, read_only=True)
     estimatedCost = serializers.DecimalField(source="estimated_cost", max_digits=18, decimal_places=4, read_only=True)
+    batchCode = serializers.SerializerMethodField()
+    customer = serializers.CharField(source="party.name", read_only=True)
+    unitCost = serializers.SerializerMethodField()
+    totalValue = serializers.DecimalField(source="estimated_cost", max_digits=18, decimal_places=2, read_only=True)
+    availableQuantity = serializers.SerializerMethodField()
+
+    def get_batchCode(self, obj):
+        if obj.source_lot_taka and obj.source_lot_taka.batch:
+            return obj.source_lot_taka.batch.batch_code
+        return obj.source_lot_taka.lot_number if obj.source_lot_taka else ""
+
+    def get_unitCost(self, obj):
+        if obj.source_lot_taka and obj.source_lot_taka.rate:
+            return float(obj.source_lot_taka.rate)
+        if obj.quantity and obj.estimated_cost:
+            from apps.core.money import D, round2
+            return float(round2(D(obj.estimated_cost) / D(obj.quantity)))
+        return 0.0
+
+    def get_availableQuantity(self, obj):
+        from apps.core.money import D, ZERO
+        out = D(obj.quantity) - D(obj.returned_quantity) - D(obj.consumed_quantity)
+        return float(max(ZERO, out))
 
     class Meta:
         model = Sample
         fields = [
-            "id", "sampleNumber", "sampleDate", "partyId", "partyName",
+            "id", "sampleNumber", "sampleDate", "partyId", "partyName", "customer",
             "salespersonId", "salespersonName", "brokerId", "brokerName",
-            "sourceLotTakaId", "fabricQualityId", "fabricQualityName",
+            "sourceLotTakaId", "batchCode", "fabricQualityId", "fabricQualityName",
             "designId", "designName", "shadeId", "shadeName",
             "sampleType", "quantity", "uom", "isReturnable", "dueDate", "status",
-            "returnedQuantity", "consumedQuantity", "estimatedCost",
+            "returnedQuantity", "consumedQuantity", "availableQuantity",
+            "unitCost", "totalValue", "estimatedCost",
             "remarks", "created_at", "updated_at",
         ]
-        read_only_fields = ["id", "sampleNumber", "returnedQuantity", "consumedQuantity", "estimatedCost", "created_at", "updated_at"]
+        read_only_fields = [
+            "id", "sampleNumber", "customer", "batchCode", "returnedQuantity",
+            "consumedQuantity", "availableQuantity", "unitCost", "totalValue",
+            "estimatedCost", "created_at", "updated_at"
+        ]
 
 
 class TripMaterialLineSerializer(BaseModelSerializer):
@@ -538,22 +613,39 @@ class TripMaterialLineSerializer(BaseModelSerializer):
         source="lot_taka", model="inventory.LotTaka", required=False, allow_null=True
     )
     lotNumber = serializers.CharField(source="lot_number", required=False, allow_null=True, allow_blank=True)
+    batchCode = serializers.SerializerMethodField()
+    poNumber = serializers.SerializerMethodField()
     takaNumber = serializers.CharField(source="taka_number", required=False, allow_null=True, allow_blank=True)
     itemId = TenantPrimaryKeyRelatedField(
         source="item", model="masters.Item", required=False, allow_null=True
     )
     itemName = serializers.CharField(source="item.name", read_only=True)
+    takaId = serializers.CharField(source="lot_taka.taka_id", read_only=True)
+    shade = serializers.CharField(source="lot_taka.shade.name", read_only=True, default=None)
     rollWeight = serializers.DecimalField(source="roll_weight", max_digits=12, decimal_places=4, required=False, allow_null=True)
     allocatedFreight = serializers.DecimalField(source="allocated_freight", max_digits=18, decimal_places=4, read_only=True)
 
     class Meta:
         model = TripMaterialLine
         fields = [
-            "id", "lotTakaId", "lotNumber", "takaNumber", "itemId", "itemName",
+            "id", "lotTakaId", "batchCode", "poNumber", "lotNumber", "takaNumber", "takaId", "shade", "itemId", "itemName",
             "quantity", "rollWeight", "document_reference_type", "document_reference_id",
             "document_reference_number", "allocatedFreight", "created_at",
         ]
         read_only_fields = ["allocatedFreight", "created_at"]
+
+    def get_batchCode(self, obj):
+        if obj.lot_taka and getattr(obj.lot_taka, "batch", None):
+            return obj.lot_taka.batch.batch_code or obj.lot_number or ""
+        return obj.lot_number or ""
+
+    def get_poNumber(self, obj):
+        if obj.lot_taka and getattr(obj.lot_taka, "batch", None) and getattr(obj.lot_taka.batch, "purchase_order", None):
+            return obj.lot_taka.batch.purchase_order.po_number or ""
+        if obj.document_reference_type == "PURCHASE_ORDER" and obj.document_reference_number:
+            return obj.document_reference_number
+        return ""
+
 
 
 class TripSerializer(BaseModelSerializer):
@@ -561,6 +653,14 @@ class TripSerializer(BaseModelSerializer):
     tripDate = serializers.DateField(source="trip_date", required=False)
     fromLocation = serializers.CharField(source="from_location")
     toLocation = serializers.CharField(source="to_location")
+    fromWarehouseId = TenantPrimaryKeyRelatedField(
+        source="from_warehouse", model="masters.Location", required=False, allow_null=True
+    )
+    toWarehouseId = TenantPrimaryKeyRelatedField(
+        source="to_warehouse", model="masters.Location", required=False, allow_null=True
+    )
+    isStockDeducted = serializers.BooleanField(source="is_stock_deducted", read_only=True)
+    isStockReceived = serializers.BooleanField(source="is_stock_received", read_only=True)
     transporterId = TenantPrimaryKeyRelatedField(
         source="transporter", model="masters.Transporter", required=False, allow_null=True
     )
@@ -584,7 +684,19 @@ class TripSerializer(BaseModelSerializer):
 
     def get_proofFileUrl(self, obj):
         if obj.proof_file_id:
-            return f"/api/v1/files/{obj.proof_file_id}/download/"
+            from apps.core import files as file_service
+            from apps.core.models import File
+            file_row = getattr(obj, "proof_file", None) or File.objects.filter(pk=obj.proof_file_id).first()
+            if file_row:
+                if file_row.status != "committed":
+                    file_row.status = "committed"
+                    file_row.save(update_fields=["status"])
+                url = file_service.public_url(file_row)
+                if url:
+                    sep = "&" if "?" in url else "?"
+                    return f"{url}{sep}inline=true"
+            token = file_service.sign_download(obj.proof_file_id)
+            return f"/api/v1/files/{obj.proof_file_id}/download/?token={token}&inline=true"
         return None
     lrNumber = serializers.CharField(source="lr_number", required=False, allow_null=True, allow_blank=True)
     lrDate = serializers.DateField(source="lr_date", required=False, allow_null=True)
@@ -604,6 +716,7 @@ class TripSerializer(BaseModelSerializer):
         model = Trip
         fields = [
             "id", "tripNumber", "tripDate", "fromLocation", "toLocation",
+            "fromWarehouseId", "toWarehouseId", "isStockDeducted", "isStockReceived",
             "transporterId", "transporterName", "transporterPartyId",
             "vehicleId", "driverId", "proofFileId", "proofFileUrl", "proof_file", "vehicleNumber", "driverName", "driverMobile", "lrNumber", "lrDate",
             "tripType", "status", "freightAmount", "loadingCharges", "unloadingCharges",
@@ -611,6 +724,6 @@ class TripSerializer(BaseModelSerializer):
             "isCostAllocated", "dispatch_time", "delivery_time", "remarks",
             "materials", "signatures", "created_at", "updated_at",
         ]
-        read_only_fields = ["id", "tripNumber", "totalCharges", "isCostAllocated", "created_at", "updated_at"]
+        read_only_fields = ["id", "tripNumber", "totalCharges", "isCostAllocated", "isStockDeducted", "isStockReceived", "created_at", "updated_at"]
 
 
