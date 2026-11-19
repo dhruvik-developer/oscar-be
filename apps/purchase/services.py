@@ -10,6 +10,7 @@ ERP are both here:
   - **landed cost** (§6.4) -- freight is apportioned across lines by value and
     the resulting unit cost is what valuation uses
 """
+import logging
 from decimal import Decimal
 
 from django.db import transaction
@@ -35,6 +36,8 @@ from apps.sales.services import (
     recalculate_document,
     _default_location_id,
 )
+
+logger = logging.getLogger(__name__)
 
 from .models import (
     FABRIC_FLOW_FACTORY_TO_MILL,
@@ -458,8 +461,13 @@ def _post_receipt_stock(bill, lines, location_id, overrides, receipt, *, user=No
                             is_approved=True,
                             remarks=f"GRN against purchase bill {bill.bill_number}",
                         )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.exception(
+                        "Failed to create LotTaka for purchase bill %s line %s: %s",
+                        bill.bill_number,
+                        line.pk,
+                        exc,
+                    )
         else:
             first_movement = stock.post_movement(
                 quantity=quantity,
@@ -739,12 +747,56 @@ def po_billed_status(order):
 
 
 def assert_po_cancellable(order):
-    """api.md §6.2 -- a PO with any active bill cannot be cancelled."""
+    """A PO with received goods, QC passed batches, active bills, or fabric at mill cannot be cancelled."""
+    if order.status in ("Cancelled",):
+        raise Conflict("This purchase order is already cancelled.", code=Codes.ALREADY_CANCELLED)
+
+    if order.status in ("Partially Received", "Fully Received", "Received"):
+        raise Conflict(
+            f"Purchase order {order.po_number} cannot be cancelled because it is already {order.status}.",
+            code=Codes.HAS_DEPENDENTS,
+        )
+
+    # 1. Check if goods have been received through GRN
+    active_receipts = list(
+        order.receipts.filter(deleted_at__isnull=True).values_list("grn_number", flat=True)
+    )
+    if active_receipts:
+        names = ", ".join(filter(None, active_receipts)) or "GRN"
+        raise Conflict(
+            f"Purchase order {order.po_number} cannot be cancelled because goods have already been received on {names}. Cancel or return the goods receipt first.",
+            code=Codes.HAS_DEPENDENTS,
+            payload={"receipts": active_receipts},
+        )
+
+    # 2. Check if any line has received quantity
+    total_received = sum(line.received_qty or 0 for line in order.line_items.filter(deleted_at__isnull=True))
+    if total_received > 0:
+        raise Conflict(
+            f"Purchase order {order.po_number} cannot be cancelled because {total_received} units have already been received.",
+            code=Codes.HAS_DEPENDENTS,
+        )
+
+    # 3. Check if inventory batches exist
+    active_batches = list(
+        order.fabric_batches.filter(deleted_at__isnull=True).values_list("batch_code", flat=True)
+    )
+    if active_batches:
+        names = ", ".join(filter(None, active_batches))
+        raise Conflict(
+            f"Purchase order {order.po_number} cannot be cancelled because active inventory batches ({names}) exist for this order.",
+            code=Codes.HAS_DEPENDENTS,
+            payload={"batches": active_batches},
+        )
+
+    # 4. Check if fabric is at dyeing mill
     if order.dyeing_job_orders.filter(deleted_at__isnull=True).exists():
         raise Conflict(
             f"The fabric of {order.po_number} is at the dyeing mill; receive it back first.",
             code="FABRIC_AT_MILL",
         )
+
+    # 5. Check active purchase bills
     blocking = list(
         PurchaseBill.objects.filter(purchase_order=order, deleted_at__isnull=True)
         .exclude(status="Cancelled")
@@ -2472,8 +2524,12 @@ def create_standalone_grn(
     try:
         from apps.pms import loom_services
         loom_services.sync_yarn_receipt_to_loom_stock(receipt)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.exception(
+            "Failed to sync yarn receipt %s to loom stock: %s",
+            receipt.pk,
+            exc,
+        )
     return receipt
 
 

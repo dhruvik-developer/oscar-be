@@ -11,12 +11,15 @@ movements (api.md §7.2).
 low-stock tiles, auto-PO suggestions -- goes through it, so the UI and the
 reorder engine can never disagree.
 """
+import logging
 from decimal import Decimal
 
 from django.db import transaction
 from django.db.models import DecimalField, F, Q, Sum, Value
 from django.db.models.functions import Coalesce
 from django.utils import timezone
+
+logger = logging.getLogger(__name__)
 
 from apps.core.exceptions import BusinessRuleViolation, Codes, ValidationFailed
 from apps.core.money import ZERO, D, round2, round4
@@ -234,8 +237,9 @@ def post_movement(
     try:
         if getattr(item_obj, "item_kind", None) == "Fabric" or getattr(item_obj, "fabric_quality", None):
             evaluate_combined_grey_stock_alert(client_id)
-    except Exception:
-        pass
+    except Exception as exc:
+        # Non-critical alert evaluation failure should not block the primary stock movement
+        logger.exception("Failed to evaluate combined grey stock alert for client %s: %s", client_id, exc)
 
     return movement
 
@@ -350,6 +354,7 @@ SYSTEM_LOCATIONS = {
     "REJECT": ("SYS-REJECT", "Reject / Scrap", "Scrap"),
     # Stock dispatched on an inter-warehouse transfer and not yet received.
     "IN_TRANSIT": ("SYS-IN-TRANSIT", "Goods In Transit", "Transit"),
+    "SAMPLE": ("SYS-SAMPLE", "Sample Stock", "Zone"),
 }
 
 #: Stock at these locations is physically on hand but not available to sell
@@ -357,7 +362,7 @@ SYSTEM_LOCATIONS = {
 BLOCKED_LOCATION_CODES = tuple(code for code, _, _ in SYSTEM_LOCATIONS.values())
 
 #: The condition vocabulary for returns and dispositions.
-CONDITIONS = ("Good", "Hold", "Reprocess", "Second Quality", "Reject")
+CONDITIONS = ("Good", "Hold", "Reprocess", "Second Quality", "Reject", "Sample")
 
 _CONDITION_ALIASES = {
     "good": "Good", "usable": "Good", "ok": "Good", "pass": "Good", "passed": "Good",
@@ -366,6 +371,7 @@ _CONDITION_ALIASES = {
     "second quality": "Second Quality", "second": "Second Quality",
     "seconds": "Second Quality", "second_quality": "Second Quality",
     "reject": "Reject", "rejected": "Reject", "scrap": "Reject", "wastage": "Reject",
+    "sample": "Sample", "samples": "Sample",
 }
 
 #: condition -> (system location role or None for "the good location",
@@ -376,6 +382,7 @@ CONDITION_ROUTING = {
     "Reprocess": ("REPROCESS", "Reprocess"),
     "Second Quality": ("SECOND_QUALITY", "Passed"),
     "Reject": ("REJECT", "Rejected"),
+    "Sample": ("SAMPLE", "Passed"),
 }
 
 
@@ -479,7 +486,7 @@ def split_lot(lot, *, location_id, suffix, source_document_type=None,
     # Optional traceability fields (present only when the model defines them).
     field_names = {f.name for f in LotTaka._meta.get_fields()}
     extra = {}
-    for name in ("fabric_quality", "design", "shade"):
+    for name in ("fabric_quality", "design", "shade", "batch"):
         if name in field_names:
             extra[f"{name}_id"] = getattr(lot, f"{name}_id", None)
     if "parent_taka" in field_names:

@@ -18,10 +18,14 @@ shorter than its book metres has the difference moved to Reject as
 The source document gets its QC verdict, and a job-work inward with rework
 gets its reprocess order. Every QC stays in the history (repeat QC too).
 """
+import logging
 from collections import defaultdict
+from decimal import InvalidOperation
 
 from django.db import transaction
 from django.utils import timezone
+
+logger = logging.getLogger(__name__)
 
 from apps.core.audit import record_audit
 from apps.core.exceptions import ValidationFailed
@@ -174,7 +178,8 @@ def _num(value, field, *, positive=False):
         return None
     try:
         number = round4(D(value))
-    except Exception:  # noqa: BLE001 - reported as a field error
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        logger.exception("Failed parsing numeric value for field %s: %s", field, exc)
         raise ValidationFailed("Enter a number.", field_errors={field: ["Not a number."]})
     if number < ZERO or (positive and number <= ZERO):
         raise ValidationFailed("Measurements must be above zero.", field_errors={field: ["Must be above 0."]})

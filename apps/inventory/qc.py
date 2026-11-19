@@ -16,11 +16,14 @@ Every GRN line is handled -- never just ``lines.first()`` -- and a partly
 dispositioned taka is split so one taka record never spans two locations.
 """
 import json
-from decimal import Decimal
+import logging
+from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
 from django.db.models import Sum
 from django.utils import timezone
+
+logger = logging.getLogger(__name__)
 
 from apps.core.exceptions import Conflict, ValidationFailed
 from apps.core.money import ZERO, D, round4
@@ -34,7 +37,7 @@ CATEGORIES = ("good", "sample", "second", "reprocess", "reject", "hold")
 
 CATEGORY_CONDITION = {
     "good": "Good",
-    "sample": "Good",
+    "sample": "Sample",
     "second": "Second Quality",
     "reprocess": "Reprocess",
     "reject": "Reject",
@@ -79,7 +82,8 @@ def parse_quantities(data):
         raw = next((data.get(key) for key in keys if data.get(key) not in (None, "")), None)
         try:
             value = round4(D(raw or 0))
-        except Exception:  # noqa: BLE001 - reported as a field error
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            logger.exception("Invalid %s quantity parsed for keys %s: %s", category, keys, exc)
             raise ValidationFailed(
                 f"Invalid {category} quantity.", field_errors={keys[0]: ["Not a number."]}
             )
@@ -340,8 +344,9 @@ def dispose_receipt(
                     if val is not None:
                         try:
                             sub_quantities[category] = round4(D(val))
-                        except Exception:
-                            pass
+                        except (InvalidOperation, TypeError, ValueError) as exc:
+                            # Skip unparseable sub-quantity values and log for traceability
+                            logger.exception("Failed parsing sub-quantity for category %s: %s", category, exc)
                 sub_total = sum(sub_quantities.values(), ZERO)
                 if sub_total > ZERO and abs(sub_total - round4(unit["qty"])) <= TOLERANCE:
                     for category, q in sub_quantities.items():
@@ -459,19 +464,13 @@ def dispose_receipt(
                 qc_status=lot_qc_status,
                 split_suffix="QC",
             )
-            if remarks:
-                LotTaka.objects.filter(pk=target.pk).update(qc_notes=remarks)
             if category == "sample":
-                from .sampling_services import issue_sample
-
-                issue_sample(
-                    client_id=receipt.client_id,
-                    source_lot_taka_id=target.pk,
-                    quantity=qty,
-                    uom=target.uom or "MTR",
-                    remarks=note,
-                    user=user,
-                )
+                target.status = LotTaka.STATUS_SAMPLE
+                target.qc_status = "Passed"
+                target.qc_notes = f"Batch QC Sample Cut | Ref: {reference_number} | Batch: {target.batch.batch_code if target.batch else ''} | Remarks: {remarks or ''}".strip()
+                target.save(update_fields=["status", "qc_status", "qc_notes", "updated_at"])
+            elif remarks:
+                LotTaka.objects.filter(pk=target.pk).update(qc_notes=remarks)
         else:
             line = unit["line"]
             unit_cost = D(line.unit_cost) if line is not None and line.unit_cost else None
@@ -608,8 +607,7 @@ def record_receipt_verdict(receipt, quantities, *, user=None, remarks=None, meas
                         rec.status = "Completed"
                     rec.save(update_fields=["reprocess_qc_status", "status", "updated_at"])
     except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning("Error updating reprocess return status: %s", e)
+        logger.exception("Error updating reprocess return status: %s", e)
 
     from apps.core.audit import record_audit
 

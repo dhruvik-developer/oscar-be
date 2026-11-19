@@ -15,11 +15,15 @@ entries -- and adds only the operations a user starts *from* a batch:
 Sale, dyeing (job work), purchase return and scrap keep their own documents;
 the batch shows them, it never copies them.
 """
+import logging
 import uuid
 from collections import defaultdict
+from decimal import InvalidOperation
 
 from django.db import transaction
 from django.db.models import Q
+
+logger = logging.getLogger(__name__)
 
 from apps.core.audit import record_audit
 from apps.core.exceptions import BusinessRuleViolation, ValidationFailed
@@ -530,7 +534,8 @@ def _qty(data, key):
     raw = data.get(key)
     try:
         value = round4(D(raw or 0))
-    except Exception:  # noqa: BLE001 - reported as a field error
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        logger.exception("Failed to parse decimal quantity for key %s: %s", key, exc)
         raise ValidationFailed("Enter a number.", field_errors={key: ["Not a number."]})
     if value < ZERO:
         raise ValidationFailed("Quantities cannot be negative.", field_errors={key: ["≥ 0."]})

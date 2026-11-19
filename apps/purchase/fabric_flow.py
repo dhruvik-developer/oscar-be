@@ -30,9 +30,10 @@ A purchase order is the order; a batch is fabric that actually arrived. So:
 All quantities and costs are computed on the server; the screen only shows them.
 """
 import json
+import logging
 import re
 from collections import defaultdict
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
 from django.utils import timezone
@@ -56,6 +57,8 @@ from .models import (
     PurchaseOrderYarnLine,
     SupplierDelivery,
 )
+
+logger = logging.getLogger(__name__)
 
 TOLERANCE = Decimal("0.001")
 HEX_COLOUR = re.compile(r"#[0-9A-F]{6}")
@@ -109,7 +112,8 @@ def _qty(value, field, *, required=True, allow_zero=False):
         return None
     try:
         qty = round4(D(value))
-    except Exception:
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        logger.exception("Invalid quantity value '%s' for field '%s': %s", value, field, exc)
         raise ValidationFailed("Quantities must be numbers.", field_errors={field: ["Not a number."]})
     if qty < ZERO or (qty == ZERO and not allow_zero):
         raise ValidationFailed("Quantities must be above zero.", field_errors={field: ["Must be above 0."]})
@@ -123,7 +127,8 @@ def _money(value, field, *, required=True):
         return None
     try:
         amount = round2(D(value))
-    except Exception:
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        logger.exception("Invalid amount value '%s' for field '%s': %s", value, field, exc)
         raise ValidationFailed("Amounts must be numbers.", field_errors={field: ["Not a number."]})
     if amount < ZERO:
         raise ValidationFailed("Amounts cannot be negative.", field_errors={field: ["Must be 0 or more."]})

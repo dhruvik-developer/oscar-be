@@ -35,6 +35,7 @@ def issue_sample(
     sample_type="CUT_PIECE",
     quantity=1,
     uom="MTR",
+    unit_cost=None,
     is_returnable=True,
     due_date=None,
     photo_file=None,
@@ -46,12 +47,18 @@ def issue_sample(
     if quantity <= ZERO:
         raise ValidationFailed("Sample quantity must be greater than zero.")
 
+    if not party_id:
+        raise ValidationFailed(
+            "Customer / Party is required for sample issue.",
+            field_errors={"partyId": ["Customer is required."]},
+        )
+
     # A sample is cut from a real taka, so the stock always comes off it
     # (PDF §10: sampling is a stock movement, not only a photo record).
     if not source_lot_taka_id:
         raise ValidationFailed(
-            "Choose the lot / taka the sample is cut from.",
-            field_errors={"sourceLotTakaId": ["Required: the sample is deducted from this taka."]},
+            "Choose the batch the sample is cut from.",
+            field_errors={"sourceLotTakaId": ["Required: the sample is deducted from this batch."]},
         )
     source_taka = LotTaka.objects.select_for_update().filter(
         client_id=client_id, pk=source_lot_taka_id, deleted_at__isnull=True
@@ -73,7 +80,14 @@ def issue_sample(
     fabric_quality_id = fabric_quality_id or source_taka.fabric_quality_id
     design_id = design_id or source_taka.design_id
     shade_id = shade_id or source_taka.shade_id
-    unit_rate = D(source_taka.rate) if source_taka.rate else ZERO
+    if unit_cost is not None and str(unit_cost).strip() != "":
+        unit_rate = round2(D(str(unit_cost)))
+    elif source_taka.rate:
+        unit_rate = D(source_taka.rate)
+    elif source_taka.batch and getattr(source_taka.batch, "landed_cost_per_meter", None):
+        unit_rate = D(source_taka.batch.landed_cost_per_meter)
+    else:
+        unit_rate = ZERO
     estimated_cost = round2(quantity * unit_rate)
 
     sample_no = allocate_number(client_id, "SMP")
@@ -106,15 +120,42 @@ def issue_sample(
         type="SAMPLE_ISSUE",
         quantity=-quantity,
         uom=uom,
-        unit_cost=source_taka.rate,
+        unit_cost=unit_rate,
         reference_type="Sample",
         reference_id=sample.id,
         reference_number=sample.sample_number,
         movement_date=sample.sample_date,
         user=user,
         lot_taka=source_taka,
-        notes=f"Sample issue {sample.sample_number}",
+        notes=f"Sample issue {sample.sample_number} to {sample.party.name if sample.party else 'Customer'}",
     )
+
+    if not is_returnable and estimated_cost > ZERO:
+        try:
+            entry = ledger.post_entry(
+                client=client_id,
+                postings=[
+                    ledger.debit(
+                        ledger.system_account(client_id, "sample_expense"),
+                        estimated_cost,
+                        description=f"Non-returnable sample {sample.sample_number} issued to {sample.party.name if sample.party else 'Customer'}",
+                    ),
+                    ledger.credit(
+                        ledger.system_account(client_id, "stock"),
+                        estimated_cost,
+                        description=f"Stock deduction for sample {sample.sample_number}",
+                    ),
+                ],
+                narration=f"Non-returnable sample issue: {sample.sample_number}",
+                source_document_type="Sample",
+                source_document_id=sample.id,
+                user=user,
+            )
+            sample.journal_entry = entry
+            sample.save(update_fields=["journal_entry", "updated_at"])
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("Failed to post ledger entry for non-returnable sample: %s", e)
     if sample_type == "FULL_TAKA":
         LotTaka.objects.filter(pk=source_taka.pk).update(status=LotTaka.STATUS_SAMPLE)
 

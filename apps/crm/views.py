@@ -117,6 +117,8 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
         "stageId": "stage_id",
     }
     permission_map = {
+        "read": ["view_lead"],
+        "write": ["edit_lead"],
         "list": ["view_lead"],
         "retrieve": ["view_lead"],
         "create": ["create_lead"],
@@ -128,6 +130,8 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
         "bulk_mark_lost": ["edit_lead"],
         "reopen": ["edit_lead"],
         "bulk_reopen": ["edit_lead"],
+        "pin": ["edit_lead"],
+        "unpin": ["edit_lead"],
     }
 
     def filter_queryset(self, queryset):
@@ -1077,12 +1081,16 @@ class TaskViewSet(TenantModelViewSet):
         "source": "source",
     }
     permission_map = {
+        "read": ["view_task"],
+        "write": ["edit_task"],
         "list": ["view_task"],
         "retrieve": ["view_task"],
         "create": ["create_task"],
         "update": ["edit_task"],
         "partial_update": ["edit_task"],
         "destroy": ["delete_task"],
+        "start": ["edit_task"],
+        "complete": ["edit_task"],
         "activity": ["view_task"],
     }
 
