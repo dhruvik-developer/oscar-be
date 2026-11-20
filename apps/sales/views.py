@@ -17,6 +17,7 @@ from apps.core.exceptions import (
     Codes,
     Conflict,
     NotFound,
+    PermissionDenied,
     ValidationFailed,
 )
 from apps.core.money import ZERO, D, round2, round4
@@ -835,7 +836,10 @@ class SalesOrderViewSet(SalesDocumentViewSet):
     @action(detail=True, methods=["post"], url_path="convert-to-invoice")
     @transaction.atomic
     def convert_to_invoice(self, request, pk=None):
-        order = SalesOrder.objects.select_for_update().get(pk=pk)
+        try:
+            order = self.get_queryset().select_for_update().get(pk=pk)
+        except SalesOrder.DoesNotExist:
+            raise NotFound("Sales order not found.", code=Codes.NOT_FOUND)
         self.check_object_permissions(request, order)
         serializer = ConvertLinesSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -844,7 +848,10 @@ class SalesOrderViewSet(SalesDocumentViewSet):
     @action(detail=True, methods=["post"], url_path="convert-to-challan-and-invoice")
     @transaction.atomic
     def convert_to_challan_and_invoice(self, request, pk=None):
-        order = SalesOrder.objects.select_for_update().get(pk=pk)
+        try:
+            order = self.get_queryset().select_for_update().get(pk=pk)
+        except SalesOrder.DoesNotExist:
+            raise NotFound("Sales order not found.", code=Codes.NOT_FOUND)
         self.check_object_permissions(request, order)
 
         if order.stage == "Cancelled":
@@ -2431,6 +2438,18 @@ class SalesReturnViewSet(PostedReturnGuardMixin, SalesDocumentViewSet):
 
     def _validate_and_post_return(self, sales_return, invoice):
         from apps.accounting import services as ledger
+        from apps.core.permissions import has_permission
+
+        user = getattr(self.request, "user", None)
+        has_qc = bool(user and (getattr(user, "is_superuser", False) or has_permission(user, "approve_qc")))
+
+        for line in sales_return.line_items.all():
+            condition = stock.normalize_condition(line.condition or "Hold")
+            if condition == "Good" and not has_qc:
+                raise PermissionDenied(
+                    "Accepting returns as 'Good' requires QC approval rights.",
+                    code="approve_qc",
+                )
 
         already_returned = stock.previously_returned_serials(
             sales_return.client_id, invoice.id

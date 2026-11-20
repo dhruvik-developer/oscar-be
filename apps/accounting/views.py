@@ -41,7 +41,10 @@ class AccountViewSet(TenantModelViewSet):
     serializer_class = AccountSerializer
     audit_entity_type = "Account"
     audit_label_field = "name"
-    required_permissions = ["view_ledger"]
+    permission_map = {
+        "read": ["view_ledger"],
+        "write": ["manage_journal_entries"],
+    }
     status_field = None
     filter_map = {"type": "type", "subtype": "subtype", "isActive": "is_active"}
     search_fields = ["name", "code"]
@@ -111,7 +114,10 @@ class BankAccountViewSet(TenantModelViewSet):
     serializer_class = BankAccountSerializer
     audit_entity_type = "BankAccount"
     audit_label_field = "name"
-    required_permissions = ["view_bank_accounts"]
+    permission_map = {
+        "read": ["view_bank_accounts"],
+        "write": ["reconcile_bank"],
+    }
     status_field = None
     search_fields = ["name", "account_number", "bank_name"]
     ordering = ["-is_default", "name"]
@@ -223,7 +229,10 @@ class BankTransferViewSet(TenantModelViewSet):
     queryset = BankTransfer.objects.select_related("from_account", "to_account")
     serializer_class = BankTransferSerializer
     audit_entity_type = "BankTransfer"
-    required_permissions = ["view_bank_accounts"]
+    permission_map = {
+        "read": ["view_bank_accounts"],
+        "write": ["reconcile_bank"],
+    }
     status_field = None
     default_date_field = "transfer_date"
     ordering = ["-transfer_date"]
@@ -236,6 +245,38 @@ class BankTransferViewSet(TenantModelViewSet):
             transfer.journal_entry = entry
             transfer.save(update_fields=["journal_entry", "updated_at"])
         return transfer
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        transfer = serializer.instance
+        old_amount = transfer.amount
+        old_from = transfer.from_account_id
+        old_to = transfer.to_account_id
+        updated_transfer = super().perform_update(serializer)
+        if updated_transfer.journal_entry and (
+            updated_transfer.amount != old_amount
+            or updated_transfer.from_account_id != old_from
+            or updated_transfer.to_account_id != old_to
+        ):
+            services.reverse_entry(
+                updated_transfer.journal_entry,
+                user=self.request.user,
+                narration=f"Reversal of transfer {updated_transfer.transfer_number} due to edit",
+            )
+            new_entry = services.post_bank_transfer(updated_transfer, user=self.request.user)
+            updated_transfer.journal_entry = new_entry
+            updated_transfer.save(update_fields=["journal_entry", "updated_at"])
+        return updated_transfer
+
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        if instance.journal_entry:
+            services.reverse_entry(
+                instance.journal_entry,
+                user=self.request.user,
+                narration=f"Reversal of deleted transfer {instance.transfer_number}",
+            )
+        super().perform_destroy(instance)
 
 
 class JournalEntryViewSet(TenantModelViewSet):

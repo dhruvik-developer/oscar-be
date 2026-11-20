@@ -126,9 +126,16 @@ class LoomFactorySerializer(serializers.ModelSerializer):
 
 
 class YarnMasterSerializer(serializers.ModelSerializer):
+    category_name = serializers.CharField(source="category.name", read_only=True, default="")
+    item_sku = serializers.CharField(source="item.sku", read_only=True, default="")
+    item_name = serializers.CharField(source="item.name", read_only=True, default="")
+
     class Meta:
         model = YarnMaster
-        fields = ["id", "name", "denier", "kg_per_bag", "rate", "note"]
+        fields = [
+            "id", "name", "denier", "kg_per_bag", "rate", "note",
+            "item", "item_sku", "item_name", "category", "category_name",
+        ]
 
 
 class LoomQualitySerializer(serializers.ModelSerializer):
@@ -137,6 +144,8 @@ class LoomQualitySerializer(serializers.ModelSerializer):
     weft_yarn_name = serializers.CharField(source="weft_yarn.name", read_only=True)
     fabric_quality_name = serializers.CharField(source="fabric_quality.name", read_only=True, default="")
     item_name = serializers.CharField(source="item.name", read_only=True, default="")
+    item_sku = serializers.CharField(source="item.sku", read_only=True, default="")
+    category_name = serializers.CharField(source="category.name", read_only=True, default="")
     fabric_quality_details = serializers.SerializerMethodField()
     item_details = serializers.SerializerMethodField()
     ppm = serializers.FloatField(read_only=True)
@@ -153,7 +162,8 @@ class LoomQualitySerializer(serializers.ModelSerializer):
         model = LoomQuality
         fields = [
             "id", "name", "fabric_quality", "fabric_quality_name", "fabric_quality_details",
-            "item", "item_name", "item_details", "warp_yarn", "warp_yarn_name", "ends", "crimp",
+            "item", "item_sku", "item_name", "item_details", "category", "category_name",
+            "warp_yarn", "warp_yarn_name", "ends", "crimp",
             "weft_yarn", "weft_yarn_name", "reed", "reed_w", "ppi", "wastage",
             "pick_charge", "ppm", "warp_kg_m", "weft_kg_m", "glm", "gsm",
             "warp_cost", "weft_cost", "job_cost", "total_cost",
@@ -340,6 +350,7 @@ class FabricDispatchSerializer(serializers.ModelSerializer):
     job_work_order_number = serializers.CharField(source="job_work_order.order_number", read_only=True, default="")
     dyeing_mill_party_name = serializers.CharField(source="dyeing_mill_party.name", read_only=True, default="")
     delivery_challan_number = serializers.CharField(source="delivery_challan.challan_number", read_only=True, default="")
+    batch_code = serializers.CharField(source="batch.batch_code", read_only=True, default="")
     job_work_order_details = serializers.SerializerMethodField()
     dyeing_mill_party_details = serializers.SerializerMethodField()
     delivery_challan_details = serializers.SerializerMethodField()
@@ -352,6 +363,7 @@ class FabricDispatchSerializer(serializers.ModelSerializer):
             "job_work_order", "job_work_order_number", "job_work_order_details",
             "dyeing_mill_party", "dyeing_mill_party_name", "dyeing_mill_party_details",
             "delivery_challan", "delivery_challan_number", "delivery_challan_details",
+            "batch", "batch_code", "target_location",
             "challan", "vehicle",
         ]
 
@@ -419,13 +431,22 @@ class LoomMachineBatchCreateSerializer(serializers.Serializer):
 
 class DailyLoomProductionBulkSaveRowSerializer(serializers.Serializer):
     machine_id = serializers.UUIDField()
-    beam_id = serializers.UUIDField(required=False, allow_null=True)
+    beam_id = serializers.CharField(required=False, allow_null=True, allow_blank=True)
     meters = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
     rpm = serializers.DecimalField(max_digits=8, decimal_places=2, required=False, default=650)
     hours = serializers.DecimalField(max_digits=5, decimal_places=2, required=False, default=22)
     stop = serializers.DecimalField(max_digits=5, decimal_places=2, required=False, default=0)
     reason = serializers.CharField(required=False, allow_blank=True, default="")
     damage = serializers.DecimalField(max_digits=8, decimal_places=2, required=False, default=0)
+
+    def validate_beam_id(self, value):
+        if not value or str(value).strip() == "" or str(value).lower() in ("null", "none"):
+            return None
+        import uuid
+        try:
+            return uuid.UUID(str(value))
+        except (ValueError, AttributeError):
+            raise serializers.ValidationError("Must be a valid UUID.")
 
 
 class DailyLoomProductionBulkSaveSerializer(serializers.Serializer):

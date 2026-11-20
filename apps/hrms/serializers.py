@@ -2,6 +2,8 @@
 from datetime import date, datetime
 from decimal import Decimal
 import re
+import uuid
+from django.db import models
 from django.utils import timezone
 
 from rest_framework import serializers
