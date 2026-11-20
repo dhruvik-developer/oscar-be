@@ -233,13 +233,16 @@ class DailyLoomProductionSerializer(serializers.ModelSerializer):
     machine_no = serializers.IntegerField(source="machine.no", read_only=True)
     beam_no = serializers.CharField(source="beam.beam_no", read_only=True)
     quality_name = serializers.CharField(source="beam.quality.name", read_only=True, default="")
+    created_by_name = serializers.CharField(source="created_by.name", read_only=True, default="")
+    updated_by_name = serializers.CharField(source="updated_by.name", read_only=True, default="")
 
     class Meta:
         model = DailyLoomProduction
         fields = [
             "id", "factory", "factory_name", "machine", "machine_no", "beam",
             "beam_no", "quality_name", "date", "meters", "rpm", "hours",
-            "stop", "reason", "damage",
+            "stop", "reason", "damage", "created_by_name", "updated_by_name",
+            "created_at", "updated_at",
         ]
 
 
@@ -350,6 +353,7 @@ class FabricDispatchSerializer(serializers.ModelSerializer):
     job_work_order_number = serializers.CharField(source="job_work_order.order_number", read_only=True, default="")
     dyeing_mill_party_name = serializers.CharField(source="dyeing_mill_party.name", read_only=True, default="")
     delivery_challan_number = serializers.CharField(source="delivery_challan.challan_number", read_only=True, default="")
+    transporter_party_name = serializers.CharField(source="transporter_party.name", read_only=True, default="")
     batch_code = serializers.CharField(source="batch.batch_code", read_only=True, default="")
     job_work_order_details = serializers.SerializerMethodField()
     dyeing_mill_party_details = serializers.SerializerMethodField()
@@ -365,6 +369,10 @@ class FabricDispatchSerializer(serializers.ModelSerializer):
             "delivery_challan", "delivery_challan_number", "delivery_challan_details",
             "batch", "batch_code", "target_location",
             "challan", "vehicle",
+            "weaving_rate", "yarn_rate", "dyeing_rate", "logistic_rate",
+            "transporter_party", "transporter_party_name", "landed_cost_rate",
+            "mill_inward_status", "mill_inward_date", "mill_inward_meters",
+            "mill_inward_taka", "mill_inward_challan", "history_passport",
         ]
 
     def get_job_work_order_details(self, obj):

@@ -227,7 +227,8 @@ class LoginView(APIView):
             # Checked only after the password, like the status messages above.
             # The role is not a failed password guess, so it does not count
             # towards the lockout.
-            if not role_matches(user, serializer.validated_data["role"]):
+            selected_role = (serializer.validated_data.get("role") or "").strip()
+            if selected_role and not role_matches(user, selected_role):
                 _audit_login(user, request, "login_failed", "Sign-in refused: selected role is not assigned")
                 raise NotAuthenticated(
                     "The selected role is not assigned to this account.", code="ROLE_MISMATCH"

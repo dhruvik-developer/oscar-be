@@ -109,8 +109,8 @@ class TenantSerializer(BaseModelSerializer):
 class LoginSerializer(BaseSerializer):
     email = serializers.EmailField()
     password = serializers.CharField(write_only=True, trim_whitespace=False)
-    #: Code picked in "Select Your Role" (see ``login_roles``).
-    role = serializers.CharField(trim_whitespace=True)
+    #: Optional code if specified (see ``login_roles``).
+    role = serializers.CharField(trim_whitespace=True, required=False, allow_blank=True, default="")
 
 
 class RefreshSerializer(BaseSerializer):

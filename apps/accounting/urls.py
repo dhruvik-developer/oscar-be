@@ -2,9 +2,11 @@
 from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
+from apps.accounts.views import UserViewSet
 from . import views
 
 router = DefaultRouter(trailing_slash=True)
+router.register("users", UserViewSet, basename="accounts-users")
 router.register("bank-accounts", views.BankAccountViewSet, basename="accounts-bank-accounts")
 router.register("journal", views.JournalEntryViewSet, basename="accounts-journal")
 router.register("budgets", views.BudgetViewSet, basename="accounts-budgets")
