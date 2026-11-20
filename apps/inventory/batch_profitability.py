@@ -15,6 +15,7 @@ is NEVER counted as revenue or realized profit.
 """
 from collections import defaultdict
 from decimal import Decimal
+from django.core.cache import cache
 from django.db.models import Q
 from apps.inventory.models import Batch, BatchLoss, LotTaka, LotCostEntry, StockMovement
 from apps.inventory.batch_services import batch_costing, batch_quantities, _date, _sale_rates
@@ -36,11 +37,16 @@ def round4(val):
     return Decimal(str(val)).quantize(Decimal("0.0001"))
 
 
-def get_batch_profitability_summary(client_id, day=None):
+def get_batch_profitability_summary(client_id, day=None, refresh=False):
     """
     Computes summary metrics, top 5 profitable batches, and top 5 loss-making batches.
     Used directly by the Dashboard's compact 'Batch-wise Profitability' section.
     """
+    cache_key = f"batch_profitability_summary:{client_id}:{day or ''}"
+    if not refresh:
+        cached_val = cache.get(cache_key)
+        if cached_val is not None:
+            return cached_val
     batches = list(
         Batch.objects.filter(client_id=client_id, deleted_at__isnull=True)
         .select_related("item", "purchase_order", "goods_receipt")
@@ -149,7 +155,7 @@ def get_batch_profitability_summary(client_id, day=None):
     # Sort loss-making biggest loss first (most negative)
     loss_rows.sort(key=lambda r: D(r["netResult"]))
 
-    return {
+    res = {
         "totalRealizedProfit": str(round2(total_realized_profit)),
         "totalRealizedLoss": str(round2(total_realized_loss)),
         "netRealizedContribution": str(round2(total_realized_profit - total_realized_loss)),
@@ -166,17 +172,30 @@ def get_batch_profitability_summary(client_id, day=None):
         "best": profitable_rows[:5],
         "net": str(round2(total_realized_profit - total_realized_loss)),
     }
+    cache.set(cache_key, res, timeout=60)
+    return res
 
 
-def get_batch_profitability_list(client_id, *, search=None, fabric_type=None, status=None, sort_by=None, date_from=None, date_to=None):
+def get_batch_profitability_list(client_id, *, search=None, fabric_type=None, status=None, sort_by=None, date_from=None, date_to=None, refresh=False):
     """
     Returns full filtered and sorted list of batch profitability records for the dedicated page.
+    Utilizes bulk preloading and caching to provide sub-second response times.
     """
+    cache_key = f"batch_profitability_list:{client_id}:{search or ''}:{fabric_type or ''}:{status or ''}:{sort_by or ''}:{date_from or ''}:{date_to or ''}"
+    if not refresh:
+        cached_result = cache.get(cache_key)
+        if cached_result is not None:
+            return cached_result
+
     qs = (
         Batch.objects.filter(client_id=client_id, deleted_at__isnull=True)
         .select_related("item", "purchase_order", "goods_receipt", "supplier")
         .order_by("-created_at")
     )
+
+    if search:
+        q_str = str(search).strip()
+        qs = qs.filter(Q(batch_code__icontains=q_str) | Q(item__name__icontains=q_str))
 
     if fabric_type and fabric_type.upper() != "ALL":
         qs = qs.filter(fabric_type__iexact=fabric_type)
@@ -185,6 +204,43 @@ def get_batch_profitability_list(client_id, *, search=None, fabric_type=None, st
         qs = qs.filter(created_on__gte=date_from)
     if date_to:
         qs = qs.filter(created_on__lte=date_to)
+
+    batches = list(qs)
+    batch_ids = [b.id for b in batches]
+
+    # Bulk preload associated takas, movements, cost entries, and losses to eliminate N+1 queries
+    takas_by_batch = defaultdict(list)
+    if batch_ids:
+        for t in LotTaka.objects.filter(
+            batch_id__in=batch_ids, deleted_at__isnull=True
+        ).select_related(
+            "item", "item__category", "location", "fabric_quality", "design", "shade", "supplier"
+        ).order_by("created_at"):
+            takas_by_batch[t.batch_id].append(t)
+
+    all_takas = [t for ts in takas_by_batch.values() for t in ts]
+    taka_ids = [t.id for t in all_takas]
+    movements_by_taka = defaultdict(list)
+    if taka_ids:
+        for m in StockMovement.objects.filter(
+            lot_taka_id__in=taka_ids, deleted_at__isnull=True
+        ):
+            movements_by_taka[m.lot_taka_id].append(m)
+
+    lot_numbers = {t.lot_number for t in all_takas if t.lot_number}
+    entries_by_lot = defaultdict(list)
+    if lot_numbers:
+        for e in LotCostEntry.objects.filter(
+            client_id=client_id, lot_number__in=lot_numbers, deleted_at__isnull=True
+        ).order_by("date", "created_at"):
+            entries_by_lot[e.lot_number].append(e)
+
+    losses_by_batch = defaultdict(list)
+    if batch_ids:
+        for l in BatchLoss.objects.filter(
+            batch_id__in=batch_ids, deleted_at__isnull=True
+        ).select_related("responsible_party"):
+            losses_by_batch[l.batch_id].append(l)
 
     raw_rows = []
     total_realized_profit = ZERO
@@ -196,16 +252,17 @@ def get_batch_profitability_list(client_id, *, search=None, fabric_type=None, st
     loss_count = 0
     unsold_count = 0
 
-    for b in qs:
-        # Search filter
-        if search:
-            q_str = str(search).strip().lower()
-            code_match = q_str in (b.batch_code or "").lower()
-            item_match = b.item and (q_str in b.item.name.lower())
-            if not (code_match or item_match):
-                continue
+    for b in batches:
+        takas = takas_by_batch.get(b.id, [])
+        movements = [m for t in takas for m in movements_by_taka.get(t.id, ())]
+        lots = {t.lot_number for t in takas}
+        cost_entries = [e for lot in lots for e in entries_by_lot.get(lot, ())]
+        losses = losses_by_batch.get(b.id, [])
 
-        c = batch_costing(b)
+        c = batch_costing(
+            b, takas=takas, movements=movements,
+            cost_entries=cost_entries, losses=losses,
+        )
         sold_qty = D(c.get("soldQty", "0"))
         rev = D(c.get("revenue", "0"))
         cogs = D(c.get("costOfSold", "0"))
@@ -213,7 +270,7 @@ def get_batch_profitability_list(client_id, *, search=None, fabric_type=None, st
         unsold_val = D(c.get("unsoldInventoryValue", "0"))
         total_cost = D(c.get("totalCost", "0"))
         cost_per_unit = D(c.get("costPerUnit", "0"))
-        qty = batch_quantities(b)
+        qty = batch_quantities(b, takas, movements=movements)
         rem_qty = D(qty.get("onHand", "0"))
 
         is_sold = sold_qty > ZERO
@@ -298,10 +355,12 @@ def get_batch_profitability_list(client_id, *, search=None, fabric_type=None, st
         "totalUnsoldValue": str(round2(total_unsold_val)),
     }
 
-    return {
+    result = {
         "summary": summary,
         "rows": raw_rows,
     }
+    cache.set(cache_key, result, timeout=60)
+    return result
 
 
 def get_batch_profitability_detail(client_id, batch_code_or_id):

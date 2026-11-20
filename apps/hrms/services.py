@@ -1408,6 +1408,55 @@ def mark_payslip_paid(payslip, *, payment_date=None, bank_account=None, user=Non
         _recover_advance(payslip)
     except Exception:
         pass
+
+    # Settle any linked IncentiveCalculation records paid through salary
+    try:
+        from apps.pms.models import IncentiveCalculation
+        linked_incentives = IncentiveCalculation.objects.filter(
+            payslip=payslip, deleted_at__isnull=True
+        ).exclude(status__in=["Paid", "Reversed"])
+        for inc in linked_incentives:
+            comp = payslip.components.filter(name__icontains="Sales Incentive", kind="earning").first()
+            approved_amt = round2(D(inc.incentive_amount or 0) - D(inc.hold_amount or 0))
+            amt = round2(D(comp.amount)) if comp else round2(approved_amt - D(inc.paid_amount or 0))
+            if amt > ZERO:
+                inc.paid_amount = round2(D(inc.paid_amount or 0) + amt)
+                if inc.paid_amount >= approved_amt:
+                    inc.status = "Paid"
+                else:
+                    inc.status = "Posted"
+                inc.paid_at = payslip.payment_date or timezone.now()
+                detail = inc.detail or {}
+                payments = list(detail.get("payments", []))
+                updated_pending = False
+                for p in payments:
+                    if p.get("method") == "SALARY" and p.get("status") in ("Pending Payroll", "Pending"):
+                        p["status"] = "Paid"
+                        p["paymentDate"] = str(payslip.payment_date or timezone.localdate())
+                        p["paymentReference"] = f"Payroll Paid ({payslip.period_month.strftime('%b %Y')})"
+                        p["payrollReference"] = f"{payslip.employee.employee_code} - {payslip.period_month.strftime('%B %Y')}"
+                        p["remainingBalance"] = float(max(ZERO, approved_amt - inc.paid_amount))
+                        updated_pending = True
+                if not updated_pending:
+                    payments.append({
+                        "id": f"sal-{inc.id}-{payslip.id}",
+                        "method": "SALARY",
+                        "paymentMethod": "Through Salary",
+                        "paymentDate": str(payslip.payment_date or timezone.localdate()),
+                        "amount": float(amt),
+                        "remainingBalance": float(max(ZERO, approved_amt - inc.paid_amount)),
+                        "paymentReference": f"Payroll Paid ({payslip.period_month.strftime('%b %Y')})",
+                        "payrollReference": f"{payslip.employee.employee_code} - {payslip.period_month.strftime('%B %Y')}",
+                        "status": "Paid",
+                        "createdAt": timezone.now().isoformat(),
+                    })
+                detail["payments"] = payments
+                has_direct = any(p.get("method") == "DIRECT" for p in payments)
+                detail["payment_method"] = "MIXED" if has_direct else "SALARY"
+                inc.detail = detail
+                inc.save(update_fields=["status", "paid_amount", "paid_at", "detail", "updated_at"])
+    except Exception as e:
+        logger.warning(f"Failed to settle linked incentives for payslip {payslip.id}: {e}")
     return payslip
 
 

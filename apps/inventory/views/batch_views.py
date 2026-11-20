@@ -841,6 +841,7 @@ class BatchProfitabilityView(APIView):
         date_from = request.query_params.get("from") or request.query_params.get("startDate")
         date_to = request.query_params.get("to") or request.query_params.get("endDate")
 
+        refresh = request.query_params.get("refresh") in ("1", "true", "True")
         data = get_batch_profitability_list(
             request.client_id,
             search=search,
@@ -849,6 +850,7 @@ class BatchProfitabilityView(APIView):
             sort_by=sort_by,
             date_from=date_from,
             date_to=date_to,
+            refresh=refresh,
         )
         return Response(data)
 

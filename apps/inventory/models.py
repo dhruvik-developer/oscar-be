@@ -472,6 +472,7 @@ class StockAudit(TenantModel, LegacyIdMixin):
     STATUSES = [
         ("Draft", "Draft"),
         ("Counting", "Counting"),
+        ("Ready for Review", "Ready for Review"),
         ("Posted", "Posted"),
         ("Cancelled", "Cancelled"),
     ]
