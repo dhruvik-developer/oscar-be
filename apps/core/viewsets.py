@@ -31,7 +31,11 @@ class TenantScopedMixin:
     filter_soft_deleted = True
 
     def get_client_id(self):
-        return getattr(self.request, "client_id", None)
+        cid = getattr(self.request, "client_id", None)
+        if not cid:
+            from apps.core.tenancy import require_client_id
+            cid = require_client_id(self.request)
+        return cid
 
     def get_queryset(self):
         queryset = super().get_queryset()

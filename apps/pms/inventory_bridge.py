@@ -317,6 +317,54 @@ def ensure_fabric_item(loom_quality, client_id=None):
     return item
 
 
+def sync_inventory_item_to_pms_yarn(item):
+    """
+    Reverse bridge: When a Yarn Item is created or updated in Inventory (masters.Item),
+    automatically creates or updates the corresponding PMS YarnMaster so it is
+    instantly visible in PMS Loom & Yarn Management.
+    """
+    if not item:
+        return None
+    client_id = item.client_id
+    cat_code = (getattr(item.category, "code", "") or "").lower()
+    cat_name = (getattr(item.category, "name", "") or "").lower()
+    is_yarn = (
+        getattr(item, "item_kind", "") == "Yarn"
+        or "yarn" in cat_code
+        or "yarn" in cat_name
+    )
+    if not is_yarn:
+        return None
+
+    from apps.pms.models_loom import YarnMaster
+
+    ym = YarnMaster.objects.filter(client_id=client_id, item=item, deleted_at__isnull=True).first()
+    if not ym:
+        ym = YarnMaster.objects.filter(client_id=client_id, name__iexact=item.name, deleted_at__isnull=True).first()
+
+    rate = item.cost_price if item.cost_price and item.cost_price > ZERO else (item.selling_price or ZERO)
+    denier = getattr(item, "denier", None) or Decimal("150.00")
+
+    if ym:
+        ym.item = item
+        ym.category = item.category
+        if rate and rate > ZERO:
+            ym.rate = rate
+        ym.save(update_fields=["item", "category", "rate", "updated_at"])
+    else:
+        ym = YarnMaster.objects.create(
+            client_id=client_id,
+            name=item.name,
+            denier=denier,
+            kg_per_bag=Decimal("25.00"),
+            rate=rate,
+            item=item,
+            category=item.category,
+            note=item.description or "",
+        )
+    return ym
+
+
 def ensure_factory_location(factory, client_id=None):
     """Ensure a masters.Location exists for a LoomFactory shed floor."""
     if not factory:

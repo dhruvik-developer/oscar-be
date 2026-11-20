@@ -251,6 +251,7 @@ class YarnMasterViewSet(TenantModelViewSet):
         yarn = super().perform_create(serializer)
         try:
             sync_yarn_master_to_inventory(yarn, category_id=self.request.data.get("category"))
+            serializer.instance.refresh_from_db()
         except Exception as exc:
             logger.warning("Failed to sync yarn to inventory item: %s", exc)
         return yarn
@@ -261,6 +262,7 @@ class YarnMasterViewSet(TenantModelViewSet):
         yarn = super().perform_update(serializer)
         try:
             sync_yarn_master_to_inventory(yarn, category_id=self.request.data.get("category"))
+            serializer.instance.refresh_from_db()
         except Exception as exc:
             logger.warning("Failed to sync yarn to inventory item: %s", exc)
         return yarn
@@ -282,6 +284,7 @@ class LoomQualityViewSet(TenantModelViewSet):
                 category_id=self.request.data.get("category"),
                 fabric_quality_id=self.request.data.get("fabric_quality"),
             )
+            serializer.instance.refresh_from_db()
         except Exception as exc:
             logger.warning("Failed to sync quality to inventory: %s", exc)
         return quality
@@ -296,6 +299,7 @@ class LoomQualityViewSet(TenantModelViewSet):
                 category_id=self.request.data.get("category"),
                 fabric_quality_id=self.request.data.get("fabric_quality"),
             )
+            serializer.instance.refresh_from_db()
         except Exception as exc:
             logger.warning("Failed to sync quality to inventory: %s", exc)
         return quality

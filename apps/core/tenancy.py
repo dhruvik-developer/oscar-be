@@ -19,11 +19,28 @@ from threading import local
 from django.db import connection
 
 _state = local()
+_default_client_id = None
+
+
+def get_default_client_id():
+    """The single master enterprise client ID for Oscar Firm."""
+    global _default_client_id
+    if _default_client_id:
+        return _default_client_id
+    try:
+        from apps.accounts.models import Client
+        client = Client.objects.order_by("created_at").first()
+        if client:
+            _default_client_id = str(client.id)
+            return _default_client_id
+    except Exception:
+        pass
+    return None
 
 
 def get_current_client_id():
-    """The tenant id bound to this request/thread, or None outside a request."""
-    return getattr(_state, "client_id", None)
+    """The tenant id bound to this request/thread, or default client outside/unbound."""
+    return getattr(_state, "client_id", None) or get_default_client_id()
 
 
 def set_current_client_id(client_id, *, push_to_db=True):

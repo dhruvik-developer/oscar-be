@@ -232,6 +232,9 @@ def _deliver_email(*, recipients, subject, message, attachments=()):
     to = [r for r in (recipients or []) if r]
     if not to:
         raise EmailDeliveryFailed("Add at least one recipient email address.")
+    sender = getattr(settings, "DEFAULT_FROM_EMAIL", "") or getattr(
+        settings, "EMAIL_HOST_USER", ""
+    )
     if not getattr(settings, "EMAIL_HOST", ""):
         if getattr(settings, "DEBUG", False) or "console" in getattr(settings, "EMAIL_BACKEND", "").lower():
             try:
