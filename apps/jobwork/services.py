@@ -6,6 +6,8 @@ replaced wholesale by a header PATCH. Each row is created, edited or
 deleted individually through these functions so every change is
 validated, numbered by the server and audited.
 """
+from decimal import Decimal
+
 from apps.core.audit import record_audit, request_ip, snapshot
 from apps.core.exceptions import Conflict, ValidationFailed
 from apps.core.money import D, ZERO, round2

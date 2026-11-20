@@ -28,6 +28,7 @@ from .models import JobWorkOrder, PlanCharge, ProcessPlan
 from .serializers import (
     JobWorkOrderSerializer,
     JWOLossEntrySerializer,
+    JWOOutwardSerializer,
     PlanChargeSerializer,
     ProcessPlanSerializer,
 )

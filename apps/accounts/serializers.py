@@ -8,7 +8,11 @@ from rest_framework import serializers
 
 from apps.core.exceptions import ValidationFailed
 from apps.core.phone import clean_mobile
-from apps.core.serializers import BaseModelSerializer, BaseSerializer
+from apps.core.serializers import (
+    BaseModelSerializer,
+    BaseSerializer,
+    TenantPrimaryKeyRelatedField,
+)
 
 from .models import Client, Permission, Role, RolePermission, User, UserPermission, UserSession
 
@@ -162,7 +166,7 @@ class UserSerializer(BaseModelSerializer):
     """
 
     role = serializers.SerializerMethodField()
-    roleId = serializers.PrimaryKeyRelatedField(
+    roleId = TenantPrimaryKeyRelatedField(
         source="role", queryset=Role.objects.all(), allow_null=True, required=False
     )
     employeeId = serializers.SerializerMethodField()
@@ -174,7 +178,7 @@ class UserSerializer(BaseModelSerializer):
     designation = serializers.SerializerMethodField()
     employeeStatus = serializers.SerializerMethodField()
     reportingManager = serializers.SerializerMethodField()
-    reportingManagerId = serializers.PrimaryKeyRelatedField(
+    reportingManagerId = TenantPrimaryKeyRelatedField(
         source="reporting_manager",
         queryset=User.objects.all(),
         allow_null=True,
@@ -298,6 +302,16 @@ class UserSerializer(BaseModelSerializer):
                     validated_data["role"] = matched_role
         old_role_id = instance.role_id
         old_status = instance.status
+
+        # Prevent unauthorized role escalation
+        new_role = validated_data.get("role")
+        if new_role is not None and new_role.id != old_role_id:
+            request = self.context.get("request")
+            actor = getattr(request, "user", None)
+            from apps.core.permissions import has_permission
+            if actor and not (getattr(actor, "is_superuser", False) or has_permission(actor, "manage_roles")):
+                raise serializers.ValidationError({"roleId": ["Only administrators with 'manage_roles' permission can change user roles."]})
+
         user = super().update(instance, validated_data)
         if user.role_id != old_role_id:
             UserSession.objects.filter(user=user, revoked_at__isnull=True).update(
@@ -309,7 +323,17 @@ class UserSerializer(BaseModelSerializer):
             )
         if password:
             request = self.context.get("request")
-            set_by_self = bool(request and getattr(request.user, "pk", None) == user.pk)
+            actor = getattr(request, "user", None)
+            set_by_self = bool(actor and getattr(actor, "pk", None) == user.pk)
+            from apps.core.permissions import has_permission
+            if actor and not set_by_self and not (getattr(actor, "is_superuser", False) or has_permission(actor, "manage_roles")):
+                raise serializers.ValidationError({"password": ["Only role administrators can reset passwords for other users."]})
+            from django.contrib.auth.password_validation import validate_password
+            from django.core.exceptions import ValidationError as DjangoValidationError
+            try:
+                validate_password(password, user)
+            except DjangoValidationError as exc:
+                raise serializers.ValidationError({"password": list(exc.messages)})
             user.set_password(password)
             user.must_change_password = not set_by_self
             user.save(update_fields=["password", "must_change_password"])

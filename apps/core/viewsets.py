@@ -31,7 +31,11 @@ class TenantScopedMixin:
     filter_soft_deleted = True
 
     def get_client_id(self):
-        return getattr(self.request, "client_id", None)
+        cid = getattr(self.request, "client_id", None)
+        if not cid:
+            from apps.core.tenancy import require_client_id
+            cid = require_client_id(self.request)
+        return cid
 
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -234,11 +238,23 @@ class TenantModelViewSet(
 
     def create_defaults(self):
         defaults = {}
-        model = self.queryset.model
-        if hasattr(model, "client_id"):
+        # [OLD CODE - COMMENTED OUT]: model = self.queryset.model
+        # model = self.queryset.model
+        qs = getattr(self, "queryset", None)
+        if qs is not None and hasattr(qs, "model"):
+            model = qs.model
+        elif hasattr(self, "get_queryset"):
+            try:
+                model = self.get_queryset().model
+            except Exception:
+                model = getattr(getattr(self.get_serializer_class(), "Meta", None), "model", None)
+        else:
+            model = getattr(getattr(self.get_serializer_class(), "Meta", None), "model", None)
+
+        if model and hasattr(model, "client_id"):
             defaults["client_id"] = self.get_client_id()
         user = getattr(self.request, "user", None)
-        if hasattr(model, "created_by_id") and getattr(user, "is_authenticated", False):
+        if model and hasattr(model, "created_by_id") and getattr(user, "is_authenticated", False):
             defaults["created_by"] = user
             defaults["updated_by"] = user
         return defaults

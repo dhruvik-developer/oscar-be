@@ -1,5 +1,8 @@
 """Masters endpoints (api.md §4)."""
 from decimal import Decimal
+import logging
+
+logger = logging.getLogger(__name__)
 
 from django.db import transaction
 from django.db.models import Count, DecimalField, F, Q, Sum, Value
@@ -460,6 +463,23 @@ class ItemViewSet(TenantModelViewSet):
                     notes="Opening stock on item creation",
                     user=self.request.user,
                 )
+
+        # Reverse sync to PMS: If item is Yarn, auto-create / sync YarnMaster in PMS Loom
+        try:
+            from apps.pms.inventory_bridge import sync_inventory_item_to_pms_yarn
+            sync_inventory_item_to_pms_yarn(instance)
+        except Exception as exc:
+            logger.warning("Failed to reverse-sync inventory yarn item to PMS: %s", exc)
+
+        return instance
+
+    def perform_update(self, serializer):
+        instance = super().perform_update(serializer)
+        try:
+            from apps.pms.inventory_bridge import sync_inventory_item_to_pms_yarn
+            sync_inventory_item_to_pms_yarn(instance)
+        except Exception as exc:
+            logger.warning("Failed to reverse-sync inventory yarn item to PMS: %s", exc)
         return instance
 
     def check_delete_allowed(self, item):
