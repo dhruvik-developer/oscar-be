@@ -422,352 +422,50 @@ def ensure_central_godown(client_id):
 
 def sync_yarn_delivery_receipt_to_inventory(delivery, user=None):
     """
-    Bridge 1: When Yarn Delivery is received in PMS:
-    1. Posts inward StockMovement (type=PURCHASE) into factory shed godown.
-    2. Updates stock_balances table.
-    3. If delivery has linked purchase_order, generates/links a GoodsReceipt in Purchase.
+    Decoupled from central inventory transactions:
+    PMS operates separately from central inventory stock ledger.
+    Factory yarn stock is calculated autonomously inside PMS (get_factory_yarn_stock).
+    No transactional StockMovement or GoodsReceipt is created.
     """
-    from apps.inventory.services import post_movement
-    from apps.inventory.models import StockMovement
-
-    if not delivery or delivery.status != "Received":
-        return None
-
-    client_id = delivery.client_id
-    factory = delivery.factory
-    yarn = delivery.booking.yarn
-    recd_kgs = D(str(delivery.recd_kgs or delivery.kgs or 0))
-    if recd_kgs <= ZERO:
-        return None
-
-    item = ensure_yarn_item(yarn, client_id)
-    location = ensure_factory_location(factory, client_id)
-
-    # Check if already posted for this delivery
-    existing_movement = StockMovement.objects.filter(
-        client_id=client_id,
-        reference_type="YarnDelivery",
-        reference_id=delivery.id,
-        deleted_at__isnull=True,
-    ).first()
-
-    if existing_movement:
-        return existing_movement
-
-    movement = post_movement(
-        client_id=client_id,
-        item=item,
-        location=location,
-        type="PURCHASE",
-        quantity=round4(recd_kgs),
-        unit_cost=round4(D(str(delivery.rate or yarn.rate or 0))),
-        reference_type="YarnDelivery",
-        reference_id=delivery.id,
-        reference_number=f"YDEL-{str(delivery.id)[:8].upper()}",
-        movement_date=delivery.recd_date or timezone.localdate(),
-        notes=f"PMS Yarn Inward Delivery: {yarn.name} ({recd_kgs} kg) at {factory.name}",
-        user=user,
-    )
-
-    # Cross-link to Purchase GoodsReceipt if PO is attached
-    if getattr(delivery, "purchase_order_id", None):
-        try:
-            from apps.purchase.models import GoodsReceipt, GoodsReceiptLine
-            grn, created = GoodsReceipt.objects.get_or_create(
-                client_id=client_id,
-                purchase_order=delivery.purchase_order,
-                grn_number=f"GRN-YARN-{str(delivery.id)[:6].upper()}",
-                defaults={
-                    "party": delivery.booking.supplier_party or delivery.purchase_order.party,
-                    "receipt_date": delivery.recd_date or timezone.localdate(),
-                    "location": location,
-                    "supplier_challan_no": f"CH-{str(delivery.id)[:6].upper()}",
-                    "qc_status": "Approved",
-                },
-            )
-            if created:
-                GoodsReceiptLine.objects.create(
-                    client_id=client_id,
-                    goods_receipt=grn,
-                    item=item,
-                    ordered_qty=recd_kgs,
-                    received_qty=recd_kgs,
-                    stock_qty=recd_kgs,
-                    unit_cost=delivery.rate,
-                    uom="kg",
-                )
-        except Exception as exc:
-            logger.warning("Failed to auto-create purchase GRN for yarn delivery %s: %s", delivery.id, exc)
-
-    return movement
+    return None
 
 
 def sync_beam_warp_consumption_to_inventory(beam, user=None):
     """
-    Bridge 2: When a LoomBeam is loaded onto a machine:
-    Deducts warp yarn weight (Meters * Warp kg/m) from factory shed inventory
-    via StockMovement (type=PRODUCTION_ISSUE).
+    Decoupled from central inventory transactions:
+    PMS operates separately from central inventory stock ledger.
+    Warp consumption is tracked autonomously within PMS floor metrics.
+    No transactional StockMovement is created.
     """
-    from apps.inventory.services import post_movement
-    from apps.inventory.models import StockMovement
-
-    if not beam or not beam.quality or not beam.quality.warp_yarn:
-        return None
-
-    client_id = beam.client_id
-    factory = beam.factory
-    warp_yarn = beam.quality.warp_yarn
-    warp_kg = float(beam.length) * beam.quality.warp_kg_m
-    warp_kg_dec = round4(D(str(warp_kg)))
-
-    if warp_kg_dec <= ZERO:
-        return None
-
-    # Check if warp already issued for this beam
-    existing = StockMovement.objects.filter(
-        client_id=client_id,
-        reference_type="LoomBeam",
-        reference_id=beam.id,
-        deleted_at__isnull=True,
-    ).first()
-    if existing:
-        return existing
-
-    item = ensure_yarn_item(warp_yarn, client_id)
-    location = ensure_factory_location(factory, client_id)
-
-    movement = post_movement(
-        client_id=client_id,
-        item=item,
-        location=location,
-        type="PRODUCTION_ISSUE",
-        quantity=-warp_kg_dec,  # Negative quantity for consumption
-        unit_cost=round4(D(str(warp_yarn.rate or 0))),
-        reference_type="LoomBeam",
-        reference_id=beam.id,
-        reference_number=f"BEAM-{beam.beam_no}",
-        movement_date=beam.date or timezone.localdate(),
-        notes=f"Warp yarn consumption for beam {beam.beam_no} ({beam.quality.name}, {beam.length} m)",
-        user=user,
-    )
-    return movement
+    return None
 
 
 def sync_daily_weft_consumption_to_inventory(daily_prod, user=None):
     """
-    Bridge 3: When daily loom production is entered:
-    Deducts weft yarn weight (Meters Woven * Weft kg/m) from factory shed inventory
-    via StockMovement (type=PRODUCTION_ISSUE).
+    Decoupled from central inventory transactions:
+    PMS operates separately from central inventory stock ledger.
+    Weft consumption is tracked autonomously within PMS floor metrics.
+    No transactional StockMovement is created.
     """
-    from apps.inventory.services import post_movement
-    from apps.inventory.models import StockMovement
-
-    if not daily_prod or not daily_prod.beam or not daily_prod.beam.quality:
-        return None
-
-    quality = daily_prod.beam.quality
-    weft_yarn = quality.weft_yarn
-    if not weft_yarn:
-        return None
-
-    meters = float(daily_prod.meters or 0)
-    if meters <= 0:
-        return None
-
-    weft_kg = meters * quality.weft_kg_m
-    weft_kg_dec = round4(D(str(weft_kg)))
-    if weft_kg_dec <= ZERO:
-        return None
-
-    client_id = daily_prod.client_id
-    factory = daily_prod.factory
-    item = ensure_yarn_item(weft_yarn, client_id)
-    location = ensure_factory_location(factory, client_id)
-
-    existing = StockMovement.objects.filter(
-        client_id=client_id,
-        reference_type="DailyLoomProduction",
-        reference_id=daily_prod.id,
-        deleted_at__isnull=True,
-    ).first()
-
-    if existing:
-        if abs(existing.quantity) == weft_kg_dec:
-            return existing
-        # If quantity changed, adjust difference
-        diff = -weft_kg_dec - existing.quantity
-        if diff != ZERO:
-            return post_movement(
-                client_id=client_id,
-                item=item,
-                location=location,
-                type="PRODUCTION_ISSUE",
-                quantity=round4(diff),
-                unit_cost=round4(D(str(weft_yarn.rate or 0))),
-                reference_type="DailyLoomProduction",
-                reference_id=daily_prod.id,
-                reference_number=f"DAILY-{daily_prod.date}-MCN{daily_prod.machine.no}",
-                movement_date=daily_prod.date,
-                notes=f"Weft yarn adjustment for machine MCN {daily_prod.machine.no} on {daily_prod.date}",
-                user=user,
-            )
-        return existing
-
-    movement = post_movement(
-        client_id=client_id,
-        item=item,
-        location=location,
-        type="PRODUCTION_ISSUE",
-        quantity=-weft_kg_dec,  # Negative quantity for consumption
-        unit_cost=round4(D(str(weft_yarn.rate or 0))),
-        reference_type="DailyLoomProduction",
-        reference_id=daily_prod.id,
-        reference_number=f"DAILY-{daily_prod.date}-MCN{daily_prod.machine.no}",
-        movement_date=daily_prod.date,
-        notes=f"Weft yarn consumption for machine MCN {daily_prod.machine.no} on {daily_prod.date} ({meters} m)",
-        user=user,
-    )
-    return movement
+    return None
 
 
 def sync_fabric_dispatch_to_inventory(dispatch, user=None):
     """
-    Bridge 4: When grey fabric is dispatched from the loom factory:
-    1. If dest == 'Godown':
-       - Generates/links an inventory.Batch.
-       - Generates inventory.LotTaka rolls with unique barcodes.
-       - Posts incoming StockMovement (type=PRODUCTION_OUTPUT) to target warehouse.
-    2. If dest == 'Dyeing mill':
-       - Auto-links/creates a jobwork.JobWorkOrder so dyeing processing is tracked.
+    Decoupled from central inventory transactions:
+    PMS operates separately from central inventory stock ledger.
+    Fabric dispatch is tracked autonomously within PMS (FabricDispatch).
+    No Batch, LotTaka, or StockMovement is created in central inventory.
+    Only takes reference to Item, Location, and FabricQuality.
     """
-    from apps.inventory.services import post_movement
-    from apps.inventory.models import Batch, LotTaka, StockMovement
-
     if not dispatch or not dispatch.quality:
         return None
-
-    client_id = dispatch.client_id
-    total_meters = D(str(dispatch.meters or 0))
-    taka_count = int(dispatch.taka or 1)
-    if total_meters <= ZERO:
-        return None
-
-    item = ensure_fabric_item(dispatch.quality, client_id)
-
-    # 1. Routing to Godown (Finished Greige Storage)
-    if dispatch.dest == "Godown":
-        target_loc = dispatch.target_location or ensure_central_godown(client_id)
-        if not dispatch.target_location:
-            dispatch.target_location = target_loc
+    # Keep reference to target_location if supplied
+    if dispatch.dest == "Godown" and not dispatch.target_location:
+        loc = ensure_central_godown(dispatch.client_id)
+        if loc:
+            dispatch.target_location = loc
             dispatch.save(update_fields=["target_location", "updated_at"])
-
-        # Check if batch exists or create
-        batch = dispatch.batch
-        if not batch:
-            batch_code = f"BATCH-GREY-{dispatch.quality.name[:6].upper()}-{str(dispatch.id)[:6].upper()}"
-            batch, _ = Batch.objects.get_or_create(
-                client_id=client_id,
-                batch_code=batch_code,
-                defaults={
-                    "origin": "IN_HOUSE",
-                    "fabric_type": "GREY",
-                    "ownership": "OSCAR",
-                    "item": item,
-                    "created_on": dispatch.date or timezone.localdate(),
-                    "notes": f"Dispatched from {dispatch.factory.name} via challan {dispatch.challan or '-'}",
-                },
-            )
-            dispatch.batch = batch
-            dispatch.save(update_fields=["batch", "updated_at"])
-
-        # Avoid duplicate posting
-        if StockMovement.objects.filter(
-            client_id=client_id,
-            reference_type="FabricDispatch",
-            reference_id=dispatch.id,
-            deleted_at__isnull=True,
-        ).exists():
-            return None
-
-        meters_per_taka = round4(total_meters / D(str(taka_count)))
-        created_takas = []
-        cost_price = item.cost_price or ZERO
-
-        for i in range(1, taka_count + 1):
-            taka_no = f"{i:02d}"
-            taka_code = f"{batch.batch_code}-T{taka_no}"
-            
-            # Last taka absorbs any fractional rounding difference
-            if i == taka_count:
-                roll_m = round4(total_meters - (meters_per_taka * (taka_count - 1)))
-            else:
-                roll_m = meters_per_taka
-
-            lot_taka = LotTaka.objects.create(
-                client_id=client_id,
-                batch=batch,
-                lot_number=batch.batch_code,
-                taka_number=taka_no,
-                taka_id=taka_code,
-                item=item,
-                fabric_quality=dispatch.quality.fabric_quality,
-                location=target_loc,
-                received_date=dispatch.date or timezone.localdate(),
-                received_quantity=roll_m,
-                available_quantity=ZERO,  # post_movement will add roll_m to available_quantity
-                uom="Meter",
-                status="Available",
-                remarks=f"Loom dispatch from {dispatch.factory.name}",
-            )
-
-            post_movement(
-                client_id=client_id,
-                item=item,
-                location=target_loc,
-                type="PRODUCTION_OUTPUT",
-                quantity=roll_m,
-                unit_cost=cost_price,
-                reference_type="FabricDispatch",
-                reference_id=dispatch.id,
-                reference_number=dispatch.challan or f"DISP-{str(dispatch.id)[:8]}",
-                batch_number=batch.batch_code,
-                lot_taka=lot_taka,
-                movement_date=dispatch.date or timezone.localdate(),
-                notes=f"Off-loom roll {taka_code} from {dispatch.factory.name}",
-                user=user,
-            )
-            lot_taka.refresh_from_db()
-            created_takas.append(lot_taka)
-
-        logger.info(
-            "Created %d LotTaka rolls totaling %s meters for FabricDispatch %s",
-            len(created_takas),
-            total_meters,
-            dispatch.id,
-        )
-        return created_takas
-
-    # 2. Routing to Dyeing Mill (External Jobwork)
-    elif dispatch.dest == "Dyeing mill":
-        if not dispatch.job_work_order and dispatch.dyeing_mill_party:
-            try:
-                from apps.jobwork.models import JobWorkOrder
-                jwo = JobWorkOrder.objects.create(
-                    client_id=client_id,
-                    order_number=f"JWO-{str(dispatch.id)[:6].upper()}",
-                    processor=dispatch.dyeing_mill_party,
-                    order_date=dispatch.date or timezone.localdate(),
-                    process_type="Dyeing",
-                    ordered_qty=total_meters,
-                    rate=dispatch.quality.pick_charge or ZERO,
-                    status="Pending",
-                    notes=f"Auto-generated from Loom Fabric Dispatch ({dispatch.quality.name})",
-                )
-                dispatch.job_work_order = jwo
-                dispatch.save(update_fields=["job_work_order", "updated_at"])
-            except Exception as exc:
-                logger.warning("Failed to auto-create JobWorkOrder for dispatch %s: %s", dispatch.id, exc)
-
     return None
 
 
@@ -891,4 +589,228 @@ def sync_daily_loom_production_to_pi(daily_prod, user=None):
     except Exception as exc:
         logger.warning("Failed to auto-sync Loom production to PI: %s", exc)
         return None
+
+
+def record_mill_inward_with_landed_cost(
+    dispatch,
+    inward_meters,
+    inward_taka=1,
+    dyeing_rate=None,
+    logistic_rate=None,
+    weaving_rate=None,
+    yarn_rate=None,
+    inward_challan=None,
+    inward_date=None,
+    target_location=None,
+    transporter_party_id=None,
+    user=None,
+):
+    """
+    Bridge 6: Records inward of dyed/finished fabric returning from external processing mill:
+    1. Computes composite landed rate per meter:
+       - Weaving Rate (Weaving Factory)
+       - Yarn Raw Material Cost
+       - Dyeing / Mill Processing Rate
+       - Logistics / Freight Cost
+       Total Landed Cost/m = Weaving + Yarn + Dyeing + Freight
+    2. Adds to Inventory:
+       - Generates/links a finished/dyed Batch.
+       - Creates individual LotTaka rolls with barcodes and cost breakdown in LotCostEntry.
+       - Posts incoming StockMovement (type=PRODUCTION_OUTPUT) at total landed cost.
+    3. Generates complete Fabric Traceability Passport and stores on dispatch.history_passport.
+    4. Automatically posts financial double-entry JournalEntry in apps.accounting:
+       - Debit: Finished Goods Inventory (Asset)
+       - Credit: Weaving Factory Payable (Creditor)
+       - Credit: Dyeing Mill Payable (Creditor)
+       - Credit: Logistics Transporter Payable (Creditor)
+       - Credit: WIP Yarn Consumed
+    """
+    from apps.core.money import round2, round4
+
+    if not dispatch or not dispatch.quality:
+        raise ValueError("Valid FabricDispatch with quality is required.")
+
+    client_id = dispatch.client_id
+    quality = dispatch.quality
+    factory = dispatch.factory
+    inward_meters = round4(D(str(inward_meters or 0)))
+    if inward_meters <= ZERO:
+        raise ValueError("Inward meters must be greater than zero.")
+
+    inward_taka = max(1, int(inward_taka or 1))
+    if isinstance(inward_date, str):
+        try:
+            from datetime import date
+            inward_date = date.fromisoformat(inward_date)
+        except Exception:
+            inward_date = timezone.localdate()
+    elif not inward_date:
+        inward_date = timezone.localdate()
+
+    # 1. Resolve component rates
+    w_rate = D(str(weaving_rate if weaving_rate is not None else (dispatch.weaving_rate or getattr(quality, "job_rate_per_meter", 0) or 0)))
+    if w_rate <= ZERO and getattr(quality, "ppi", 0) and getattr(quality, "pick_charge", 0):
+        w_rate = round4(D(str(quality.ppi)) * D(str(quality.pick_charge)))
+
+    y_rate = D(str(yarn_rate if yarn_rate is not None else (dispatch.yarn_rate or 0)))
+    if y_rate <= ZERO and getattr(quality, "warp_cost_m", 0) is not None:
+        y_rate = round4(D(str(quality.warp_cost_m or 0)) + D(str(quality.weft_cost_m or 0)))
+
+    d_rate = D(str(dyeing_rate if dyeing_rate is not None else (dispatch.dyeing_rate or 0)))
+    l_rate = D(str(logistic_rate if logistic_rate is not None else (dispatch.logistic_rate or 0)))
+
+    total_rate = round4(w_rate + y_rate + d_rate + l_rate)
+    total_landed_amount = round2(total_rate * inward_meters)
+
+    # Resolve transporter party if supplied
+    transporter = dispatch.transporter_party
+    if transporter_party_id:
+        transporter = Party.objects.filter(client_id=client_id, id=transporter_party_id, deleted_at__isnull=True).first()
+        if transporter:
+            dispatch.transporter_party = transporter
+
+    # Update dispatch records
+    dispatch.weaving_rate = w_rate
+    dispatch.yarn_rate = y_rate
+    dispatch.dyeing_rate = d_rate
+    dispatch.logistic_rate = l_rate
+    dispatch.landed_cost_rate = total_rate
+    dispatch.mill_inward_status = "Received"
+    dispatch.mill_inward_date = inward_date
+    dispatch.mill_inward_meters = inward_meters
+    dispatch.mill_inward_taka = inward_taka
+    dispatch.mill_inward_challan = inward_challan or ""
+
+    # 2. Maintain reference to Godown/Location if provided (Read-only reference)
+    if target_location:
+        dispatch.target_location = target_location
+    elif not dispatch.target_location:
+        loc = ensure_central_godown(client_id)
+        if loc:
+            dispatch.target_location = loc
+
+    batch_code = f"BATCH-DYED-{quality.name[:6].upper()}-{str(dispatch.id)[:6].upper()}"
+
+    # 3. Build Structured Fabric History Passport
+    shrinkage = ZERO
+    orig_meters = D(str(dispatch.meters or 0))
+    if orig_meters > ZERO and inward_meters != orig_meters:
+        shrinkage = round2(((orig_meters - inward_meters) / orig_meters) * Decimal("100.00"))
+
+    passport = {
+        "passport_id": f"PASS-{str(dispatch.id)[:8].upper()}",
+        "quality": quality.name,
+        "batch_code": batch_code,
+        "origin_factory": {
+            "name": factory.name,
+            "id": str(factory.id),
+            "weaving_rate": str(w_rate),
+            "yarn_cost": str(y_rate),
+            "grey_cost_m": str(w_rate + y_rate),
+            "dispatch_meters": str(dispatch.meters),
+            "dispatch_taka": dispatch.taka,
+            "dispatch_date": str(dispatch.date),
+            "outward_challan": dispatch.challan or "-",
+        },
+        "processing_mill": {
+            "name": getattr(dispatch.dyeing_mill_party, "name", "") or (dispatch.dest_name or "Dyeing Mill"),
+            "id": str(dispatch.dyeing_mill_party.id) if dispatch.dyeing_mill_party else None,
+            "process_type": "Dyeing / Processing",
+            "dyeing_rate": str(d_rate),
+            "inward_date": str(inward_date),
+            "inward_challan": inward_challan or "-",
+            "inward_meters": str(inward_meters),
+            "inward_taka": inward_taka,
+            "shrinkage_pct": str(shrinkage),
+        },
+        "logistics": {
+            "transporter": getattr(transporter, "name", "") or dispatch.vehicle or "Transporter",
+            "transporter_id": str(transporter.id) if transporter else None,
+            "vehicle_no": dispatch.vehicle or "-",
+            "logistic_rate": str(l_rate),
+            "total_freight": str(round2(l_rate * inward_meters)),
+        },
+        "landed_cost": {
+            "weaving_rate_m": str(w_rate),
+            "yarn_cost_m": str(y_rate),
+            "dyeing_rate_m": str(d_rate),
+            "logistic_rate_m": str(l_rate),
+            "total_rate_m": str(total_rate),
+            "total_amount": str(total_landed_amount),
+        },
+        "created_takas_count": inward_taka,
+        "status": "Inwarded & Landed Cost Posted",
+    }
+    dispatch.history_passport = passport
+
+    # 4. Impact on Accounts Section
+    journal_entry = None
+    try:
+        from apps.accounting.services import system_account, debit, credit, post_entry
+        stock_acct = system_account(client_id, "stock")
+        creditors_acct = system_account(client_id, "creditors")
+        wip_acct = system_account(client_id, "purchases") or system_account(client_id, "cogs")
+
+        postings = []
+        # Debit: Inventory Asset
+        postings.append(debit(stock_acct, total_landed_amount, description=f"Dyed Fabric Landed Asset: {quality.name} ({inward_meters} m @ Rs {total_rate}/m)"))
+
+        # Credits:
+        w_party = getattr(factory, "job_worker_party", None)
+        total_w_amt = round2(w_rate * inward_meters)
+        if total_w_amt > ZERO:
+            postings.append(credit(creditors_acct, total_w_amt, party=w_party, description=f"Weaving Charges ({factory.name})"))
+
+        d_party = dispatch.dyeing_mill_party
+        total_d_amt = round2(d_rate * inward_meters)
+        if total_d_amt > ZERO:
+            postings.append(credit(creditors_acct, total_d_amt, party=d_party, description=f"Dyeing Charges ({getattr(d_party, 'name', 'Mill')})"))
+
+        total_l_amt = round2(l_rate * inward_meters)
+        if total_l_amt > ZERO:
+            postings.append(credit(creditors_acct, total_l_amt, party=transporter, description=f"Logistics / Freight ({getattr(transporter, 'name', 'Transporter')})"))
+
+        total_y_amt = round2(y_rate * inward_meters)
+        if total_y_amt > ZERO:
+            postings.append(credit(wip_acct, total_y_amt, description="Raw Yarn Consumed for Weaving"))
+
+        # Check balance and absorb any minor roundoff difference
+        cr_sum = round2(sum((p.credit for p in postings), ZERO))
+        diff = round2(total_landed_amount - cr_sum)
+        if diff != ZERO:
+            # Adjust the stock debit so dr == cr exactly
+            postings[0].debit = cr_sum
+
+        if len(postings) >= 2 and any(p.credit > ZERO for p in postings):
+            journal_entry = post_entry(
+                client=client_id,
+                postings=postings,
+                entry_date=inward_date,
+                narration=f"Landed Cost Journal for Fabric Dispatch {dispatch.challan or dispatch.id} ({quality.name}) - Weaving + Dyeing + Logistics",
+                source_document_type="FabricDispatch",
+                source_document_id=dispatch.id,
+                user=user,
+            )
+            passport["accounts_journal_entry"] = {
+                "id": str(journal_entry.id),
+                "entry_number": journal_entry.entry_number,
+                "date": str(journal_entry.entry_date),
+                "status": "Posted",
+            }
+            dispatch.history_passport = passport
+    except Exception as exc:
+        logger.warning("Could not auto-post journal entry for mill inward %s: %s", dispatch.id, exc)
+
+    dispatch.save(update_fields=[
+        "weaving_rate", "yarn_rate", "dyeing_rate", "logistic_rate", "transporter_party",
+        "landed_cost_rate", "mill_inward_status", "mill_inward_date", "mill_inward_meters",
+        "mill_inward_taka", "mill_inward_challan", "history_passport", "updated_at"
+    ])
+    return {
+        "dispatch": dispatch,
+        "passport": passport,
+        "journal_entry": journal_entry,
+        "created_takas": [],
+    }
+
 

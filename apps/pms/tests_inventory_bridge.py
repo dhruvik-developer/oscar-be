@@ -95,17 +95,11 @@ class PMSInventoryBridgeTestCase(TestCase):
         )
 
         movement = sync_yarn_delivery_receipt_to_inventory(delivery, user=self.user)
-        self.assertIsNotNone(movement)
-        self.assertEqual(movement.type, "PURCHASE")
-        self.assertEqual(movement.quantity, Decimal("1000.0000"))
+        # Decoupled: PMS does not post to central inventory StockMovement
+        self.assertIsNone(movement)
+        self.assertEqual(StockMovement.objects.filter(reference_type="YarnDelivery").count(), 0)
 
-        balance = StockBalance.objects.get(
-            client_id=self.client_obj.id, item_id=movement.item_id, location_id=movement.location_id
-        )
-        self.assertEqual(balance.on_hand, Decimal("1000.0000"))
-
-    def test_beam_warp_and_daily_weft_consumption_bridge(self):
-        # 1. Inward yarn first
+    def test_beam_warp_and_daily_weft_consumption_decoupled(self):
         booking = YarnBooking.objects.create(
             client=self.client_obj,
             supplier=self.supplier.name,
@@ -127,7 +121,7 @@ class PMSInventoryBridgeTestCase(TestCase):
         )
         sync_yarn_delivery_receipt_to_inventory(deliv, user=self.user)
 
-        # 2. Warp beam consumption
+        # 2. Warp beam consumption is decoupled from StockMovement
         beam = LoomBeam.objects.create(
             client=self.client_obj,
             beam_no="B101",
@@ -138,11 +132,10 @@ class PMSInventoryBridgeTestCase(TestCase):
             machine=self.machine,
         )
         warp_mv = sync_beam_warp_consumption_to_inventory(beam, user=self.user)
-        self.assertIsNotNone(warp_mv)
-        self.assertEqual(warp_mv.type, "PRODUCTION_ISSUE")
-        self.assertTrue(warp_mv.quantity < Decimal("0"))
+        self.assertIsNone(warp_mv)
+        self.assertEqual(StockMovement.objects.filter(reference_type="LoomBeam").count(), 0)
 
-        # 3. Daily weft consumption
+        # 3. Daily weft consumption is decoupled from StockMovement
         daily_prod = DailyLoomProduction.objects.create(
             client=self.client_obj,
             factory=self.factory,
@@ -152,11 +145,10 @@ class PMSInventoryBridgeTestCase(TestCase):
             meters=Decimal("150.00"),
         )
         weft_mv = sync_daily_weft_consumption_to_inventory(daily_prod, user=self.user)
-        self.assertIsNotNone(weft_mv)
-        self.assertEqual(weft_mv.type, "PRODUCTION_ISSUE")
-        self.assertTrue(weft_mv.quantity < Decimal("0"))
+        self.assertIsNone(weft_mv)
+        self.assertEqual(StockMovement.objects.filter(reference_type="DailyLoomProduction").count(), 0)
 
-    def test_fabric_dispatch_to_godown_generates_lot_taka_and_stock(self):
+    def test_fabric_dispatch_decoupled_from_inventory(self):
         dispatch = FabricDispatch.objects.create(
             client=self.client_obj,
             factory=self.factory,
@@ -169,18 +161,7 @@ class PMSInventoryBridgeTestCase(TestCase):
         )
 
         takas = sync_fabric_dispatch_to_inventory(dispatch, user=self.user)
-        self.assertIsNotNone(takas)
-        self.assertEqual(len(takas), 3)
-
-        total_taka_m = sum(t.available_quantity for t in takas)
-        self.assertEqual(total_taka_m, Decimal("300.0000"))
-
-        self.assertIsNotNone(dispatch.batch)
-        self.assertTrue(dispatch.batch.batch_code.startswith("BATCH-GREY-"))
-
-        # Verify stock movement into godown
-        movements = StockMovement.objects.filter(
-            client=self.client_obj, reference_type="FabricDispatch", reference_id=dispatch.id
-        )
-        self.assertEqual(movements.count(), 3)
-        self.assertEqual(sum(m.quantity for m in movements), Decimal("300.0000"))
+        self.assertIsNone(takas)
+        # Verify no lot takas or stock movements are created in central inventory
+        self.assertEqual(LotTaka.objects.filter(client=self.client_obj).count(), 0)
+        self.assertEqual(StockMovement.objects.filter(reference_type="FabricDispatch").count(), 0)

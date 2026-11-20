@@ -299,6 +299,7 @@ class ProductionProgram(TenantModel):
         ("Planned", "Planned"),
         ("Running", "Running"),
         ("Hold", "Hold"),
+        ("Done", "Done"),
         ("Closed", "Closed"),
     ]
     name = models.TextField()
@@ -350,6 +351,20 @@ class FabricDispatch(TenantModel):
     target_location = models.ForeignKey(
         "masters.Location", null=True, blank=True, on_delete=models.SET_NULL, related_name="incoming_fabric_dispatches"
     )
+    weaving_rate = models.DecimalField(max_digits=10, decimal_places=2, default=0, null=True, blank=True)
+    yarn_rate = models.DecimalField(max_digits=10, decimal_places=2, default=0, null=True, blank=True)
+    dyeing_rate = models.DecimalField(max_digits=10, decimal_places=2, default=0, null=True, blank=True)
+    logistic_rate = models.DecimalField(max_digits=10, decimal_places=2, default=0, null=True, blank=True)
+    transporter_party = models.ForeignKey(
+        "masters.Party", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    landed_cost_rate = models.DecimalField(max_digits=10, decimal_places=2, default=0, null=True, blank=True)
+    mill_inward_status = models.TextField(default="Pending")  # Pending, Received
+    mill_inward_date = models.DateField(null=True, blank=True)
+    mill_inward_meters = models.DecimalField(max_digits=12, decimal_places=2, default=0, null=True, blank=True)
+    mill_inward_taka = models.IntegerField(default=0, null=True, blank=True)
+    mill_inward_challan = models.TextField(null=True, blank=True)
+    history_passport = models.JSONField(default=dict, blank=True)
 
     class Meta:
         db_table = "loom_fabric_dispatches"
