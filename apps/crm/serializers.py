@@ -136,6 +136,9 @@ class LeadSerializer(BaseModelSerializer):
     customerId = serializers.CharField(source="party.id", read_only=True)
     customerName = serializers.CharField(source="party.name", read_only=True)
     customValues = serializers.JSONField(source="custom_values", required=False)
+    salespersonId = serializers.SerializerMethodField()
+    salespersonName = serializers.SerializerMethodField()
+    assignmentHistory = serializers.SerializerMethodField()
 
     class Meta:
         model = Lead
@@ -148,6 +151,7 @@ class LeadSerializer(BaseModelSerializer):
             "convertedAt", "convertedByName", "conversionSource",
             "conversionReference",
             "lost_reason", "custom_values", "customValues",
+            "salespersonId", "salespersonName", "assignmentHistory",
             "productsCount", "sourcesCount", "filesCount", "openTasksCount",
             "deliveryChallansCount",
             "salesInvoicesCount",
@@ -213,6 +217,18 @@ class LeadSerializer(BaseModelSerializer):
 
     def get_salesInvoicesCount(self, lead):
         return self._counter(lead, "sales_invoices_count")
+
+    def get_salespersonId(self, lead):
+        cv = lead.custom_values or {}
+        return cv.get("salesperson_id") or (str(lead.owner.employee.id) if getattr(getattr(lead, "owner", None), "employee", None) else None)
+
+    def get_salespersonName(self, lead):
+        cv = lead.custom_values or {}
+        return cv.get("salesperson_name") or (lead.owner.employee.name if getattr(getattr(lead, "owner", None), "employee", None) else (lead.owner.name if getattr(lead, "owner", None) else None))
+
+    def get_assignmentHistory(self, lead):
+        cv = lead.custom_values or {}
+        return cv.get("assignment_history") or []
 
 
 class LeadUserSerializer(BaseModelSerializer):

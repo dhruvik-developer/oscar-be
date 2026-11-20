@@ -282,6 +282,8 @@ class StockAuditViewSet(TenantModelViewSet):
         "destroy": ["perform_audit"],
         "post_variances": ["perform_audit"],
         "save_counts": ["perform_audit"],
+        "mark_ready_for_review": ["perform_audit"],
+        "revert_to_counting": ["perform_audit"],
         "cancel": ["perform_audit"],
     }
     status_field = "status"
@@ -295,7 +297,7 @@ class StockAuditViewSet(TenantModelViewSet):
         "periodMonth": "period_month",
     }
     draft_only_writes = True
-    draft_values = ("Draft", "Counting")
+    draft_values = ("Draft", "Counting", "Ready for Review")
 
     def create(self, request, *args, **kwargs):
         # 1. Require authorized user to perform audit
@@ -351,7 +353,7 @@ class StockAuditViewSet(TenantModelViewSet):
             active_qs = StockAudit.objects.filter(
                 client_id=self.get_client_id(),
                 period_month=period_month,
-                status__in=["Draft", "Counting"],
+                status__in=["Draft", "Counting", "Ready for Review"],
                 deleted_at__isnull=True,
             ).select_related("location", "conducted_by", "created_by").order_by("-created_at")
             if location_id:
@@ -400,16 +402,40 @@ class StockAuditViewSet(TenantModelViewSet):
         serializer.validated_data["audit_number"] = allocate_number(
             self.request.user.client, "AUD"
         )
-        serializer.validated_data.setdefault("conducted_by", self.request.user)
+        auditor_id = (
+            self.request.data.get("conducted_by")
+            or self.request.data.get("auditor_id")
+            or self.request.data.get("conductedById")
+        )
+        if auditor_id:
+            from apps.accounts.models import User
+            auditor = User.objects.filter(client_id=self.get_client_id(), id=auditor_id).first()
+            if auditor:
+                serializer.validated_data["conducted_by"] = auditor
+            else:
+                serializer.validated_data.setdefault("conducted_by", self.request.user)
+        else:
+            serializer.validated_data.setdefault("conducted_by", self.request.user)
+
         audit = super().perform_create(serializer)
 
         if not lines:
-            # Snapshot items and their book stock for the chosen warehouse (or company-wide)
-            items = list(
-                Item.objects.filter(
-                    client_id=self.get_client_id(), deleted_at__isnull=True
-                ).exclude(item_kind="Service")
+            categories = (
+                self.request.data.get("categories")
+                or self.request.data.get("category_ids")
+                or []
             )
+            if isinstance(categories, str):
+                categories = [c.strip() for c in categories.split(",") if c.strip()]
+
+            items_qs = Item.objects.filter(
+                client_id=self.get_client_id(), deleted_at__isnull=True
+            ).exclude(item_kind="Service")
+
+            if categories:
+                items_qs = items_qs.filter(category_id__in=categories)
+
+            items = list(items_qs)
             item_ids = [item.id for item in items]
 
             if audit.location_id:
@@ -476,6 +502,30 @@ class StockAuditViewSet(TenantModelViewSet):
                 audit.save(update_fields=["status", "updated_at"])
 
         return Response({"savedLines": updated_count, "status": audit.status})
+
+    @action(detail=True, methods=["post"])
+    def mark_ready_for_review(self, request, pk=None):
+        """Allows moving a Counting audit to Ready for Review."""
+        require_permission(request.user, "perform_audit")
+        audit = self.get_object()
+        if audit.status == "Posted":
+            raise Conflict("Posted audits are certified and locked.", code="DRAFT_ONLY")
+        audit.status = "Ready for Review"
+        audit.save(update_fields=["status", "updated_at"])
+        self.write_audit("review", audit, description="Audit moved to Ready for Review")
+        return Response({"status": audit.status})
+
+    @action(detail=True, methods=["post"])
+    def revert_to_counting(self, request, pk=None):
+        """Allows reverting a Ready for Review audit back to Counting."""
+        require_permission(request.user, "perform_audit")
+        audit = self.get_object()
+        if audit.status == "Posted":
+            raise Conflict("Posted audits are certified and locked.", code="DRAFT_ONLY")
+        audit.status = "Counting"
+        audit.save(update_fields=["status", "updated_at"])
+        self.write_audit("revert", audit, description="Audit reverted to Counting")
+        return Response({"status": audit.status})
 
     @action(detail=True, methods=["post"])
     def post_variances(self, request, pk=None):

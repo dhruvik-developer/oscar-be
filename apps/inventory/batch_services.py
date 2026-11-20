@@ -1332,7 +1332,7 @@ def physical_stock_summary(client_id):
     material, by state; customers also show what was delivered back."""
     from .models import LotTaka, StockMovement
 
-    states = ("available", "reserved", "qcHold", "rework", "secondQuality", "rejected", "withJobWorker")
+    states = ("available", "reserved", "qcHold", "rework", "secondQuality", "rejected", "withJobWorker", "sample")
     summary = {}
 
     def row_for(ownership, party_id, party_name):
@@ -1353,6 +1353,8 @@ def physical_stock_summary(client_id):
         bucket = _bucket(t)
         if bucket == "available" and t.status == "Reserved":
             bucket = "reserved"
+        if bucket not in row:
+            row[bucket] = ZERO
         row[bucket] += D(t.available_quantity)
         row["batches"].add(t.batch_id)
 

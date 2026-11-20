@@ -2469,6 +2469,12 @@ class HrmsIncentiveSerializer(_PMSIncentiveCalculationSerializer):
     }
 
     status = serializers.SerializerMethodField()
+    payment_method = serializers.SerializerMethodField()
+    paymentMethod = serializers.SerializerMethodField()
+    remaining_balance = serializers.SerializerMethodField()
+    remainingBalance = serializers.SerializerMethodField()
+    payment_history = serializers.SerializerMethodField()
+    paymentHistory = serializers.SerializerMethodField()
     ledger_status = serializers.CharField(source="status", read_only=True)
     period_name = serializers.CharField(source="period_label", read_only=True)
     start_date = serializers.DateField(source="period_start", read_only=True)
@@ -2491,7 +2497,9 @@ class HrmsIncentiveSerializer(_PMSIncentiveCalculationSerializer):
             "gross_sales", "returns_deduction", "net_eligible_sales",
             "applicable_rate", "calculated_incentive", "payable_amount",
             "hold_reason", "scheme_name", "payable_now", "next_payout_date",
-            "payout_after_days",
+            "payout_after_days", "payment_method", "paymentMethod",
+            "remaining_balance", "remainingBalance",
+            "payment_history", "paymentHistory",
         ]
 
     @staticmethod
@@ -2503,9 +2511,96 @@ class HrmsIncentiveSerializer(_PMSIncentiveCalculationSerializer):
         return D(base) if base not in (None, "") else D(obj.net_sales or 0)
 
     def get_status(self, obj):
-        if (obj.detail or {}).get("managementHold") and obj.status not in ("Paid", "Reversed"):
+        if obj.status == "Reversed":
+            return "REVERSED"
+        if (obj.detail or {}).get("managementHold"):
             return "HELD"
+        approved = max(ZERO, D(obj.incentive_amount or 0) - D(obj.hold_amount or 0))
+        paid = D(obj.paid_amount or 0)
+        if obj.status == "Paid" or (paid >= approved and approved > ZERO):
+            return "PAID"
+        if paid > ZERO and paid < approved:
+            return "PARTIALLY_PAID"
+        if obj.status in ("Approved", "Posted"):
+            return "APPROVED"
+        if obj.status == "Calculated":
+            return "ACCRUED"
         return self.STATUS_MAP.get(obj.status, (obj.status or "").upper())
+
+    def get_payment_method(self, obj):
+        detail = obj.detail or {}
+        payments = detail.get("payments", [])
+        has_direct = any(p.get("method") == "DIRECT" for p in payments)
+        has_salary = any(p.get("method") == "SALARY" for p in payments) or (obj.payslip_id is not None)
+        if has_direct and has_salary:
+            return "Direct & Salary"
+        if has_direct:
+            return "Direct Payment"
+        if has_salary:
+            return "Through Salary"
+        m = detail.get("payment_method")
+        if m == "DIRECT":
+            return "Direct Payment"
+        if m == "SALARY":
+            return "Through Salary"
+        if m == "MIXED":
+            return "Direct & Salary"
+        return "-"
+
+    def get_paymentMethod(self, obj):
+        return self.get_payment_method(obj)
+
+    def get_remaining_balance(self, obj):
+        approved = max(ZERO, D(obj.incentive_amount or 0) - D(obj.hold_amount or 0))
+        remaining = max(ZERO, approved - D(obj.paid_amount or 0))
+        return self._money(remaining)
+
+    def get_remainingBalance(self, obj):
+        return self.get_remaining_balance(obj)
+
+    def get_payment_history(self, obj):
+        detail = obj.detail or {}
+        payments = list(detail.get("payments", []))
+        approved = max(ZERO, D(obj.incentive_amount or 0) - D(obj.hold_amount or 0))
+        if not payments and D(obj.paid_amount or 0) > ZERO:
+            payments = [{
+                "id": f"leg-{obj.id}",
+                "salesperson": obj.employee.name if obj.employee else "-",
+                "salespersonCode": getattr(obj.employee, "employee_code", ""),
+                "incentivePeriod": obj.period_label,
+                "approvedIncentive": self._money(approved),
+                "paymentMethod": "Through Salary" if obj.payslip_id else "Direct Payment",
+                "paymentDate": obj.paid_at.strftime("%Y-%m-%d") if obj.paid_at else str(timezone.localdate()),
+                "amountPaid": self._money(obj.paid_amount),
+                "remainingBalance": self._money(max(ZERO, approved - D(obj.paid_amount))),
+                "paymentReference": (obj.journal_entry.entry_number if obj.journal_entry else "DIRECT-PAY"),
+                "payrollReference": (f"{obj.employee.employee_code} - {obj.payslip.period_month.strftime('%b %Y')}" if obj.payslip else None),
+                "accountName": "Bank / Cash",
+                "paymentStatus": "Paid",
+                "createdAt": obj.paid_at.isoformat() if obj.paid_at else timezone.now().isoformat(),
+            }]
+        formatted = []
+        for p in payments:
+            formatted.append({
+                "id": p.get("id"),
+                "salesperson": obj.employee.name if obj.employee else "-",
+                "salespersonCode": getattr(obj.employee, "employee_code", ""),
+                "incentivePeriod": obj.period_label,
+                "approvedIncentive": self._money(approved),
+                "paymentMethod": "Direct Payment" if p.get("method") == "DIRECT" else "Through Salary" if p.get("method") == "SALARY" else p.get("paymentMethod", "-"),
+                "paymentDate": p.get("paymentDate"),
+                "amountPaid": self._money(p.get("amount") or p.get("amountPaid")),
+                "remainingBalance": self._money(p.get("remainingBalance", 0)),
+                "paymentReference": p.get("paymentReference") or "-",
+                "payrollReference": p.get("payrollReference") or "-",
+                "accountName": p.get("accountName") or "-",
+                "paymentStatus": p.get("status") or p.get("paymentStatus") or "Paid",
+                "createdAt": p.get("createdAt"),
+            })
+        return formatted
+
+    def get_paymentHistory(self, obj):
+        return self.get_payment_history(obj)
 
     def get_gross_sales(self, obj):
         return self._money(D(obj.net_sales or 0) + D(obj.returns_total or 0))
