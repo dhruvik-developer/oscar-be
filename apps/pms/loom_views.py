@@ -404,15 +404,18 @@ class DailyLoomProductionViewSet(TenantModelViewSet):
         machines = LoomMachine.objects.filter(factory=factory, is_active=True, deleted_at__isnull=True).order_by("no")
         rows = []
         for m in machines:
-            beam = LoomBeam.objects.filter(machine=m, status="On loom", deleted_at__isnull=True).first()
+            active_beam = LoomBeam.objects.filter(machine=m, status="On loom", deleted_at__isnull=True).first()
             prod = DailyLoomProduction.objects.filter(machine=m, date=dt_str, deleted_at__isnull=True).first()
+            beam = active_beam or (prod.beam if prod and prod.beam else None)
             rem = float(beam.length) - float(DailyLoomProduction.objects.filter(beam=beam, deleted_at__isnull=True).aggregate(s=Sum("meters"))["s"] or 0) if beam else 0.0
+            has_beam = bool(active_beam or (prod and prod.beam))
             rows.append({
                 "machine_id": str(m.id),
                 "machine_no": m.no,
-                "has_beam": bool(beam),
+                "has_beam": has_beam,
                 "beam_id": str(beam.id) if beam else None,
                 "beam_no": beam.beam_no if beam else "",
+                "beam_status": beam.status if beam else None,
                 "quality_name": beam.quality.name if beam else "",
                 "rem_m": round(rem, 1),
                 "meters": float(prod.meters) if prod else None,
@@ -475,6 +478,16 @@ class DailyLoomProductionViewSet(TenantModelViewSet):
                     active_beam = LoomBeam.objects.filter(machine_id=machine_id, status="On loom", deleted_at__isnull=True).first()
                     if active_beam:
                         beam_id = active_beam.id
+                    else:
+                        existing_prod = DailyLoomProduction.objects.filter(
+                            client_id=client_id,
+                            factory_id=factory_id,
+                            machine_id=machine_id,
+                            date=dt_str,
+                            deleted_at__isnull=True,
+                        ).first()
+                        if existing_prod and existing_prod.beam_id:
+                            beam_id = existing_prod.beam_id
                 if not beam_id:
                     raise ValidationFailed(
                         f"Machine {machine_id} has no active beam assigned.",

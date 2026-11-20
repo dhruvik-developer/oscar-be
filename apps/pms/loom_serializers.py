@@ -431,13 +431,22 @@ class LoomMachineBatchCreateSerializer(serializers.Serializer):
 
 class DailyLoomProductionBulkSaveRowSerializer(serializers.Serializer):
     machine_id = serializers.UUIDField()
-    beam_id = serializers.UUIDField(required=False, allow_null=True)
+    beam_id = serializers.CharField(required=False, allow_null=True, allow_blank=True)
     meters = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
     rpm = serializers.DecimalField(max_digits=8, decimal_places=2, required=False, default=650)
     hours = serializers.DecimalField(max_digits=5, decimal_places=2, required=False, default=22)
     stop = serializers.DecimalField(max_digits=5, decimal_places=2, required=False, default=0)
     reason = serializers.CharField(required=False, allow_blank=True, default="")
     damage = serializers.DecimalField(max_digits=8, decimal_places=2, required=False, default=0)
+
+    def validate_beam_id(self, value):
+        if not value or str(value).strip() == "" or str(value).lower() in ("null", "none"):
+            return None
+        import uuid
+        try:
+            return uuid.UUID(str(value))
+        except (ValueError, AttributeError):
+            raise serializers.ValidationError("Must be a valid UUID.")
 
 
 class DailyLoomProductionBulkSaveSerializer(serializers.Serializer):
