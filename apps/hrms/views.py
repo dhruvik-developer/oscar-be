@@ -3116,6 +3116,7 @@ class LeaveEncashmentViewSet(TenantModelViewSet):
 
 class PayslipViewSet(TenantModelViewSet):
 
+
     def get_object(self):
         lookup_url_kwarg = self.lookup_url_kwarg or self.lookup_field
         pk = self.kwargs.get(lookup_url_kwarg)
@@ -6322,21 +6323,20 @@ class SalespersonIncentiveViewSet(TenantModelViewSet):
     permission_classes = [HasModulePermission]
 
     permission_map = {
-
         "read": ["view_staff"],
-
         "write": ["edit_staff"],
-
         "approve": ["approve_payroll"],
-
         "calculate_quarterly": ["edit_staff"],
-
         "hold_payout": ["approve_payroll"],
-
         "release_payout": ["approve_payroll"],
-
         "mark_paid": ["approve_payroll"],
-
+        "pay_direct": ["approve_payroll"],
+        "pay_salary": ["approve_payroll"],
+        "payment_history": ["view_staff"],
+        "reverse": ["approve_payroll"],
+        "salesperson_performance": ["view_staff"],
+        "dashboard_summary": ["view_staff"],
+        "salesperson_detail": ["view_staff"],
     }
 
 
@@ -6456,14 +6456,21 @@ class SalespersonIncentiveViewSet(TenantModelViewSet):
 
         # would otherwise hand every employee the whole company's sales.
 
-        invoices = SalesInvoice.objects.filter(
+        from apps.sales import services as sales_services
 
+        # Ensure all invoices in period inherit salesperson from upstream lead/order (Requirement §4)
+        for unassigned in SalesInvoice.objects.filter(
             client_id=request.client_id,
-
             doc_date__range=[start_date, end_date],
-
             deleted_at__isnull=True,
+            salesperson_fk__isnull=True,
+        ).exclude(status__in=["Draft", "Cancelled"]):
+            sales_services.fill_salesperson(unassigned)
 
+        invoices = SalesInvoice.objects.filter(
+            client_id=request.client_id,
+            doc_date__range=[start_date, end_date],
+            deleted_at__isnull=True,
         ).exclude(status__in=["Draft", "Cancelled"])
 
         tagged_ids = set(
@@ -6606,87 +6613,789 @@ class SalespersonIncentiveViewSet(TenantModelViewSet):
 
 
 
-    @action(detail=True, methods=["POST"], url_path="mark-paid")
-
+    @action(detail=True, methods=["POST"], url_path="pay-direct")
     @transaction.atomic
-
-    def mark_paid(self, request, pk=None):
-
-        """Pay outside payroll (letter pad §12): post the accrual if needed,
-
-        then Dr Incentive Payable / Cr Bank (or Cash when no bank is given)."""
-
+    def pay_direct(self, request, pk=None):
+        """Option A - Direct Payment: Pay approved incentive directly from Cash/Bank ledger."""
+        import uuid
+        from datetime import datetime
         from types import SimpleNamespace
-
-
-
         from apps.accounting import services as ledger
-
         from apps.accounting.models import BankAccount
-
         from apps.pms import production_services
-
-
+        from apps.core.exceptions import BusinessRuleViolation, ValidationFailed
+        from apps.core.money import D, round2, ZERO
 
         calc = self._calc()
-
-        if calc.status == "Paid":
-
-            return Response(self.get_serializer(calc).data)
-
-        if calc.status == "Calculated":
-
+        if calc.status == "Reversed":
+            raise ValidationFailed("Cannot pay a reversed incentive.")
+        if (calc.detail or {}).get("managementHold"):
+            raise ValidationFailed("This incentive is currently on hold. Release the hold first.")
+        if calc.status not in ("Approved", "Posted"):
             raise ValidationFailed(
-
-                "Approve the incentive before marking it paid.",
-
-                field_errors={"status": ["Must be Approved."]},
-
+                "Only Approved incentives can be paid.", field_errors={"status": ["Must be Approved."]}
             )
 
-        if calc.status == "Approved":
+        approved_amount = round2(D(calc.incentive_amount or 0) - D(calc.hold_amount or 0))
+        remaining_balance = round2(approved_amount - D(calc.paid_amount or 0))
+        if remaining_balance <= ZERO:
+            raise ValidationFailed("This incentive is already fully paid.")
 
+        # Payment date
+        raw_date = request.data.get("paymentDate")
+        try:
+            payment_date = datetime.strptime(str(raw_date)[:10], "%Y-%m-%d").date() if raw_date else timezone.localdate()
+        except Exception:
+            payment_date = timezone.localdate()
+
+        raw_amt = request.data.get("amount")
+        pay_amount = round2(D(raw_amt)) if raw_amt not in (None, "") else remaining_balance
+        if pay_amount <= ZERO:
+            raise ValidationFailed("Payment amount must be greater than zero.", field_errors={"amount": ["Must be > 0."]})
+        if pay_amount > remaining_balance:
+            raise ValidationFailed(
+                f"Payment amount (Rs. {pay_amount}) cannot exceed remaining balance (Rs. {remaining_balance}).",
+                field_errors={"amount": [f"Maximum Rs. {remaining_balance}."]},
+            )
+
+        # Bank / cash account
+        bank_account = None
+        bank_account_id = request.data.get("bankAccountId")
+        if bank_account_id:
+            bank_account = BankAccount.objects.filter(
+                id=bank_account_id, client_id=calc.client_id, deleted_at__isnull=True
+            ).first()
+        if bank_account is None:
+            bank_account = BankAccount.objects.filter(
+                client_id=calc.client_id, is_default=True, deleted_at__isnull=True
+            ).first()
+        if bank_account is None:
+            bank_account = SimpleNamespace(
+                id=None,
+                name="Cash Account",
+                account=ledger.system_account(calc.client_id, "cash"),
+            )
+
+        # Ensure accrual entry is posted to ledger
+        if calc.journal_entry is None:
             calc = production_services.post_incentive(calc, user=request.user)
 
+        # Accounting Ledger Entry: Dr Incentive Payable / Cr Bank or Cash
+        payable_acc = production_services._incentive_payable_account(calc)
+        bank_ledger_acc = bank_account.account if getattr(bank_account, "account", None) else ledger.system_account(calc.client_id, "cash")
+        payment_ref = request.data.get("paymentReference") or f"TXN-{uuid.uuid4().hex[:8].upper()}"
 
-
-        bank_account = None
-
-        bank_account_id = request.data.get("bankAccountId")
-
-        if bank_account_id:
-
-            bank_account = BankAccount.objects.filter(
-
-                id=bank_account_id, client_id=request.client_id, deleted_at__isnull=True
-
-            ).first()
-
-        if bank_account is None:
-
-            bank_account = SimpleNamespace(
-
-                account=ledger.system_account(calc.client_id, "cash")
-
-            )
-
-        if D(calc.incentive_amount) - D(calc.hold_amount) - D(calc.paid_amount) <= ZERO:
-
-            raise ValidationFailed(
-
-                "Nothing is payable yet: the incentive is held until the customer pays.",
-
-                field_errors={"holdAmount": ["Fully held."]},
-
-            )
-
-        calc = production_services.pay_incentive(
-
-            calc, bank_account=bank_account, user=request.user
-
+        payment_entry = ledger.post_entry(
+            client=calc.client,
+            postings=[
+                ledger.debit(
+                    payable_acc,
+                    pay_amount,
+                    description=f"Incentive payout {calc.calc_number} - {calc.employee.name}",
+                ),
+                ledger.credit(
+                    bank_ledger_acc,
+                    pay_amount,
+                    description=f"Direct payment {payment_ref} for {calc.calc_number}",
+                ),
+            ],
+            entry_date=payment_date,
+            narration=f"Direct payout for sales incentive {calc.calc_number} ({calc.period_label}) - Ref: {payment_ref}",
+            source_document_type="IncentivePayout",
+            source_document_id=calc.id,
+            user=request.user,
         )
 
+        calc.paid_amount = round2(D(calc.paid_amount or 0) + pay_amount)
+        if calc.paid_amount >= approved_amount:
+            calc.status = "Paid"
+        else:
+            calc.status = "Posted"
+        calc.paid_at = timezone.now()
+
+        # Update detail payment history
+        detail = calc.detail or {}
+        payments = list(detail.get("payments", []))
+        new_balance = round2(approved_amount - calc.paid_amount)
+        payment_rec = {
+            "id": str(uuid.uuid4()),
+            "method": "DIRECT",
+            "paymentMethod": "Direct Payment",
+            "paymentDate": str(payment_date),
+            "amount": float(pay_amount),
+            "remainingBalance": float(new_balance),
+            "paymentReference": payment_ref,
+            "payrollReference": None,
+            "accountName": getattr(bank_account, "name", "Cash Account"),
+            "accountId": str(getattr(bank_account, "id", None)) if getattr(bank_account, "id", None) else None,
+            "status": "Paid",
+            "journalEntryId": str(payment_entry.id) if payment_entry else None,
+            "createdAt": timezone.now().isoformat(),
+            "notes": request.data.get("notes") or "",
+        }
+        payments.append(payment_rec)
+        detail["payments"] = payments
+        has_salary = any(p.get("method") == "SALARY" for p in payments)
+        detail["payment_method"] = "MIXED" if has_salary else "DIRECT"
+        calc.detail = detail
+        calc.save(update_fields=["status", "paid_amount", "paid_at", "detail", "updated_at"])
+
+        # Audit trail
+        production_services.record_audit(
+            client=calc.client_id,
+            actor=request.user,
+            action="incentive_direct_payment",
+            entity_type="IncentiveCalculation",
+            entity_id=calc.id,
+            entity_label=calc.calc_number,
+            description=f"Direct incentive payment of Rs. {pay_amount} posted via {getattr(bank_account, 'name', 'Cash')} (Ref: {payment_ref}). Remaining: Rs. {new_balance}.",
+            after={"paid_amount": float(calc.paid_amount), "status": calc.status},
+        )
         return Response(self.get_serializer(calc).data)
+
+    @action(detail=True, methods=["POST"], url_path="pay-salary")
+    @transaction.atomic
+    def pay_salary(self, request, pk=None):
+        """Option B - Pay Through Salary: Queue approved incentive into salesperson's next payroll."""
+        import uuid
+        from datetime import datetime, date
+        from apps.hrms.models import PayrollRun, Payslip, PayslipComponent
+        from apps.hrms import services as hrms_services
+        from apps.pms import production_services
+        from apps.core.money import D, round2, ZERO
+
+        calc = self._calc()
+        if calc.status == "Reversed":
+            raise ValidationFailed("Cannot pay a reversed incentive.")
+        if (calc.detail or {}).get("managementHold"):
+            raise ValidationFailed("This incentive is currently on hold. Release the hold first.")
+        if calc.status not in ("Approved", "Posted"):
+            raise ValidationFailed(
+                "Only Approved incentives can be paid through salary.",
+                field_errors={"status": ["Must be Approved."]},
+            )
+
+        approved_amount = round2(D(calc.incentive_amount or 0) - D(calc.hold_amount or 0))
+        remaining_balance = round2(approved_amount - D(calc.paid_amount or 0))
+        if remaining_balance <= ZERO:
+            raise ValidationFailed("This incentive is already fully paid.")
+
+        raw_amt = request.data.get("amount")
+        salary_amount = round2(D(raw_amt)) if raw_amt not in (None, "") else remaining_balance
+        if salary_amount <= ZERO:
+            raise ValidationFailed("Salary incentive amount must be greater than zero.")
+        if salary_amount > remaining_balance:
+            raise ValidationFailed(
+                f"Amount (Rs. {salary_amount}) cannot exceed remaining balance (Rs. {remaining_balance}).",
+                field_errors={"amount": [f"Maximum Rs. {remaining_balance}."]},
+            )
+
+        # Target payroll period
+        raw_month = request.data.get("month")
+        target_month = None
+        if raw_month:
+            try:
+                target_month = datetime.strptime(str(raw_month)[:7], "%Y-%m").date().replace(day=1)
+            except Exception:
+                target_month = None
+        if not target_month:
+            today = timezone.localdate()
+            target_month = today.replace(day=1)
+
+        # Check if target month's payroll is already paid/settled
+        existing_run = PayrollRun.objects.filter(client=calc.client, period_month=target_month).first()
+        if existing_run and existing_run.status in ("Paid", "Approved"):
+            if target_month.month == 12:
+                target_month = date(target_month.year + 1, 1, 1)
+            else:
+                target_month = date(target_month.year, target_month.month + 1, 1)
+
+        # Find or create payslip for target_month
+        payslip = Payslip.objects.filter(
+            client=calc.client, employee=calc.employee, period_month=target_month, deleted_at__isnull=True
+        ).first()
+
+        if payslip is None:
+            try:
+                hrms_services.process_payroll(
+                    client=calc.client, period_month=target_month, employee_ids=[calc.employee.id], user=request.user
+                )
+                payslip = Payslip.objects.filter(
+                    client=calc.client, employee=calc.employee, period_month=target_month, deleted_at__isnull=True
+                ).first()
+            except Exception:
+                pass
+
+        if payslip is None:
+            run, _ = PayrollRun.objects.get_or_create(
+                client=calc.client,
+                period_month=target_month,
+                defaults={"status": "In Progress", "processed_at": timezone.now(), "created_by": request.user},
+            )
+            std_sal = calc.employee.standard_salary or Decimal("0.00")
+            payslip = Payslip.objects.create(
+                client=calc.client,
+                payroll_run=run,
+                employee=calc.employee,
+                period_month=target_month,
+                standard_salary=std_sal,
+                attended_days=30,
+                total_days=30,
+                earned_salary=std_sal,
+                basic=std_sal * Decimal("0.5"),
+                hra=std_sal * Decimal("0.3"),
+                allowances=std_sal * Decimal("0.2"),
+                additional_earnings=Decimal("0.00"),
+                deductions=Decimal("0.00"),
+                net_payable=std_sal,
+                status="In Progress",
+            )
+
+        # Check for existing Sales Incentive component
+        existing_comp = PayslipComponent.objects.filter(
+            payslip=payslip, name__icontains="Sales Incentive", kind="earning"
+        ).first()
+
+        if existing_comp:
+            diff = salary_amount - round2(D(existing_comp.amount))
+            if diff != ZERO:
+                existing_comp.amount = salary_amount
+                existing_comp.save(update_fields=["amount", "updated_at"])
+                payslip.additional_earnings = round2(D(payslip.additional_earnings or 0) + diff)
+                payslip.net_payable = round2(D(payslip.net_payable or 0) + diff)
+                payslip.save(update_fields=["additional_earnings", "net_payable", "updated_at"])
+        else:
+            PayslipComponent.objects.create(
+                client=calc.client,
+                payslip=payslip,
+                name="Sales Incentive",
+                amount=salary_amount,
+                kind="earning",
+            )
+            payslip.additional_earnings = round2(D(payslip.additional_earnings or 0) + salary_amount)
+            payslip.net_payable = round2(D(payslip.net_payable or 0) + salary_amount)
+            payslip.save(update_fields=["additional_earnings", "net_payable", "updated_at"])
+
+        # Link to calculation
+        calc.payslip = payslip
+        calc.payroll_run = payslip.payroll_run
+        detail = calc.detail or {}
+        detail["queued_salary_amount"] = float(salary_amount)
+        detail["queued_payroll_period"] = target_month.strftime("%Y-%m")
+
+        payments = list(detail.get("payments", []))
+        pending_id = f"sal-{calc.id}-{target_month.strftime('%Y%m')}"
+        payments = [p for p in payments if p.get("id") != pending_id and p.get("status") != "Pending Payroll"]
+        payments.append({
+            "id": pending_id,
+            "method": "SALARY",
+            "paymentMethod": "Through Salary",
+            "paymentDate": str(target_month),
+            "amount": float(salary_amount),
+            "remainingBalance": float(round2(remaining_balance - salary_amount)),
+            "paymentReference": f"Queued in {target_month.strftime('%b %Y')} Payroll",
+            "payrollReference": f"{calc.employee.employee_code} - {target_month.strftime('%B %Y')} ({payslip.status})",
+            "status": "Pending Payroll",
+            "createdAt": timezone.now().isoformat(),
+        })
+        detail["payments"] = payments
+        has_direct = any(p.get("method") == "DIRECT" for p in payments if p.get("status") == "Paid")
+        detail["payment_method"] = "MIXED" if has_direct else "SALARY"
+        calc.detail = detail
+        calc.save(update_fields=["payslip", "payroll_run", "detail", "updated_at"])
+
+        production_services.record_audit(
+            client=calc.client_id,
+            actor=request.user,
+            action="incentive_queued_in_salary",
+            entity_type="IncentiveCalculation",
+            entity_id=calc.id,
+            entity_label=calc.calc_number,
+            description=f"Incentive Rs. {salary_amount} linked to {target_month.strftime('%B %Y')} payroll (Payslip {payslip.id}). Will be marked Paid upon payroll payment.",
+            after={"payroll_run_id": str(payslip.payroll_run_id), "payslip_id": str(payslip.id)},
+        )
+        return Response(self.get_serializer(calc).data)
+
+    @action(detail=False, methods=["GET"], url_path="payment-history")
+    def payment_history(self, request):
+        """Aggregate payment history records across all salesperson incentives (Requirement §3)."""
+        from apps.pms.models import IncentiveCalculation
+        from apps.core.money import D, round2, ZERO
+
+        calcs = IncentiveCalculation.objects.filter(
+            client_id=self.get_client_id()
+        ).select_related("employee", "payslip", "journal_entry").order_by("-updated_at")
+
+        method_filter = request.query_params.get("method")
+        status_filter = request.query_params.get("status")
+        search_filter = (request.query_params.get("search") or "").strip().lower()
+
+        history_rows = []
+        for calc in calcs:
+            detail = calc.detail or {}
+            payments = list(detail.get("payments", []))
+            approved = round2(D(calc.incentive_amount or 0) - D(calc.hold_amount or 0))
+            if not payments and D(calc.paid_amount or 0) > ZERO:
+                payments = [{
+                    "id": f"leg-{calc.id}",
+                    "method": "SALARY" if calc.payslip_id else "DIRECT",
+                    "paymentMethod": "Through Salary" if calc.payslip_id else "Direct Payment",
+                    "paymentDate": calc.paid_at.strftime("%Y-%m-%d") if calc.paid_at else str(timezone.localdate()),
+                    "amount": float(calc.paid_amount),
+                    "remainingBalance": float(max(ZERO, approved - D(calc.paid_amount))),
+                    "paymentReference": (calc.journal_entry.entry_number if calc.journal_entry else "DIRECT-PAY"),
+                    "payrollReference": (f"{calc.employee.employee_code} - {calc.payslip.period_month.strftime('%b %Y')}" if calc.payslip else None),
+                    "accountName": "Bank / Cash",
+                    "status": "Paid",
+                    "createdAt": calc.paid_at.isoformat() if calc.paid_at else timezone.now().isoformat(),
+                }]
+
+            emp_name = calc.employee.name if calc.employee else "-"
+            emp_code = getattr(calc.employee, "employee_code", "")
+
+            for p in payments:
+                m = p.get("paymentMethod") or ("Direct Payment" if p.get("method") == "DIRECT" else "Through Salary")
+                st = p.get("status") or p.get("paymentStatus") or "Paid"
+                ref = p.get("paymentReference") or "-"
+                pref = p.get("payrollReference") or "-"
+
+                if method_filter:
+                    mf = method_filter.upper()
+                    if mf == "DIRECT" and "direct" not in m.lower():
+                        continue
+                    if mf == "SALARY" and "salary" not in m.lower():
+                        continue
+
+                if status_filter and status_filter.upper() != "ALL":
+                    if status_filter.upper() != st.upper() and status_filter.upper() != st.replace(" ", "_").upper():
+                        continue
+
+                if search_filter:
+                    haystack = f"{emp_name} {emp_code} {calc.period_label} {ref} {pref} {m} {st}".lower()
+                    if search_filter not in haystack:
+                        continue
+
+                history_rows.append({
+                    "id": p.get("id"),
+                    "incentiveId": str(calc.id),
+                    "salesperson": emp_name,
+                    "salespersonCode": emp_code,
+                    "salespersonId": str(calc.employee.id) if calc.employee else None,
+                    "incentivePeriod": calc.period_label,
+                    "approvedIncentive": float(approved),
+                    "paymentMethod": m,
+                    "paymentDate": p.get("paymentDate"),
+                    "amountPaid": float(p.get("amount") or p.get("amountPaid") or 0),
+                    "remainingBalance": float(p.get("remainingBalance", 0)),
+                    "paymentReference": ref,
+                    "payrollReference": pref,
+                    "accountName": p.get("accountName") or "-",
+                    "paymentStatus": st,
+                    "createdAt": p.get("createdAt"),
+                })
+
+        history_rows.sort(key=lambda r: (r.get("paymentDate") or "", r.get("createdAt") or ""), reverse=True)
+        return Response({"count": len(history_rows), "results": history_rows})
+
+    def _bank_account(self):
+        from apps.accounting.models import BankAccount
+        bank_account_id = self.request.data.get("bankAccountId")
+        if not bank_account_id:
+            return None
+        return BankAccount.objects.filter(
+            pk=bank_account_id, client_id=self.get_client_id(), deleted_at__isnull=True
+        ).first()
+
+    @action(detail=True, methods=["POST"], url_path="mark-paid")
+    def mark_paid(self, request, pk=None):
+        """PMS maturity-checked payout action (used by automated jobs and P12 tests)."""
+        from apps.pms import production_services
+        calc = self._calc()
+        calc = production_services.pay_incentive(
+            calc,
+            bank_account=self._bank_account(),
+            user=request.user,
+        )
+        return Response(self.get_serializer(calc).data)
+
+
+
+    @action(detail=True, methods=["POST"], url_path="reverse")
+    def reverse(self, request, pk=None):
+        """Controlled reversal process for calculated or approved incentive (Requirement §5 & §6)."""
+        from apps.pms import production_services
+        calc = self._calc()
+        calc = production_services.reverse_incentive(
+            calc, user=request.user, reason=request.data.get("reason") or "Management reversal"
+        )
+        return Response(self.get_serializer(calc).data)
+
+    @action(detail=False, methods=["GET"], url_path="salesperson-performance")
+    def salesperson_performance(self, request):
+        """Aggregate CRM lead metrics, eligible sales, and earned incentives for salespeople (Requirement §2)."""
+        import calendar
+        import re
+        import uuid
+        from apps.crm.models import Lead
+        from apps.hrms.models import Employee
+        from apps.pms.models import IncentiveCalculation
+        from apps.pms.production_services import sales_totals_for_period, round2, D, ZERO
+        from apps.sales.models import SalesInvoice
+        from apps.sales import services as sales_services
+
+        today = timezone.localdate()
+        fy_start = today.year if today.month >= 4 else today.year - 1
+
+        raw_q = str(request.query_params.get("quarter") or "")
+        match_q = re.search(r"[1-4]", raw_q)
+        quarter = int(match_q.group(0)) if match_q else (((today.month - 4) % 12) // 3 + 1)
+
+        raw_y = str(request.query_params.get("year") or "")
+        match_y = re.search(r"\d{4}", raw_y)
+        year = int(match_y.group(0)) if match_y else fy_start
+
+        start_month = 4 + (quarter - 1) * 3
+        cal_year = year + (start_month - 1) // 12
+        start_month = (start_month - 1) % 12 + 1
+        end_month = start_month + 2
+        start_date = datetime(cal_year, start_month, 1).date()
+        end_date = datetime(cal_year, end_month, calendar.monthrange(cal_year, end_month)[1]).date()
+        period_label = f"Q{quarter} FY{year}-{(year + 1) % 100:02d}"
+
+        client_id = request.client_id
+
+        # Backfill any invoice in the quarter whose salesperson_fk is missing
+        unassigned_invoices = SalesInvoice.objects.filter(
+            client_id=client_id,
+            doc_date__range=[start_date, end_date],
+            deleted_at__isnull=True,
+            salesperson_fk__isnull=True,
+        ).exclude(status__in=["Draft", "Cancelled"])
+        for inv in unassigned_invoices:
+            sales_services.fill_salesperson(inv)
+
+        tagged_emp_ids = set(
+            SalesInvoice.objects.filter(
+                client_id=client_id,
+                deleted_at__isnull=True,
+                salesperson_fk__isnull=False
+            ).values_list("salesperson_fk_id", flat=True)
+        )
+        lead_assigned_ids = set()
+        for sp_val in Lead.objects.filter(client_id=client_id, deleted_at__isnull=True).values_list("custom_values__salesperson_id", flat=True):
+            if sp_val:
+                try:
+                    lead_assigned_ids.add(uuid.UUID(str(sp_val)))
+                except (ValueError, TypeError):
+                    pass
+
+        owner_emp_ids = set(
+            Lead.objects.filter(
+                client_id=client_id,
+                deleted_at__isnull=True,
+                owner__employee__isnull=False
+            ).values_list("owner__employee_id", flat=True)
+        )
+
+        all_candidate_ids = tagged_emp_ids | lead_assigned_ids | owner_emp_ids
+
+        employees = Employee.objects.filter(client_id=client_id, status="Active").filter(
+            Q(id__in=all_candidate_ids) |
+            Q(department__name__icontains="sale") |
+            Q(designation__name__icontains="sale") |
+            Q(department__name__icontains="marketing")
+        ).select_related("department", "designation").order_by("name")
+
+        records = []
+        for emp in employees:
+            emp_leads = Lead.objects.filter(client_id=client_id, deleted_at__isnull=True).filter(
+                Q(custom_values__salesperson_id=str(emp.id)) |
+                Q(owner__employee=emp) |
+                Q(owner__name__iexact=emp.name)
+            )
+
+            assigned_leads = emp_leads.count()
+            converted_leads = emp_leads.filter(
+                Q(converted_at__isnull=False) |
+                Q(stage__name__in=["Won", "Converted", "Customer"]) |
+                Q(converted_deal__isnull=False)
+            ).count()
+            lost_leads = emp_leads.filter(
+                Q(stage__is_lost=True) |
+                Q(lost_reason__isnull=False)
+            ).count()
+            active_leads = max(0, assigned_leads - converted_leads - lost_leads)
+
+            totals = sales_totals_for_period(client_id, start_date, end_date, employee=emp)
+            gross_sales = float(totals["gross_sales"])
+            returns_amt = float(totals["returns"])
+            net_base = float(totals["net_sales"])
+
+            calcs = IncentiveCalculation.objects.filter(
+                client_id=client_id,
+                employee=emp,
+                period_label=period_label,
+                deleted_at__isnull=True
+            ).exclude(status="Reversed")
+
+            incentive_earned = float(sum((D(c.incentive_amount or 0) for c in calcs), ZERO))
+            incentive_paid = float(sum((D(c.paid_amount or 0) for c in calcs), ZERO))
+
+            if any(c.status == "Paid" for c in calcs):
+                status = "PAID"
+            elif any((c.detail or {}).get("managementHold") for c in calcs):
+                status = "HELD"
+            elif any(c.status in ("Approved", "Posted") for c in calcs):
+                status = "APPROVED"
+            elif calcs.exists():
+                status = "ACCRUED"
+            elif gross_sales > 0:
+                status = "PENDING_CALC"
+            else:
+                status = "ACTIVE"
+
+            records.append({
+                "id": str(emp.id),
+                "employeeId": str(emp.id),
+                "employeeCode": emp.employee_code or "—",
+                "employeeName": emp.name,
+                "department": emp.department.name if emp.department else "Sales",
+                "designation": emp.designation.name if emp.designation else "Sales Representative",
+                "assignedLeads": assigned_leads,
+                "activeLeads": active_leads,
+                "convertedLeads": converted_leads,
+                "lostLeads": lost_leads,
+                "grossEligibleSales": gross_sales,
+                "deductedReturns": returns_amt,
+                "netIncentiveBase": net_base,
+                "incentiveEarned": incentive_earned,
+                "incentivePaid": incentive_paid,
+                "status": status,
+                "hasCalculation": calcs.exists(),
+                "periodLabel": period_label,
+            })
+
+        records.sort(key=lambda r: (r["grossEligibleSales"], r["assignedLeads"]), reverse=True)
+
+        return Response({
+            "periodLabel": period_label,
+            "quarter": quarter,
+            "year": year,
+            "startDate": start_date.isoformat(),
+            "endDate": end_date.isoformat(),
+            "salespeople": records,
+        })
+
+    @action(detail=False, methods=["GET"], url_path="dashboard-summary")
+    def dashboard_summary(self, request):
+        """Dashboard KPI summary computed strictly from actual database records (Requirement §7)."""
+        import calendar
+        import re
+        from apps.pms.models import IncentiveCalculation
+        from apps.pms.production_services import sales_totals_for_period, round2, D, ZERO
+
+        today = timezone.localdate()
+        fy_start = today.year if today.month >= 4 else today.year - 1
+
+        raw_q = str(request.query_params.get("quarter") or "")
+        match_q = re.search(r"[1-4]", raw_q)
+        quarter = int(match_q.group(0)) if match_q else (((today.month - 4) % 12) // 3 + 1)
+
+        raw_y = str(request.query_params.get("year") or "")
+        match_y = re.search(r"\d{4}", raw_y)
+        year = int(match_y.group(0)) if match_y else fy_start
+
+        start_month = 4 + (quarter - 1) * 3
+        cal_year = year + (start_month - 1) // 12
+        start_month = (start_month - 1) % 12 + 1
+        end_month = start_month + 2
+        start_date = datetime(cal_year, start_month, 1).date()
+        end_date = datetime(cal_year, end_month, calendar.monthrange(cal_year, end_month)[1]).date()
+        period_label = f"Q{quarter} FY{year}-{(year + 1) % 100:02d}"
+
+        client_id = request.client_id
+        totals = sales_totals_for_period(client_id, start_date, end_date)
+        gross_sales = float(totals["gross_sales"])
+        returns = float(totals["returns"])
+        net_base = float(totals["net_sales"])
+
+        calcs = IncentiveCalculation.objects.filter(
+            client_id=client_id,
+            period_label=period_label,
+            deleted_at__isnull=True
+        ).exclude(status="Reversed")
+
+        if not calcs.exists():
+            active_calcs = IncentiveCalculation.objects.filter(
+                client_id=client_id,
+                deleted_at__isnull=True
+            ).exclude(status="Reversed")
+            calculated_accrual = float(sum((D(c.incentive_amount or 0) for c in active_calcs), ZERO))
+            disbursed_paid = float(sum((D(c.paid_amount or 0) for c in active_calcs), ZERO))
+        else:
+            calculated_accrual = float(sum((D(c.incentive_amount or 0) for c in calcs), ZERO))
+            disbursed_paid = float(sum((D(c.paid_amount or 0) for c in calcs), ZERO))
+
+        return Response({
+            "periodLabel": period_label,
+            "grossEligibleSales": gross_sales,
+            "deductedReturns": returns,
+            "netIncentiveBase": net_base,
+            "calculatedAccrual": calculated_accrual,
+            "disbursedPaid": disbursed_paid,
+        })
+
+    @action(detail=False, methods=["GET"], url_path="salesperson-detail")
+    def salesperson_detail(self, request):
+        """Detailed breakdown for a specific salesperson: leads, invoices, returns, calculations (Requirement §2)."""
+        import calendar
+        import re
+        from apps.crm.models import Lead
+        from apps.hrms.models import Employee
+        from apps.pms.models import IncentiveCalculation
+        from apps.pms.production_services import sales_totals_for_period
+        from apps.sales.models import SalesInvoice, SalesReturn
+
+        employee_id = request.query_params.get("employeeId") or request.query_params.get("id")
+        if not employee_id:
+            raise ValidationFailed("employeeId parameter is required.", field_errors={"employeeId": ["Required."]})
+
+        emp = Employee.objects.filter(client_id=request.client_id, pk=employee_id).select_related("department", "designation").first()
+        if not emp:
+            raise NotFound("Salesperson not found.")
+
+        today = timezone.localdate()
+        fy_start = today.year if today.month >= 4 else today.year - 1
+
+        raw_q = str(request.query_params.get("quarter") or "")
+        match_q = re.search(r"[1-4]", raw_q)
+        quarter = int(match_q.group(0)) if match_q else (((today.month - 4) % 12) // 3 + 1)
+
+        raw_y = str(request.query_params.get("year") or "")
+        match_y = re.search(r"\d{4}", raw_y)
+        year = int(match_y.group(0)) if match_y else fy_start
+
+        start_month = 4 + (quarter - 1) * 3
+        cal_year = year + (start_month - 1) // 12
+        start_month = (start_month - 1) % 12 + 1
+        end_month = start_month + 2
+        start_date = datetime(cal_year, start_month, 1).date()
+        end_date = datetime(cal_year, end_month, calendar.monthrange(cal_year, end_month)[1]).date()
+        period_label = f"Q{quarter} FY{year}-{(year + 1) % 100:02d}"
+
+        client_id = request.client_id
+
+        # Attributed CRM Leads
+        leads = Lead.objects.filter(client_id=client_id, deleted_at__isnull=True).filter(
+            Q(custom_values__salesperson_id=str(emp.id)) |
+            Q(owner__employee=emp) |
+            Q(owner__name__iexact=emp.name)
+        ).select_related("stage", "party", "owner").order_by("-created_at")
+
+        leads_data = []
+        assignment_history_log = []
+        for l in leads:
+            is_converted = bool(l.converted_at or (l.stage and l.stage.name in ("Won", "Converted", "Customer")) or l.converted_deal_id)
+            is_lost = bool((l.stage and l.stage.is_lost) or l.lost_reason_id)
+            status_label = "Converted" if is_converted else ("Lost" if is_lost else "Active")
+            leads_data.append({
+                "id": str(l.id),
+                "leadNumber": l.lead_number,
+                "name": l.name,
+                "company": l.company or "—",
+                "stage": l.stage.name if l.stage else "New",
+                "status": status_label,
+                "amount": float(l.amount or 0),
+                "createdOn": l.created_on.isoformat() if l.created_on else (l.created_at.strftime("%Y-%m-%d") if l.created_at else None),
+                "convertedAt": l.converted_at.isoformat() if l.converted_at else None,
+                "conversionReference": l.conversion_reference or None,
+            })
+            for h in (l.custom_values or {}).get("assignment_history") or []:
+                assignment_history_log.append({
+                    "leadNumber": l.lead_number,
+                    "leadName": l.name,
+                    **h
+                })
+
+        # Attributed Sales Invoices
+        invoices = SalesInvoice.objects.filter(
+            client_id=client_id,
+            deleted_at__isnull=True
+        ).filter(
+            Q(salesperson_fk=emp) |
+            Q(salesperson__iexact=emp.name) |
+            Q(salesperson__iexact=emp.employee_code or "")
+        ).select_related("party").order_by("-doc_date")
+
+        invoices_data = []
+        for inv in invoices:
+            invoices_data.append({
+                "id": str(inv.id),
+                "invoiceNumber": inv.invoice_number,
+                "docDate": inv.doc_date.isoformat() if inv.doc_date else None,
+                "partyName": inv.party.name if inv.party else (inv.party_name or "—"),
+                "total": float(inv.total or 0),
+                "taxableValue": float(inv.taxable_value or 0),
+                "amountPaid": float(inv.amount_paid or 0),
+                "status": inv.status,
+            })
+
+        # Attributed Sales Returns
+        returns = SalesReturn.objects.filter(
+            client_id=client_id,
+            deleted_at__isnull=True,
+            status="Posted"
+        ).filter(
+            Q(salesperson_fk=emp) |
+            Q(salesperson__iexact=emp.name) |
+            Q(sales_invoice__salesperson_fk=emp)
+        ).select_related("party", "sales_invoice").order_by("-doc_date")
+
+        returns_data = []
+        for ret in returns:
+            returns_data.append({
+                "id": str(ret.id),
+                "returnNumber": ret.return_number,
+                "docDate": ret.doc_date.isoformat() if ret.doc_date else None,
+                "invoiceNumber": ret.sales_invoice.invoice_number if ret.sales_invoice else (ret.invoice_number or "—"),
+                "total": float(ret.total or 0),
+                "status": ret.status,
+            })
+
+        # Calculations
+        calcs = IncentiveCalculation.objects.filter(
+            client_id=client_id,
+            employee=emp,
+            deleted_at__isnull=True
+        ).select_related("scheme").order_by("-created_at")
+
+        accruals_data = [self.get_serializer(c).data for c in calcs]
+        totals = sales_totals_for_period(client_id, start_date, end_date, employee=emp)
+
+        return Response({
+            "salesperson": {
+                "id": str(emp.id),
+                "name": emp.name,
+                "employeeCode": emp.employee_code or "—",
+                "department": emp.department.name if emp.department else "Sales",
+                "designation": emp.designation.name if emp.designation else "Sales Representative",
+            },
+            "period": {
+                "periodLabel": period_label,
+                "quarter": quarter,
+                "year": year,
+                "startDate": start_date.isoformat(),
+                "endDate": end_date.isoformat(),
+                "grossSales": float(totals["gross_sales"]),
+                "returns": float(totals["returns"]),
+                "netSales": float(totals["net_sales"]),
+            },
+            "leads": leads_data,
+            "invoices": invoices_data,
+            "returns": returns_data,
+            "accruals": accruals_data,
+            "assignmentHistory": assignment_history_log,
+        })
 
 
 

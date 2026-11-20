@@ -11,6 +11,7 @@ Lead stages are **data, not an enum** -- they are tenant-configurable through
 so they are persisted.
 """
 from django.db import models
+from django.utils import timezone
 
 from apps.core.models import LegacyIdMixin, TenantModel
 
@@ -218,6 +219,57 @@ class Lead(TenantModel, LegacyIdMixin):
 
     def save(self, *args, **kwargs):
         self.custom_values = lift_attribution(self.custom_values)
+        if not isinstance(self.custom_values, dict):
+            self.custom_values = {}
+
+        # Track salesperson assignment & reassignment history (Requirement §1)
+        new_sp_id = self.custom_values.get("salesperson_id")
+        new_sp_name = self.custom_values.get("salesperson_name")
+        history = list(self.custom_values.get("assignment_history") or [])
+
+        is_new = self._state.adding or not Lead.objects.filter(pk=self.pk).exists()
+        if not is_new:
+            old_lead = Lead.objects.filter(pk=self.pk).values("custom_values").first()
+            if old_lead:
+                old_cv = old_lead.get("custom_values") or {}
+                old_sp_id = old_cv.get("salesperson_id")
+                old_sp_name = old_cv.get("salesperson_name")
+
+                if old_sp_id and new_sp_id and str(old_sp_id) != str(new_sp_id):
+                    history.append({
+                        "event": "reassigned",
+                        "previous_salesperson_id": str(old_sp_id),
+                        "previous_salesperson_name": old_sp_name or "",
+                        "new_salesperson_id": str(new_sp_id),
+                        "new_salesperson_name": new_sp_name or "",
+                        "assigned_at": timezone.now().isoformat(),
+                        "assigned_by": getattr(self.updated_by, "name", None) or (str(self.updated_by.id) if self.updated_by else "system"),
+                    })
+                    self.custom_values["assignment_history"] = history
+                elif not old_sp_id and new_sp_id:
+                    history.append({
+                        "event": "assigned",
+                        "previous_salesperson_id": None,
+                        "previous_salesperson_name": None,
+                        "new_salesperson_id": str(new_sp_id),
+                        "new_salesperson_name": new_sp_name or "",
+                        "assigned_at": timezone.now().isoformat(),
+                        "assigned_by": getattr(self.updated_by, "name", None) or (str(self.updated_by.id) if self.updated_by else "system"),
+                    })
+                    self.custom_values["assignment_history"] = history
+        else:
+            if new_sp_id and not history:
+                history.append({
+                    "event": "initial_assignment",
+                    "previous_salesperson_id": None,
+                    "previous_salesperson_name": None,
+                    "new_salesperson_id": str(new_sp_id),
+                    "new_salesperson_name": new_sp_name or "",
+                    "assigned_at": timezone.now().isoformat(),
+                    "assigned_by": getattr(self.created_by, "name", None) or (str(self.created_by.id) if self.created_by else "system"),
+                })
+                self.custom_values["assignment_history"] = history
+
         super().save(*args, **kwargs)
 
 

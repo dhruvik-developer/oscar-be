@@ -1855,6 +1855,25 @@ def reverse_incentive(calc, *, user=None, reason=None):
         source_document_id=calc.id,
         user=user,
     )
+    ledger.reverse_document_entries(
+        client_id=calc.client_id,
+        source_document_type="IncentivePayout",
+        source_document_id=calc.id,
+        user=user,
+    )
+    if calc.payslip and calc.payslip.status != "Paid":
+        try:
+            comp = calc.payslip.components.filter(name__icontains="Sales Incentive", kind="earning").first()
+            if comp:
+                comp_amt = comp.amount
+                comp.delete()
+                calc.payslip.additional_earnings = max(ZERO, round2(D(calc.payslip.additional_earnings or 0) - D(comp_amt)))
+                calc.payslip.net_payable = max(ZERO, round2(D(calc.payslip.net_payable or 0) - D(comp_amt)))
+                calc.payslip.save(update_fields=["additional_earnings", "net_payable", "updated_at"])
+            calc.payslip = None
+            calc.payroll_run = None
+        except Exception:
+            pass
     before = {"status": calc.status}
     calc.status = "Reversed"
     calc.reversed_at = timezone.now()

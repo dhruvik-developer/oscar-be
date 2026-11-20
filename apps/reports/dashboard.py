@@ -574,36 +574,56 @@ def _attention(client_id, day, production, qc):
 # ---------------------------------------------------------------------------
 def _resolve_period_bounds(day, period="mtd"):
     """Returns (start_date, end_date, prev_start, prev_end, label, prev_label)."""
+    today = timezone.localdate()
     period = (period or "mtd").lower()
-    if period == "today":
+    if period in ("today", "day", "date"):
         start = day
         end = day
         prev_start = day - timedelta(days=1)
         prev_end = prev_start
-        label = "Today"
-        prev_label = "vs yesterday"
-    elif period == "fytd":
+        if day == today:
+            label = "Today"
+            prev_label = "vs yesterday"
+        else:
+            label = day.strftime("%d %b %Y")
+            prev_label = f"vs {prev_start.strftime('%d %b')}"
+    elif period in ("fytd", "year", "fy"):
         fy_year = day.year if day.month >= 4 else day.year - 1
+        current_fy = today.year if today.month >= 4 else today.year - 1
         start = date(fy_year, 4, 1)
-        end = day
         prev_start = date(fy_year - 1, 4, 1)
-        try:
-            prev_end = date(fy_year - 1, day.month, day.day)
-        except ValueError:
-            prev_end = date(fy_year - 1, day.month, 28)
-        label = f"FYTD {fy_year}-{str(fy_year + 1)[-2:]}"
-        prev_label = f"vs FY {fy_year - 1}"
+        if fy_year == current_fy:
+            end = day
+            try:
+                prev_end = date(fy_year - 1, day.month, day.day)
+            except ValueError:
+                prev_end = date(fy_year - 1, day.month, 28)
+            label = f"FYTD {fy_year}-{str(fy_year + 1)[-2:]}"
+            prev_label = f"vs FY {fy_year - 1}"
+        else:
+            end = date(fy_year + 1, 3, 31)
+            prev_end = date(fy_year, 3, 31)
+            label = f"FY {fy_year}-{str(fy_year + 1)[-2:]}"
+            prev_label = f"vs FY {fy_year - 1}-{str(fy_year)[-2:]}"
     else:  # default 'mtd'
         start = day.replace(day=1)
-        end = day
         prev_month_last = start - timedelta(days=1)
         prev_start = prev_month_last.replace(day=1)
-        try:
-            prev_end = prev_start.replace(day=min(day.day, prev_month_last.day))
-        except ValueError:
+        if day.year == today.year and day.month == today.month:
+            end = day
+            try:
+                prev_end = prev_start.replace(day=min(day.day, prev_month_last.day))
+            except ValueError:
+                prev_end = prev_month_last
+            label = f"{day.strftime('%b %Y')} (MTD)"
+            prev_label = f"vs {prev_start.strftime('%b')}"
+        else:
+            import calendar
+            _, last_day = calendar.monthrange(day.year, day.month)
+            end = date(day.year, day.month, last_day)
             prev_end = prev_month_last
-        label = f"{day.strftime('%b %Y')} (MTD)"
-        prev_label = f"vs {prev_start.strftime('%b')}"
+            label = day.strftime("%b %Y")
+            prev_label = f"vs {prev_start.strftime('%b %Y')}"
     return start, end, prev_start, prev_end, label, prev_label
 
 
@@ -731,6 +751,16 @@ def business_dashboard(client_id, *, day=None, period="mtd", chart_range="7d", i
     # -----------------------------------------------------------------------
     p_start, p_end, prev_start, prev_end, period_label, prev_comp_label = _resolve_period_bounds(day, period)
 
+    # Period title suffix for top KPI cards
+    if period in ("today", "day", "date"):
+        period_title = "Today" if day == today else day.strftime("%d %b")
+    elif period in ("fytd", "year", "fy"):
+        fy_year_kpi = day.year if day.month >= 4 else day.year - 1
+        cur_fy_kpi = today.year if today.month >= 4 else today.year - 1
+        period_title = f"FYTD {fy_year_kpi}-{str(fy_year_kpi + 1)[-2:]}" if fy_year_kpi == cur_fy_kpi else f"FY {fy_year_kpi}-{str(fy_year_kpi + 1)[-2:]}"
+    else:
+        period_title = "MTD" if (day.year == today.year and day.month == today.month) else day.strftime("%b %Y")
+
     # 1. Top 6 Financial KPIs
     cur_sales = _sum_posted_sales(client_id, p_start, p_end)
     prev_sales = _sum_posted_sales(client_id, prev_start, prev_end)
@@ -768,7 +798,7 @@ def business_dashboard(client_id, *, day=None, period="mtd", chart_range="7d", i
     top_kpi_cards = [
         {
             "id": "sales",
-            "title": f"Sales ({period.upper() if period != 'today' else 'Today'})",
+            "title": f"Sales ({period_title})",
             "value": cur_sales,
             "previousValue": prev_sales,
             "diffPct": sales_diff_pct,
@@ -777,7 +807,7 @@ def business_dashboard(client_id, *, day=None, period="mtd", chart_range="7d", i
         },
         {
             "id": "collection",
-            "title": f"Collection ({period.upper() if period != 'today' else 'Today'})",
+            "title": f"Collection ({period_title})",
             "value": cur_coll,
             "previousValue": prev_coll,
             "diffPct": coll_diff_pct,
@@ -795,7 +825,7 @@ def business_dashboard(client_id, *, day=None, period="mtd", chart_range="7d", i
         },
         {
             "id": "netProfit",
-            "title": f"Net Profit ({period.upper() if period != 'today' else 'Today'})",
+            "title": f"Net Profit ({period_title})",
             "value": np_cur if np_cur != ZERO else Decimal("236500.00"),
             "previousValue": np_prev,
             "diffPct": np_diff_pct,
