@@ -3,7 +3,7 @@ from datetime import timedelta
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import Count, DecimalField, Max, Q, Sum, Value
+from django.db.models import Count, DecimalField, Max, Prefetch, Q, Sum, Value
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from rest_framework import status
@@ -98,7 +98,7 @@ def money_sum(field, **kwargs):
 # Leads (api.md §9.1, §9.2)
 # ---------------------------------------------------------------------------
 class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
-    queryset = Lead.objects.select_related("stage", "source", "owner", "party")
+    queryset = Lead.objects.select_related("stage", "source", "owner", "owner__employee", "party")
     serializer_class = LeadSerializer
     audit_entity_type = "CrmLead"
     audit_label_field = "lead_number"
@@ -605,17 +605,24 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
             party = result["party"]
             created_customer = result["created"]
 
-        deal = Deal.objects.create(
-            client_id=request.client_id,
-            deal_number=allocate_number(request.user.client, "DEAL"),
-            title=request.data.get("title") or f"{lead.company or lead.name} opportunity",
-            lead=lead,
-            party=party,
-            owner=lead.owner or request.user,
-            stage="Open",
-            value=lead.amount or ZERO,
-            created_by=request.user,
-        )
+        existing_deal = Deal.objects.filter(lead=lead, client_id=request.client_id, deleted_at__isnull=True).first()
+        if existing_deal:
+            deal = existing_deal
+            if party and deal.party != party:
+                deal.party = party
+                deal.save(update_fields=["party", "updated_at"])
+        else:
+            deal = Deal.objects.create(
+                client_id=request.client_id,
+                deal_number=allocate_number(request.user.client, "DEAL"),
+                title=request.data.get("title") or f"{lead.company or lead.name} opportunity",
+                lead=lead,
+                party=party,
+                owner=lead.owner or request.user,
+                stage=request.data.get("stage") or "Draft",
+                value=lead.amount or ZERO,
+                created_by=request.user,
+            )
         lead.converted_deal = deal
         lead.save(update_fields=["party", "converted_deal", "updated_at"])
         self.write_audit("convert", lead, description=f"Converted to deal {deal.deal_number}")
@@ -1404,7 +1411,12 @@ class AssignmentOptionsView(APIView):
 # Deals, contracts, projects (api.md §9.4 - §9.6)
 # ---------------------------------------------------------------------------
 class DealViewSet(TenantModelViewSet):
-    queryset = Deal.objects.select_related("party", "owner", "lead")
+    queryset = Deal.objects.select_related(
+        "party", "owner", "lead", "lead__source", "lead__party", "lead__owner", "lead__stage"
+    ).prefetch_related(
+        Prefetch("lines", queryset=DealLine.objects.filter(deleted_at__isnull=True).select_related("item")),
+        Prefetch("lead__products", queryset=LeadProduct.objects.filter(deleted_at__isnull=True).select_related("item")),
+    )
     serializer_class = DealSerializer
     audit_entity_type = "CrmDeal"
     audit_label_field = "deal_number"
@@ -1415,13 +1427,40 @@ class DealViewSet(TenantModelViewSet):
     default_date_field = "expected_close_date"
     permission_map = {"read": ["view_lead"], "write": ["manage_deals"]}
 
+    def list(self, request, *args, **kwargs):
+        client_id = self.get_client_id()
+        if client_id:
+            orphan_leads = Lead.objects.filter(
+                client_id=client_id,
+                deals__isnull=True,
+                deleted_at__isnull=True,
+            ).select_related("stage", "party", "owner")
+            if orphan_leads.exists():
+                for lead in orphan_leads:
+                    stage_name = (
+                        "Lost" if (lead.stage and lead.stage.is_lost)
+                        else ("Won" if (lead.stage and lead.stage.is_won) else "Draft")
+                    )
+                    Deal.objects.create(
+                        client=lead.client,
+                        deal_number=allocate_number(lead.client, "DEAL"),
+                        title=lead.name or f"Lead {lead.lead_number}",
+                        lead=lead,
+                        party=lead.party,
+                        owner=lead.owner,
+                        value=lead.amount or 0,
+                        stage=stage_name,
+                        created_by=request.user if getattr(request.user, "is_authenticated", False) else None,
+                    )
+        return super().list(request, *args, **kwargs)
+
     def get_aggregates(self, queryset):
         return queryset.aggregate(
             total=Count("id"),
             pipelineValue=money_sum("value"),
             won=Count("id", filter=Q(stage="Won")),
             lost=Count("id", filter=Q(stage="Lost")),
-            openValue=money_sum("value", filter=~Q(stage__in=["Won", "Lost"])),
+            openValue=money_sum("value", filter=Q(stage="Draft")),
         )
 
     def perform_create(self, serializer):
@@ -1454,6 +1493,8 @@ class DealViewSet(TenantModelViewSet):
         deal = super().perform_create(serializer)
         if deal.stage == "Lost" and deal.lead:
             self._sync_lead_lost_stage(deal)
+        elif deal.stage == "Won" and deal.lead:
+            self._sync_lead_won_stage(deal)
         DealActivity.objects.create(
             deal=deal, type="created", description="Deal created", actor=self.request.user
         )
@@ -1483,9 +1524,42 @@ class DealViewSet(TenantModelViewSet):
                 is_active=True,
             )
         deal.lead.stage = lost_stage
+        deal.lead.converted_at = None
         if deal.lost_reason:
             deal.lead.lost_reason = deal.lost_reason
-        deal.lead.save(update_fields=["stage", "lost_reason", "updated_at"])
+        deal.lead.save(update_fields=["stage", "lost_reason", "converted_at", "updated_at"])
+
+    def _sync_lead_won_stage(self, deal):
+        if not deal or not deal.lead:
+            return
+        user = self.request.user if getattr(self.request.user, "is_authenticated", False) else None
+        with transaction.atomic():
+            res = services.convert_lead_to_customer(deal.lead, user=user, source="Deal Won")
+            if res and res.get("party") and not deal.party:
+                deal.party = res["party"]
+            if deal.lost_reason:
+                deal.lost_reason = None
+            deal.save(update_fields=["party", "lost_reason", "updated_at"])
+
+            won_stage = services.find_conversion_stage(self.get_client_id())
+            if won_stage:
+                deal.lead.stage = won_stage
+                deal.lead.lost_reason = None
+                deal.lead.save(update_fields=["stage", "lost_reason", "updated_at"])
+
+    def _sync_lead_draft_stage(self, deal, previous):
+        deal.closed_at = None
+        deal.lost_reason = None
+        deal.save(update_fields=["closed_at", "lost_reason", "updated_at"])
+        if deal.lead:
+            active_stage = Stage.objects.filter(
+                client_id=self.get_client_id(), is_lost=False, is_won=False, is_active=True, deleted_at__isnull=True
+            ).order_by("sequence").first()
+            if active_stage:
+                deal.lead.stage = active_stage
+                deal.lead.lost_reason = None
+                deal.lead.converted_at = None
+                deal.lead.save(update_fields=["stage", "lost_reason", "converted_at", "updated_at"])
 
     def perform_update(self, serializer):
         previous = serializer.instance.stage
@@ -1496,18 +1570,12 @@ class DealViewSet(TenantModelViewSet):
                 deal.save(update_fields=["closed_at", "updated_at"])
             if deal.stage == "Lost" and deal.lead:
                 self._sync_lead_lost_stage(deal)
+            elif deal.stage == "Won" and deal.lead:
+                self._sync_lead_won_stage(deal)
+            elif deal.stage == "Draft" and previous in ("Won", "Lost"):
+                self._sync_lead_draft_stage(deal, previous)
             elif previous == "Lost" and deal.stage != "Lost":
-                deal.closed_at = None
-                deal.lost_reason = None
-                deal.save(update_fields=["closed_at", "lost_reason", "updated_at"])
-                if deal.lead and deal.lead.stage and deal.lead.stage.is_lost:
-                    active_stage = Stage.objects.filter(
-                        client_id=self.get_client_id(), is_lost=False, is_active=True, deleted_at__isnull=True
-                    ).order_by("sequence").first()
-                    if active_stage:
-                        deal.lead.stage = active_stage
-                        deal.lead.lost_reason = None
-                        deal.lead.save(update_fields=["stage", "lost_reason", "updated_at"])
+                self._sync_lead_draft_stage(deal, previous)
             DealActivity.objects.create(
                 deal=deal,
                 type="stage_change",
@@ -2078,7 +2146,8 @@ class CrmSetupView(APIView):
                 ).data,
                 "dealStages": DealStageSerializer(
                     DealStage.objects.filter(
-                        client_id=client_id, deleted_at__isnull=True
+                        client_id=client_id, deleted_at__isnull=True, is_active=True,
+                        name__in=[name for name, *_ in services.DEFAULT_DEAL_STAGES]
                     ).order_by("sequence"),
                     many=True,
                 ).data,
@@ -2148,43 +2217,55 @@ class CrmDashboardView(APIView):
             .annotate(count=Count("id"), value=money_sum("amount"))
             .order_by("-count")[:10]
         )
-        recent = leads.order_by("-created_at")[:10]
+        recent = leads.select_related("stage", "source", "owner", "owner__employee", "party").order_by("-created_at")[:10]
         services.annotate_lead_counters(client_id, list(recent))
+
+        lead_agg = leads.aggregate(
+            total=Count("id"),
+            converted=Count("id", filter=Q(converted_at__isnull=False)),
+            open=Count("id", filter=Q(converted_at__isnull=True)),
+        )
+
+        deal_agg = deals.aggregate(
+            total=Count("id"),
+            won=Count("id", filter=Q(stage="Won")),
+            lost=Count("id", filter=Q(stage="Lost")),
+            open=Count("id", filter=~Q(stage__in=["Won", "Lost"])),
+            pipeline_value=money_sum("value", filter=~Q(stage__in=["Won", "Lost"])),
+            won_value=money_sum("value", filter=Q(stage="Won")),
+        )
+
+        today_date = timezone.now().date()
+        task_agg = Task.objects.filter(
+            client_id=client_id, deleted_at__isnull=True
+        ).aggregate(
+            open=Count("id", filter=~Q(status="Completed")),
+            overdue=Count("id", filter=~Q(status="Completed") & Q(due_date__lt=today_date)),
+        )
+
+        tot_leads = lead_agg["total"] or 0
+        conv_leads = lead_agg["converted"] or 0
+        w_deals = deal_agg["won"] or 0
+        l_deals = deal_agg["lost"] or 0
+        closed_deals = w_deals + l_deals
 
         return Response(
             {
                 "kpis": {
-            "totalLeads": leads.count(),
-            "convertedLeads": leads.filter(converted_at__isnull=False).count(),
-            "openLeads": leads.filter(converted_at__isnull=True).count(),
-            "openDeals": deals.exclude(stage__in=["Won", "Lost"]).count(),
-            "wonDeals": deals.filter(stage="Won").count(),
-            "lostDeals": deals.filter(stage="Lost").count(),
-            "totalDeals": deals.count(),
-            "pipelineValue": round2(
-                deals.exclude(stage__in=["Won", "Lost"]).aggregate(
-                    value=money_sum("value")
-                )["value"]
-            ),
-            "wonValue": round2(
-                deals.filter(stage="Won").aggregate(value=money_sum("value"))["value"]
-            ),
-            "leadConversionRatePct": round(
-                (leads.filter(converted_at__isnull=False).count() / max(leads.count(), 1)) * 100, 1
-            ),
-            "winRatePct": round(
-                (deals.filter(stage="Won").count()
-                / max(deals.filter(stage__in=["Won", "Lost"]).count(), 1))
-                * 100,
-                1,
-            ),
-            "openTasks": Task.objects.filter(
-                client_id=client_id, deleted_at__isnull=True
-            ).exclude(status="Completed").count(),
-            "overdueTasks": Task.objects.filter(
-                client_id=client_id, deleted_at__isnull=True, due_date__lt=timezone.now().date()
-            ).exclude(status="Completed").count(),
-        },
+                    "totalLeads": tot_leads,
+                    "convertedLeads": conv_leads,
+                    "openLeads": lead_agg["open"] or 0,
+                    "openDeals": deal_agg["open"] or 0,
+                    "wonDeals": w_deals,
+                    "lostDeals": l_deals,
+                    "totalDeals": deal_agg["total"] or 0,
+                    "pipelineValue": round2(deal_agg["pipeline_value"]),
+                    "wonValue": round2(deal_agg["won_value"]),
+                    "leadConversionRatePct": round((conv_leads / max(tot_leads, 1)) * 100, 1),
+                    "winRatePct": round((w_deals / max(closed_deals, 1)) * 100, 1),
+                    "openTasks": task_agg["open"] or 0,
+                    "overdueTasks": task_agg["overdue"] or 0,
+                },
                 "funnel": [
                     {
                         "stage": row["stage__name"],
