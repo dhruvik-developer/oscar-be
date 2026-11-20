@@ -547,11 +547,58 @@ class DealSerializer(BaseModelSerializer):
             return obj.party.phone
         return ""
 
+    product = serializers.SerializerMethodField()
+    products = serializers.SerializerMethodField()
+
+    def _get_active_lines(self, obj):
+        if hasattr(obj, "_prefetched_objects_cache") and "lines" in obj._prefetched_objects_cache:
+            return [line for line in obj.lines.all() if not getattr(line, "deleted_at", None)]
+        return list(obj.lines.filter(deleted_at__isnull=True).select_related("item"))
+
+    def _get_active_lead_products(self, lead):
+        if not lead:
+            return []
+        if hasattr(lead, "_prefetched_objects_cache") and "products" in lead._prefetched_objects_cache:
+            return [p for p in lead.products.all() if not getattr(p, "deleted_at", None)]
+        return list(lead.products.filter(deleted_at__isnull=True).select_related("item"))
+
+    def get_product(self, obj):
+        lines = self._get_active_lines(obj)
+        if lines and lines[0].item:
+            return lines[0].item.name
+        if obj.lead:
+            prods = self._get_active_lead_products(obj.lead)
+            if prods and prods[0].item:
+                return prods[0].item.name
+            if getattr(obj.lead, "custom_values", None):
+                cv = obj.lead.custom_values or {}
+                cv_prods = cv.get("products") or cv.get("fields", {}).get("products")
+                if isinstance(cv_prods, list) and cv_prods:
+                    return str(cv_prods[0])
+                if isinstance(cv_prods, str) and cv_prods:
+                    return cv_prods
+        return ""
+
+    def get_products(self, obj):
+        lines = self._get_active_lines(obj)
+        res = [line.item.name for line in lines if line.item]
+        if not res and obj.lead:
+            prods = self._get_active_lead_products(obj.lead)
+            res = [lp.item.name for lp in prods if lp.item]
+            if not res and getattr(obj.lead, "custom_values", None):
+                cv = obj.lead.custom_values or {}
+                cv_prods = cv.get("products") or cv.get("fields", {}).get("products")
+                if isinstance(cv_prods, list):
+                    res = [str(x) for x in cv_prods if x]
+                elif isinstance(cv_prods, str) and cv_prods:
+                    res = [cv_prods]
+        return res
+
     class Meta:
         model = Deal
         fields = [
             "id", "deal_number", "title", "leadId", "leadNumber", "customerId", "customerName",
-            "ownerId", "ownerName", "stage", "value", "probability", "source", "phone",
+            "ownerId", "ownerName", "stage", "value", "probability", "source", "phone", "product", "products",
             "expected_close_date", "expectedCloseDate", "closed_at", "lost_reason", "quotation",
             "crm_project", "created_at", "updated_at",
         ]

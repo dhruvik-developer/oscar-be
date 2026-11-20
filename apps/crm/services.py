@@ -723,10 +723,8 @@ DEFAULT_STAGES = [
 #: (Deal.STAGES still accepts them so older deals keep their value).
 DEFAULT_DEAL_STAGES = [
     ("Draft", 1, False, False),
-    ("Sent", 2, False, False),
-    ("Open", 3, False, False),
-    ("Won", 4, True, False),
-    ("Lost", 5, False, True),
+    ("Won", 2, True, False),
+    ("Lost", 3, False, True),
 ]
 
 
@@ -829,7 +827,7 @@ def find_conversion_stage(client_id):
     )
     if stage is not None:
         return stage
-    return (
+    found = (
         Stage.objects.filter(
             client_id=client_id,
             name__iexact="Converted",
@@ -838,6 +836,19 @@ def find_conversion_stage(client_id):
         or Stage.objects.filter(
             client_id=client_id, name__iexact="Won", deleted_at__isnull=True
         ).first()
+    )
+    if found is not None:
+        return found
+    from django.db.models import Max
+    last_seq = Stage.objects.filter(
+        client_id=client_id, deleted_at__isnull=True
+    ).aggregate(m=Max("sequence"))["m"] or 0
+    return Stage.objects.create(
+        client_id=client_id,
+        name="Won",
+        sequence=last_seq + 1,
+        is_won=True,
+        is_active=True,
     )
 
 

@@ -837,7 +837,7 @@ class SalesOrderViewSet(SalesDocumentViewSet):
     @transaction.atomic
     def convert_to_invoice(self, request, pk=None):
         try:
-            order = self.get_queryset().select_for_update().get(pk=pk)
+            order = self.get_queryset().select_for_update(of=("self",)).get(pk=pk)
         except SalesOrder.DoesNotExist:
             raise NotFound("Sales order not found.", code=Codes.NOT_FOUND)
         self.check_object_permissions(request, order)
@@ -849,7 +849,7 @@ class SalesOrderViewSet(SalesDocumentViewSet):
     @transaction.atomic
     def convert_to_challan_and_invoice(self, request, pk=None):
         try:
-            order = self.get_queryset().select_for_update().get(pk=pk)
+            order = self.get_queryset().select_for_update(of=("self",)).get(pk=pk)
         except SalesOrder.DoesNotExist:
             raise NotFound("Sales order not found.", code=Codes.NOT_FOUND)
         self.check_object_permissions(request, order)
