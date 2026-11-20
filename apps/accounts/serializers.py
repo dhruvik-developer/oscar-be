@@ -52,9 +52,42 @@ class MeUserSerializer(BaseModelSerializer):
         data["roleCode"] = instance.role.code if instance.role_id else None
         data["mustChangePassword"] = bool(instance.must_change_password)
         data["twoFactorEnabled"] = bool(instance.two_factor_enabled)
-        data["twoFactorRequired"] = instance.requires_two_factor
+        data["twoFactorRequired"] = bool(instance.role_id and instance.role.requires_two_factor)
         data["isSuperuser"] = bool(instance.is_superuser)
         data["is_superuser"] = bool(instance.is_superuser)
+
+        emp = instance.employee if instance.employee_id else None
+        if emp:
+            data["employeeCode"] = emp.employee_code
+            data["employeeId"] = emp.employee_code
+            data["dateOfBirth"] = emp.date_of_birth.isoformat() if emp.date_of_birth else None
+            data["gender"] = emp.gender
+            data["bloodGroup"] = emp.blood_group
+            data["personalEmail"] = emp.personal_email
+            data["emergencyContact"] = emp.emergency_contact or {}
+            data["address"] = emp.address or {}
+            data["joiningDate"] = emp.joining_date.isoformat() if emp.joining_date else (instance.joined_date.isoformat() if instance.joined_date else None)
+            data["employmentType"] = emp.employment_type or "Full-time"
+            data["employmentStatus"] = emp.status or instance.status
+            data["designation"] = emp.designation.name if emp.designation_id else (instance.role.name if instance.role_id else "Staff")
+            if not data.get("department") and emp.department_id:
+                data["department"] = emp.department.name
+            if not data.get("location") and emp.location_id:
+                data["location"] = emp.location.name
+            if not data.get("reportingManager") and emp.manager_id:
+                data["reportingManager"] = emp.manager.name
+        else:
+            data["joiningDate"] = instance.joined_date.isoformat() if instance.joined_date else None
+            data["employmentStatus"] = instance.status
+            data["designation"] = instance.role.name if instance.role_id else "Staff"
+            data["address"] = {}
+            data["emergencyContact"] = {}
+            data["dateOfBirth"] = None
+            data["gender"] = None
+            data["bloodGroup"] = None
+            data["personalEmail"] = None
+            data["employmentType"] = "Full-time"
+
         return data
 
     def get_employeeId(self, user):
@@ -126,18 +159,76 @@ class ResetPasswordSerializer(BaseSerializer):
 
 
 class UpdateMeSerializer(BaseModelSerializer):
-    """``PATCH /auth/me/`` -- own profile only: name, phone, avatar, and opting
-    in to two-step sign-in. A role that requires it cannot be opted out of."""
+    """``PATCH /auth/me/`` -- own profile: name, phone, avatar, twoFactorEnabled, and personal info."""
 
     avatar = serializers.CharField(source="avatar_url", required=False, allow_null=True)
     twoFactorEnabled = serializers.BooleanField(source="two_factor_enabled", required=False)
+    address = serializers.JSONField(required=False, allow_null=True)
+    emergencyContact = serializers.JSONField(required=False, allow_null=True)
+    dateOfBirth = serializers.DateField(required=False, allow_null=True)
+    gender = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    bloodGroup = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    personalEmail = serializers.EmailField(required=False, allow_null=True, allow_blank=True)
 
     class Meta:
         model = User
-        fields = ["name", "phone", "avatar", "twoFactorEnabled"]
+        fields = [
+            "name", "phone", "avatar", "twoFactorEnabled",
+            "address", "emergencyContact", "dateOfBirth", "gender", "bloodGroup", "personalEmail",
+        ]
+
+    def validate_twoFactorEnabled(self, value):
+        if not value and self.instance and self.instance.role_id and self.instance.role.requires_two_factor:
+            raise serializers.ValidationError("Two-factor authentication is required by your role.")
+        return value
 
     def validate_phone(self, value):
         return clean_mobile(value)
+
+    def update(self, instance, validated_data):
+        address = validated_data.pop("address", None)
+        emergency_contact = validated_data.pop("emergencyContact", None)
+        dob = validated_data.pop("dateOfBirth", None)
+        gender = validated_data.pop("gender", None)
+        blood_group = validated_data.pop("bloodGroup", None)
+        personal_email = validated_data.pop("personalEmail", None)
+
+        user = super().update(instance, validated_data)
+
+        emp = user.employee if user.employee_id else None
+        if emp:
+            changed = False
+            if address is not None:
+                emp.address = address
+                changed = True
+            if emergency_contact is not None:
+                emp.emergency_contact = emergency_contact
+                changed = True
+            if dob is not None:
+                emp.date_of_birth = dob
+                changed = True
+            if gender is not None:
+                emp.gender = gender
+                changed = True
+            if blood_group is not None:
+                emp.blood_group = blood_group
+                changed = True
+            if personal_email is not None:
+                emp.personal_email = personal_email
+                changed = True
+            if "name" in validated_data:
+                emp.name = validated_data["name"]
+                changed = True
+            if "phone" in validated_data:
+                emp.phone = validated_data["phone"]
+                changed = True
+            if "avatar_url" in validated_data:
+                emp.avatar_url = validated_data["avatar_url"]
+                changed = True
+            if changed:
+                emp.save()
+
+        return user
 
 
 class UserSessionSerializer(BaseModelSerializer):
@@ -244,6 +335,11 @@ class UserSerializer(BaseModelSerializer):
     def get_permissions(self, user):
         """Role-derived plus overrides (api.md §3.1: "permissions[]" on detail)."""
         return sorted(user.effective_permissions())
+
+    def validate_twoFactorEnabled(self, value):
+        if not value and self.instance and self.instance.role_id and self.instance.role.requires_two_factor:
+            raise serializers.ValidationError("Two-factor authentication is required by your role.")
+        return value
 
     def validate_phone(self, value):
         return clean_mobile(value)
